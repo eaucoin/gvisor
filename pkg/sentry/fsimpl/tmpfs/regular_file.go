@@ -954,10 +954,13 @@ var hostWriteThreshold = 16 * uint64(hostarch.PageSize)
 
 func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
 	if rw.file.inode.fs.mf.IsDiskBacked() && fr.Length() >= hostWriteThreshold {
-		fd, err := rw.file.inode.fs.mf.DataFD(fr)
+		mf := rw.file.inode.fs.mf
+		fd, err := mf.DataFD(fr)
 		if err != nil {
 			return 0, err
 		}
+		// The write bypasses MapInternal, which would mark the pages dirty.
+		mf.MarkDirtyBy(pgalloc.DirtyMarkTmpfsWrite, fr)
 		return hostfd.Pwritev2(
 			int32(fd),                     // fd
 			srcs.TakeFirst64(fr.Length()), // srcs
