@@ -503,6 +503,33 @@ docker start --checkpoint <checkpoint-name> <container-name>
     `--checkpoint-dir` flag but this will be required when restoring from a
     checkpoint made in another container.
 
+## How to use checkpoint/restore with containerd
+
+The gVisor containerd shim, `containerd-shim-runsc-v1`, checkpoints a sandbox
+through containerd's task service:
+
+```bash
+ctr task checkpoint --image-path=<path> [--exit] <container id>
+```
+
+The checkpoint holds the whole sandbox, whichever of its containers it is asked
+for. With `--exit` the sandbox stops after the checkpoint; otherwise it keeps
+running.
+
+A task that containerd creates from a checkpoint (`CreateTaskRequest.checkpoint`,
+which containerd sets from a checkpoint directory or a checkpoint in its content
+store) is restored, rather than started, when it is started. Create and start the
+sandbox's root container first: its restore brings back the whole sandbox, and
+those of the other containers reattach them. Two options of the runtime's shim
+configuration file (its `ConfigPath`, see
+[Containerd Advanced Configuration](containerd/configuration.md)) apply to these
+restores:
+
+```toml
+restore_direct = true      # runsc restore --direct
+restore_background = true  # runsc restore --background
+```
+
 ## Restore validation
 
 A restore checks that the sandbox it brings back still matches what it finds on
