@@ -472,7 +472,10 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 	// may be derived from the host (e.g. Kubernetes computes it from node
 	// memory capacity for Burstable pods). Hooks contain callbacks for
 	// lifecycle of the container such as prestart and teardown, and can
-	// change. Do not validate these fields.
+	// change. OOMScoreAdj is applied by runsc to the sandbox and gofer
+	// processes on the host, from the restored container's spec, like
+	// Resources; Kubernetes derives it from the pod's memory request, so it
+	// changes with the request. Do not validate these fields.
 	oldSpec.Hostname, newSpec.Hostname = "", ""
 	oldSpec.Domainname, newSpec.Domainname = "", ""
 	oldProcess.Env, newProcess.Env = nil, nil
