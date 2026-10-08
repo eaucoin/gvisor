@@ -256,6 +256,7 @@ go_library(
         "cgroup_mutex.go",
         "cgroup_v2_mutex.go",
         "context.go",
+        "dirty.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
@@ -436,6 +437,7 @@ go_test(
     name = "kernel_test",
     size = "small",
     srcs = [
+        "dirty_test.go",
         "fd_table_test.go",
         "table_test.go",
         "task_signals_test.go",
@@ -457,6 +459,7 @@ go_test(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",
@@ -466,5 +469,6 @@ go_test(
         "//pkg/sync",
         "//pkg/tcpip",
         "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
