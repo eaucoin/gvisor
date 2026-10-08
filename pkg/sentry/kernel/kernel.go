@@ -172,6 +172,9 @@ type Kernel struct {
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
+	// dirty is the state of dirty tracking; see dirty.go.
+	dirty dirtyTracking `state:"nosave"`
+
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
 	timekeeper           *Timekeeper
@@ -762,7 +765,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) error {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
@@ -790,6 +793,22 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if fsOpts != nil {
 		matchCtx = k.newFSCheckpointMatchContext(ctx, fsOpts.Paths)
 		mfsToSaveActual = filterMFsToSave(mfsToSave, matchCtx)
+	}
+
+	if k.DirtyTrackingEnabled() {
+		dirtyEpoch, err := k.beginDirtySave(ctx)
+		if err != nil {
+			return err
+		}
+		saved := []*pgalloc.MemoryFile{k.mf}
+		for _, mf := range mfsToSaveActual {
+			saved = append(saved, mf)
+		}
+		// This must run after k.saveMemoryFiles() completes, so it must be
+		// deferred before the wait for it below.
+		defer func() {
+			retErr = k.endDirtySave(ctx, dirtyEpoch, saved, retErr)
+		}()
 	}
 
 	parallelMFSave := pagesMetadata != nil
@@ -1074,6 +1093,11 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 		}
 		timeline.Reached("Main MemoryFile loading started")
 	}
+	if k.DirtyTrackingEnabled() {
+		// Track the timekeeper's writes below: the image just loaded will be
+		// the parent of the next incremental save.
+		k.mf.EnableDirtyTracking()
+	}
 
 	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
 
@@ -1109,6 +1133,23 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 	// not to exist.
 	if k.useHostCores && initAppCores > k.applicationCores {
 		return fmt.Errorf("UseHostCores enabled: can't increase ApplicationCores from %d to %d after restore", k.applicationCores, initAppCores)
+	}
+
+	if k.DirtyTrackingEnabled() {
+		if k.dirty.Verify && asyncMFLoader != nil {
+			// Verification hashes every page, so private MemoryFiles must be
+			// loading too.
+			if err := asyncMFLoader.WaitMetadata(); err != nil {
+				return err
+			}
+		}
+		mfs := []*pgalloc.MemoryFile{k.mf}
+		for _, mf := range pgalloc.MemoryFileMapFromContext(ctx) {
+			mfs = append(mfs, mf)
+		}
+		if err := k.trackDirty(ctx, mfs); err != nil {
+			return fmt.Errorf("starting dirty tracking: %w", err)
+		}
 	}
 
 	return nil
