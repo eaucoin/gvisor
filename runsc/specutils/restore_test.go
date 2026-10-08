@@ -24,12 +24,15 @@ import (
 // podSpec returns the spec of a container of a Kubernetes pod with the given
 // UID, as the containerd shim hands it to runsc.
 func podSpec(podUID string) *specs.Spec {
+	oomScoreAdj := 984
+	limit := int64(256 << 20)
 	return &specs.Spec{
 		Version: specs.Version,
 		Root:    &specs.Root{Path: "/run/containerd/" + podUID + "/rootfs"},
 		Process: &specs.Process{
-			Args: []string{"/bin/sleep", "1000"},
-			Cwd:  "/",
+			Args:        []string{"/bin/sleep", "1000"},
+			Cwd:         "/",
+			OOMScoreAdj: &oomScoreAdj,
 		},
 		Hostname: "pod-" + podUID,
 		Annotations: map[string]string{
@@ -37,6 +40,9 @@ func podSpec(podUID string) *specs.Spec {
 		},
 		Linux: &specs.Linux{
 			CgroupsPath: "/kubepods/burstable/pod" + podUID + "/" + podUID + "-container",
+			Resources: &specs.LinuxResources{
+				Memory: &specs.LinuxMemory{Limit: &limit},
+			},
 		},
 	}
 }
@@ -55,6 +61,19 @@ func TestValidateSpecsAcrossPods(t *testing.T) {
 		{
 			name:   "new pod",
 			mutate: func(*specs.Spec) {},
+		},
+		{
+			// Kubernetes derives the OOM score adjustment from the memory
+			// request, and the memory limit sets the pod cgroup's limit.
+			name: "memory request and limit",
+			mutate: func(spec *specs.Spec) {
+				oomScoreAdj := 968
+				spec.Process.OOMScoreAdj = &oomScoreAdj
+				limit := int64(512 << 20)
+				spec.Linux.Resources = &specs.LinuxResources{
+					Memory: &specs.LinuxMemory{Limit: &limit},
+				}
+			},
 		},
 		{
 			name: "other gVisor annotation",
