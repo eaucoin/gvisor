@@ -42,6 +42,7 @@ go_test(
     srcs = [
         "bufreader_test.go",
         "bufwriter_test.go",
+        "fdreader_test.go",
         "fdwriter_test.go",
         "ioreader_test.go",
         "iowriter_test.go",
