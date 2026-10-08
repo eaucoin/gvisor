@@ -897,7 +897,7 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 	// Check metadata stability before updating metadata.
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
-	if i.isRegularFile() {
+	if i.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(i.fs.iopts.UniqueID, genericDebugPathname(i.fs, d)) {
 		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
 		if opts.ValidateFileSizes {
 			if savedSize != uint64(stat.Size) {

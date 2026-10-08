@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -124,6 +125,18 @@ type CompleteRestoreOptions struct {
 	// implementations backed by remote filesystems should validate that file
 	// mtimes have not changed between checkpoint and restore.
 	ValidateFileModificationTimestamps bool
+
+	// If ValidateFile is not nil, the validations above apply only to the
+	// files for which it returns true, given the unique ID of their filesystem
+	// (cf. gofer.InternalFilesystemOptions.UniqueID) and their path relative to
+	// its root.
+	ValidateFile func(fsID checkpoint.ResourceID, path string) bool
+}
+
+// ValidatesFile returns true if the validations requested by opts apply to the
+// file at path in the filesystem with unique ID fsID.
+func (opts *CompleteRestoreOptions) ValidatesFile(fsID checkpoint.ResourceID, path string) bool {
+	return opts.ValidateFile == nil || opts.ValidateFile(fsID, path)
 }
 
 // saveMounts is called by stateify.
