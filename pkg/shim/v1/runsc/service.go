@@ -187,6 +187,18 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	restore, err := takeRestoreAnnotations(rfs.Create.Bundle)
+	if err != nil {
+		return nil, err
+	}
+	restoreImagePath := rfs.Create.Checkpoint
+	if restore.imagePath != "" {
+		if restoreImagePath != "" && restoreImagePath != restore.imagePath {
+			return nil, fmt.Errorf("checkpoint %q and annotation %s=%q differ: %w", restoreImagePath, restoreImagePathAnnotation, restore.imagePath, errdefs.ErrInvalidArgument)
+		}
+		restoreImagePath = restore.imagePath
+	}
+
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
 		Bundle:             rfs.Create.Bundle,
@@ -198,7 +210,9 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		Stderr:             rfs.Create.Stderr,
 		FSRestoreImagePath: rfs.Conf.ImagePath,
 		FSRestoreDirect:    rfs.Conf.Direct,
-		RestoreImagePath:   rfs.Create.Checkpoint,
+		RestoreImagePath:   restoreImagePath,
+		RestoreDirect:      restore.direct,
+		RestoreBackground:  restore.background,
 	})
 	if err != nil {
 		return nil, err
