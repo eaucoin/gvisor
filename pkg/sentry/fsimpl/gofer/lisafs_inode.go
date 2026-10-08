@@ -640,7 +640,7 @@ func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opt
 	// Check metadata stability before updating metadata.
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
-	if i.isRegularFile() {
+	if i.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(i.fs.iopts.UniqueID, genericDebugPathname(i.fs, d)) {
 		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
 		if opts.ValidateFileSizes {
 			if inode.Stat.Mask&linux.STATX_SIZE == 0 {
