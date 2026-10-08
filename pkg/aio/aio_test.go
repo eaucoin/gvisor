@@ -320,3 +320,42 @@ func TestGoQueue(t *testing.T) {
 		return q, nil
 	})
 }
+
+// TestGoQueueWaitOr checks that GoQueue.WaitOr returns when its wake channel
+// is readable, without waiting for an inflight operation, and otherwise when
+// the operation completes.
+func TestGoQueueWaitOr(t *testing.T) {
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		t.Fatalf("Pipe failed: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	q := NewGoQueue(1)
+	defer q.Destroy()
+	// A read at the current offset of the pipe's empty read end blocks until
+	// the pipe has data.
+	buf := make([]byte, 8)
+	Readv(q, 7 /* id */, int32(fds[0]), -1 /* off */, []unix.Iovec{{Base: &buf[0], Len: uint64(len(buf))}})
+
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{}
+	if cs := q.WaitOr(nil, wake); len(cs) != 0 {
+		t.Fatalf("WaitOr with wake readable returned %v, want no completions", cs)
+	}
+	if len(wake) != 0 {
+		t.Fatalf("WaitOr did not receive from wake")
+	}
+
+	if _, err := unix.Write(fds[1], []byte("complete")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	cs := q.WaitOr(nil, wake)
+	if len(cs) != 1 || cs[0].ID != 7 || cs[0].Result != int64(len(buf)) {
+		t.Fatalf("WaitOr returned %v, want the completion of read 7 of %d bytes", cs, len(buf))
+	}
+	if string(buf) != "complete" {
+		t.Errorf("read %q, want %q", buf, "complete")
+	}
+}
