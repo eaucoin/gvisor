@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	time2 "time"
@@ -360,6 +361,41 @@ func (r *restoreMounts) String() string {
 	return fmt.Sprintf("fdmap: %#v, mfmap: %v, fsCheckpointedMfs: %v", r.fdmap, r.mfmap, r.fsCheckpointedMfs)
 }
 
+// completeRestoreOptions returns the options with which the restored
+// filesystems complete their restore, checking the files that
+// conf.RestoreValidateFiles selects in the containers that containerSpecs
+// holds by name.
+func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*specs.Spec) *vfs.CompleteRestoreOptions {
+	if conf.RestoreValidateFiles == config.RestoreValidateFilesNone {
+		return &vfs.CompleteRestoreOptions{}
+	}
+	// A container's filesystems have the unique ID {container name, mount
+	// destination} (createMountNamespace), "/" for its root filesystem.
+	//
+	// Mount points are not checked: their mounts hide them, and runsc or the
+	// container manager may have created them for the mounts, so they are new
+	// files in a root filesystem that is new at restore. containerd does so for
+	// Kubernetes' /etc/hosts.
+	mountPoints := make(map[checkpoint.ResourceID]struct{})
+	for name, spec := range containerSpecs {
+		for _, m := range spec.Mounts {
+			mountPoints[checkpoint.ResourceID{ContainerName: name, Path: path.Clean(m.Destination)}] = struct{}{}
+		}
+	}
+	rootfsOnly := conf.RestoreValidateFiles == config.RestoreValidateFilesRootfs
+	return &vfs.CompleteRestoreOptions{
+		ValidateFileSizes:                  true,
+		ValidateFileModificationTimestamps: true,
+		ValidateFile: func(fsID checkpoint.ResourceID, p string) bool {
+			if rootfsOnly && fsID.Path != "/" {
+				return false
+			}
+			_, isMountPoint := mountPoints[checkpoint.ResourceID{ContainerName: fsID.ContainerName, Path: path.Join(fsID.Path, p)}]
+			return !isMountPoint
+		},
+	}
+}
+
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
 
@@ -540,7 +576,7 @@ func (r *restorer) restore(l *Loader) error {
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, completeRestoreOptions(l.root.conf, l.containerSpecs), r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
 	}
 	r.timer.Reached("kernel loaded")
