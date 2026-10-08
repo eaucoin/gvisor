@@ -209,6 +209,28 @@ func validateAnnotations(cName string, before, after map[string]string) error {
 	if !reflect.DeepEqual(oldM, newM) {
 		return validateError("Annotations", cName, oldM, newM)
 	}
+	return validateImageName(cName, before, after)
+}
+
+// imageNameAnnotations are the annotations by which container managers name
+// the image that a container was created from.
+var imageNameAnnotations = []string{
+	ContainerdImageNameAnnotation,
+	CRIOImageNameAnnotation,
+}
+
+// validateImageName checks that a container is restored from the image it was
+// checkpointed from, as far as its container manager names it. Its root
+// filesystem is part of the checkpointed state: the processes have it mapped
+// and cached, so another image breaks them.
+func validateImageName(cName string, before, after map[string]string) error {
+	for _, key := range imageNameAnnotations {
+		oldName, oldOK := before[key]
+		newName, newOK := after[key]
+		if oldOK && newOK && oldName != newName {
+			return validateError("Image", cName, oldName, newName)
+		}
+	}
 	return nil
 }
 
