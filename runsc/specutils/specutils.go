@@ -92,6 +92,12 @@ const (
 
 // LINT.ThenChange(:Features)
 
+// CgroupParentAnnotation names the cgroup the sandbox joins instead of the
+// root container's cgroup. The containerd shim sets it to the pod's cgroup,
+// e.g. "/kubepods/burstable/pod<uid>", so that the sandbox is accounted to the
+// pod rather than to its pause container.
+const CgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
+
 // ExePath must point to runsc binary, which is normally the same binary. It's
 // changed in tests that aren't linked in the same binary.
 var ExePath = "/proc/self/exe"
