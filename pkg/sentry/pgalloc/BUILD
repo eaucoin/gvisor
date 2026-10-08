@@ -29,6 +29,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "dirty_mutex",
+    out = "dirty_mutex.go",
+    package = "pgalloc",
+    prefix = "dirty",
+)
+
+declare_mutex(
     name = "memory_file_mutex",
     out = "memory_file_mutex.go",
     package = "pgalloc",
@@ -162,6 +169,8 @@ go_library(
         "async_load_budget.go",
         "context.go",
         "debug.go",
+        "dirty.go",
+        "dirty_mutex.go",
         "evictable_range.go",
         "evictable_range_set.go",
         "image.go",
@@ -212,6 +221,7 @@ go_test(
     size = "small",
     srcs = [
         "async_load_budget_test.go",
+        "dirty_test.go",
         "image_test.go",
         "loader_test.go",
         "pgalloc_64k_test.go",

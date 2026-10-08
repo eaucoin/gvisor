@@ -203,6 +203,9 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoads]
 
+	// dirty is the dirty tracking state; see dirty.go.
+	dirty dirtyState
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -735,7 +738,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			}
 			if alloc.recycled {
 				// The contents of recycled waste pages are initially unknown, so we
-				// need to zero them.
+				// need to zero them. (MapInternal marked them dirty above.)
 				f.manuallyZero(fr)
 			} else if needHugeTouch {
 				// We only need to touch a single byte in each huge page.
@@ -955,6 +958,9 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 			m += chunkSize
 		}
 	}
+	if f.dirty.tracked.Load() {
+		f.dirty.growLocked(int(newNrChunks))
+	}
 	f.chunks.Store(&newChunks)
 
 	// Mark void pages free.
@@ -1136,6 +1142,9 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
+	// Decommitting zeroes the pages' contents without writing through any
+	// mapping.
+	f.MarkDirtyBy(DirtyMarkDecommit, fr)
 	if err := f.decommitFile(fr); err != nil {
 		log.Warningf("Failed to decommit %v: %v", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
@@ -1480,6 +1489,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 	}
 	if at.Execute {
 		return safemem.BlockSeq{}, linuxerr.EACCES
+	}
+	if at.Write {
+		f.markDirtyInternal(fr)
 	}
 
 	if loads := f.asyncPageLoad.Load(); loads != nil {
