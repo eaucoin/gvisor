@@ -72,6 +72,11 @@ type FileDescription struct {
 	// remap indicates whether the shared buffers need to be remapped
 	// due to a S/R. Protected by ProcessSubmissions critical section.
 	remap bool
+
+	// alwaysDirty is true if the shared buffers' ranges are registered with
+	// pgalloc.MemoryFile.MarkAlwaysDirty. Protected by ProcessSubmissions
+	// critical section.
+	alwaysDirty bool `state:"nosave"`
 }
 
 var _ vfs.FileDescriptionImpl = (*FileDescription)(nil)
@@ -215,12 +220,18 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, entries uint32, par
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *FileDescription) Release(ctx context.Context) {
+	if fd.alwaysDirty {
+		fd.mf.ClearAlwaysDirty(fd.rbmf.fr)
+		fd.mf.ClearAlwaysDirty(fd.sqemf.fr)
+	}
 	fd.mf.DecRef(fd.rbmf.fr)
 	fd.mf.DecRef(fd.sqemf.fr)
 }
 
 // mapSharedBuffers caches internal mappings for the ring's shared memory
-// regions.
+// regions. The Sentry writes through them without calling MapInternal again,
+// so their ranges are registered as always dirty with the MemoryFile's dirty
+// tracking until the file is released.
 func (fd *FileDescription) mapSharedBuffers() error {
 	// Mapping for the IORings header struct.
 	rb, err := fd.mf.MapInternal(fd.rbmf.fr, hostarch.ReadWrite)
@@ -245,6 +256,11 @@ func (fd *FileDescription) mapSharedBuffers() error {
 	}
 	fd.sqesBuf.init(sqes)
 
+	if !fd.alwaysDirty && pgalloc.DirtyMarkPathEnabled(pgalloc.DirtyMarkIOUring) {
+		fd.mf.MarkAlwaysDirty(fd.rbmf.fr)
+		fd.mf.MarkAlwaysDirty(fd.sqemf.fr)
+		fd.alwaysDirty = true
+	}
 	return nil
 
 }

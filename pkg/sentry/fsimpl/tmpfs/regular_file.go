@@ -922,10 +922,13 @@ func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.Blo
 		// causes a lot of context switching. Use write(2) host syscall instead,
 		// which makes one context switch and faults all the pages that are touched
 		// during the write.
-		fd, err := rw.file.inode.fs.mf.DataFD(fr)
+		mf := rw.file.inode.fs.mf
+		fd, err := mf.DataFD(fr)
 		if err != nil {
 			return 0, err
 		}
+		// The write bypasses MapInternal, which would mark the pages dirty.
+		mf.MarkDirtyBy(pgalloc.DirtyMarkTmpfsWrite, fr)
 		return hostfd.Pwritev2(
 			int32(fd),                     // fd
 			srcs.TakeFirst64(fr.Length()), // srcs
