@@ -52,8 +52,6 @@ import (
 	"gvisor.dev/gvisor/runsc/starttime"
 )
 
-const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
-
 // validateID validates the container id.
 func validateID(id string) error {
 	// See libcontainer/factory_linux.go.
@@ -412,7 +410,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		var err error
 
 		cpuLimits = newCPULimits(conf, args.Spec.Linux.Resources, willRestoreSandbox(args))
-		if parentPath, inPod := args.Spec.Annotations[cgroupParentAnnotation]; inPod && cpuLimits != nil {
+		if parentPath, inPod := args.Spec.Annotations[specutils.CgroupParentAnnotation]; inPod && cpuLimits != nil {
 			logCPUPoliciesNotApplied(conf, fmt.Sprintf("the orchestrator owns the pod cgroup %q. Note that this means gVisor sandbox lifecycle operations are being capped by the pod CPU limit, and could go faster otherwise", parentPath))
 			cpuLimits = nil
 		}
@@ -755,7 +753,7 @@ func (c *Container) Update(conf *config.Config, res *specs.LinuxResources) error
 				return fmt.Errorf("cgroup cannot be nil")
 			}
 			oldCPULimits := c.Sandbox.CPULimits
-			if _, inPod := c.Spec.Annotations[cgroupParentAnnotation]; !inPod && cgroup.OwnsCPULimit(cg) {
+			if _, inPod := c.Spec.Annotations[specutils.CgroupParentAnnotation]; !inPod && cgroup.OwnsCPULimit(cg) {
 				c.Sandbox.CPULimits = newCPULimits(conf, res, oldCPULimits != nil && oldCPULimits.WillRestore)
 			}
 			if err := cg.Update(c.cgroupResources(res)); err != nil {
@@ -2466,12 +2464,12 @@ func willRestoreSandbox(args Args) bool {
 }
 
 // setupCgroupForRoot configures and returns cgroup for the sandbox and the
-// root container. If `cgroupParentAnnotation` is set, use that path as the
+// root container. If specutils.CgroupParentAnnotation is set, use that path as the
 // sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
 // `cpuLimits`, if set, gives the sandbox cgroup its creation CPU limit.
 func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec, cpuLimits *sandbox.CPULimits) (cgroup.Cgroup, cgroup.Cgroup, error) {
 	var parentCgroup cgroup.Cgroup
-	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
+	if parentPath, ok := spec.Annotations[specutils.CgroupParentAnnotation]; ok {
 		var err error
 		parentCgroup, err = c.createParentCgroup(parentPath, conf)
 		if err != nil {
@@ -2512,7 +2510,7 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec, cp
 // paths to discover new containers and report stats for them.
 func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, error) {
 	if specutils.IsRootContainer(spec) {
-		if _, ok := spec.Annotations[cgroupParentAnnotation]; !ok {
+		if _, ok := spec.Annotations[specutils.CgroupParentAnnotation]; !ok {
 			return nil, nil
 		}
 	}
