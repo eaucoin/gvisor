@@ -503,6 +503,35 @@ docker start --checkpoint <checkpoint-name> <container-name>
     `--checkpoint-dir` flag but this will be required when restoring from a
     checkpoint made in another container.
 
+## Restore validation
+
+A restore checks that the sandbox it brings back still matches what it finds on
+the host, and fails rather than letting the application run on top of
+something else.
+
+### Files
+
+A checkpoint does not contain the files of the filesystems that gVisor reaches
+through its gofer, such as the containers' root filesystems: the restored sandbox
+reopens them. The `--restore-validate-files` flag selects the files whose size
+and modification time a restore compares with the checkpoint's, failing if
+either changed:
+
+-   `rootfs` (default): the files of the containers' root filesystems, that is,
+    their images.
+-   `all`: also the files of the containers' mounts.
+-   `none`: no file.
+
+Only the files that the checkpoint holds, such as running executables and their
+libraries and open files, are checked: the checkpoint knows no others. A
+container restored onto another version of its image, whose executable or
+libraries differ, fails to restore instead of crashing. Mounts are not checked
+by default because their contents may legitimately change between checkpoint
+and restore: Kubernetes writes `/etc/hosts`, `/etc/hostname` and
+`/etc/resolv.conf` for each pod, and a volume may be written by other
+containers, pods or the host while the sandbox is checkpointed. `all` suits
+sandboxes whose mounts do not change, such as read-only volumes.
+
 ## Networking
 
 Checkpoint/restore is supported with `--network=sandbox` (default),
