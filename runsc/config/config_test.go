@@ -1013,3 +1013,31 @@ func TestSignalUnkillablePolicy(t *testing.T) {
 		_ = SignalUnkillablePolicy(-1).String()
 	})
 }
+
+func TestReleaseVersions(t *testing.T) {
+	for _, tc := range []struct {
+		version     string
+		release     bool
+		distributor bool
+	}{
+		{"release-20260706.0", true, false},
+		{"release-20260706", true, false},
+		{"gfoo-20260706.0", true, false},
+		{"release-20260706.0-acme.1", true, true},
+		{"release-20260706.0-acme.12", true, true},
+		{"gfoo-20260706.0-acme.1", true, true},
+		{"release-20260706.0-14-gabcdef123456", false, false},
+		{"release-20260706.0-acme.1-3-gabcdef123456", false, false},
+		{"release-20260706.0-acme", false, false},
+		{"release-20260706.0-Acme.1", false, false},
+		{"xfoo-20260706.0", false, false},
+		{"VERSION_MISSING", false, false},
+	} {
+		if got := IsReleaseVersion(tc.version); got != tc.release {
+			t.Errorf("IsReleaseVersion(%q) = %t, want %t", tc.version, got, tc.release)
+		}
+		if got := IsDistributorReleaseVersion(tc.version); got != tc.distributor {
+			t.Errorf("IsDistributorReleaseVersion(%q) = %t, want %t", tc.version, got, tc.distributor)
+		}
+	}
+}

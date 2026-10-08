@@ -1704,12 +1704,23 @@ func (p SidecarUsagePolicy) AllowEmbeddedFallback() bool {
 }
 
 // releaseVersionRE matches the version strings of production release builds:
-// a `release-` or `g<lowercase>-` prefix, then the release date.
-var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$`)
+// a `release-` or `g<lowercase>-` prefix, then the release date, then, for a
+// distributor's build of that release, `-<distributor>.<n>` (e.g.
+// `release-20260921.0-acme.1`).
+var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?(-[a-z]+\.\d+)?$`)
 
-// IsReleaseVersion returns whether ver is a tagged-release version string.
+// IsReleaseVersion returns whether ver is a tagged-release version string,
+// gVisor's own or a distributor's.
 func IsReleaseVersion(ver string) bool {
 	return releaseVersionRE.MatchString(ver)
+}
+
+// IsDistributorReleaseVersion returns whether ver is the version string of a
+// distributor's build of a release, whose binaries come from that distributor
+// rather than from gVisor's releases.
+func IsDistributorReleaseVersion(ver string) bool {
+	m := releaseVersionRE.FindStringSubmatch(ver)
+	return m != nil && m[1] != ""
 }
 
 // RestoreSpecValidationPolicy dictates how spec validation should be handled.
