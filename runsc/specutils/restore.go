@@ -469,10 +469,14 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 	// Hostname, Domainname, Environment variables and CgroupsPath are
 	// allowed to change during restore. Hooks contain callbacks for
 	// lifecycle of the container such as prestart and teardown, and can
-	// change. Do not validate these fields.
+	// change. OOMScoreAdj is applied by runsc to the sandbox and gofer
+	// processes on the host, from the restored container's spec, like
+	// Resources; Kubernetes derives it from the pod's memory request, so it
+	// changes with the request. Do not validate these fields.
 	oldSpec.Hostname, newSpec.Hostname = "", ""
 	oldSpec.Domainname, newSpec.Domainname = "", ""
 	oldProcess.Env, newProcess.Env = nil, nil
+	oldProcess.OOMScoreAdj, newProcess.OOMScoreAdj = nil, nil
 	oldLinux.CgroupsPath, newLinux.CgroupsPath = "", ""
 	oldSpec.Hooks, newSpec.Hooks = nil, nil
 
