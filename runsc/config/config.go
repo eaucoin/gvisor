@@ -474,6 +474,10 @@ type Config struct {
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 
+	// RestoreValidateFiles selects the files that a restore checks for
+	// changes since the checkpoint.
+	RestoreValidateFiles RestoreValidateFilesPolicy `flag:"restore-validate-files"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -1851,6 +1855,68 @@ func (p RestoreSpecValidationPolicy) String() string {
 		return "enforce"
 	default:
 		panic(fmt.Sprintf("invalid restore spec validation policy %d", p))
+	}
+}
+
+// RestoreValidateFilesPolicy selects the files that a restore checks for
+// changes since the checkpoint. The restore fails if the size or the
+// modification time of a regular file it checks has changed.
+//
+// Only the files that the checkpoint holds, such as running executables and
+// their libraries and open files, are checked: the checkpoint knows no others.
+type RestoreValidateFilesPolicy int
+
+// RestoreValidateFilesPolicy values.
+const (
+	// RestoreValidateFilesNone checks no file.
+	RestoreValidateFilesNone RestoreValidateFilesPolicy = iota
+
+	// RestoreValidateFilesRootfs checks the files of the containers' root
+	// filesystems, i.e. their images, but not those of their mounts.
+	RestoreValidateFilesRootfs
+
+	// RestoreValidateFilesAll checks the files of every filesystem backed by
+	// a gofer.
+	RestoreValidateFilesAll
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *RestoreValidateFilesPolicy) Set(v string) error {
+	switch v {
+	case "none":
+		*p = RestoreValidateFilesNone
+	case "rootfs":
+		*p = RestoreValidateFilesRootfs
+	case "all":
+		*p = RestoreValidateFilesAll
+	default:
+		return fmt.Errorf("invalid restore file validation policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p RestoreValidateFilesPolicy) Ptr() *RestoreValidateFilesPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *RestoreValidateFilesPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p RestoreValidateFilesPolicy) String() string {
+	switch p {
+	case RestoreValidateFilesNone:
+		return "none"
+	case RestoreValidateFilesRootfs:
+		return "rootfs"
+	case RestoreValidateFilesAll:
+		return "all"
+	default:
+		panic(fmt.Sprintf("invalid restore file validation policy %d", p))
 	}
 }
 
