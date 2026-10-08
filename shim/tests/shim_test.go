@@ -32,6 +32,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/anypb"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/shim/shimutils"
 )
 
@@ -155,6 +156,21 @@ func TestCreateSandboxWithContainer(t *testing.T) {
 				t.Fatalf("failed to kill and wait for sandbox: %v", err)
 			}
 		})
+	}
+}
+
+// TestCreateContainerWithoutType verifies that a container with no CRI
+// container type, as a client like ctr creates, is the sandbox's root
+// container: its create returns rather than waiting for output from the
+// sandbox, which the shim would otherwise capture through a pipe that the
+// sandbox inherits and never closes.
+func TestCreateContainerWithoutType(t *testing.T) {
+	containerd := shimutils.NewMockContainerd(t, nil, nil)
+	spec := shimutils.NewSandboxSpec()
+	delete(spec.Annotations, specutils.ContainerdContainerTypeAnnotation)
+	sandbox, client := setupSandboxWithSpec(t, containerd, spec)
+	if err := killAndWaitForContainer(t.Context(), client, sandbox.ID(), containerd); err != nil {
+		t.Fatalf("failed to kill and wait for container: %v", err)
 	}
 }
 

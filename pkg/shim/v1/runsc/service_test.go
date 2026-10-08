@@ -323,3 +323,52 @@ func TestCgroupNoUpdate(t *testing.T) {
 		})
 	}
 }
+
+// TestNewInitRootContainer verifies which containers the shim creates as the
+// sandbox's root container: those runsc boots the sandbox for.
+func TestNewInitRootContainer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        bool
+	}{
+		{
+			name: "CRI sandbox",
+			annotations: map[string]string{
+				specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox,
+			},
+			want: true,
+		},
+		{
+			name: "CRI container",
+			annotations: map[string]string{
+				specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeContainer,
+				specutils.ContainerdSandboxIDAnnotation:     "sandbox",
+			},
+			want: false,
+		},
+		{
+			// A client that is not a CRI, like ctr, sets no container type.
+			name: "no container type",
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			spec := &specs.Spec{
+				Process:     &specs.Process{Args: []string{"sleep", "1000"}},
+				Annotations: tc.annotations,
+			}
+			if err := utils.WriteSpec(bundle, spec); err != nil {
+				t.Fatalf("WriteSpec: %v", err)
+			}
+			p, err := newInit(bundle, "default", nopPlatform{}, &proc.CreateConfig{ID: "c", Bundle: bundle}, &Options{}, "")
+			if err != nil {
+				t.Fatalf("newInit: %v", err)
+			}
+			if p.Sandbox != tc.want {
+				t.Errorf("newInit(%v).Sandbox = %v, want %v", tc.annotations, p.Sandbox, tc.want)
+			}
+		})
+	}
+}
