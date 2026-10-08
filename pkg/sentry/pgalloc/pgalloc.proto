@@ -39,6 +39,18 @@ message ChunkInfoProto {
   bool huge = 1;
 }
 
+// ExtentProto maps a range of MemoryFile offsets to the pages file of one
+// layer of the image.
+message ExtentProto {
+  // start and end are the MemoryFile offsets [start, end).
+  uint64 start = 1;
+  uint64 end = 2;
+  // layer is an index into ImageProto.layers.
+  uint32 layer = 3;
+  // offset is the byte offset of start's data in that layer's pages file.
+  uint64 offset = 4;
+}
+
 message MemoryFileMetadataProto {
   uint64 version = 1;
   repeated ChunkInfoProto chunks = 2;
@@ -48,4 +60,60 @@ message MemoryFileMetadataProto {
   repeated FileRangeProto unwaste_small = 6;
   repeated FileRangeProto unwaste_huge = 7;
   map<uint64, uint64> subreleased = 8;
+
+  // extents maps known-committed pages to their data, sorted by start and
+  // non-overlapping. A known-committed page without an extent is zero. Empty
+  // when the pages are saved inline rather than in pages files.
+  repeated ExtentProto extents = 9;
+
+  // page_hashes holds one hash (ImageProto.page_hash), a little-endian
+  // uint64, per known-committed page in MemoryFile offset order. In a pages
+  // metadata file, it is empty: the page hashes are in the file's page hashes
+  // section (pkg/sentry/state/checkpointimage).
+  bytes page_hashes = 10;
+}
+
+// ResourceIDProto is a checkpoint.ResourceID.
+message ResourceIDProto {
+  string container_name = 1;
+  string path = 2;
+}
+
+// LayerProto identifies an image whose pages file holds data of this image.
+message LayerProto {
+  // digest is the SHA-256 of that image's pages metadata file. It is empty
+  // for layer 0, the image itself.
+  bytes digest = 1;
+  // pages_size is the size of that image's pages file in bytes.
+  uint64 pages_size = 2;
+}
+
+// WorkingSetProto is the set of pages that a sandbox touched first after a
+// restore, in the order it touched them.
+message WorkingSetProto {
+  uint32 version = 1;
+  // unit is the recording granularity in bytes.
+  uint64 unit = 2;
+  // window_ns is how long the set was recorded for.
+  uint64 window_ns = 3;
+  // extents are ranges of the application MemoryFile in first-touch order.
+  repeated FileRangeProto extents = 4;
+}
+
+// ImageProto describes a checkpoint image as a whole. It precedes the
+// MemoryFileMetadataProto of each MemoryFile in the pages metadata file.
+message ImageProto {
+  // layers[0] is this image; others are images that hold some of its pages,
+  // in order of first reference by an extent.
+  repeated LayerProto layers = 1;
+  WorkingSetProto working_set = 2;
+  // page_hash is the hash function of MemoryFileMetadataProto.page_hashes:
+  // 1 is XXH64 (seed 0) of each 4 KiB page.
+  uint32 page_hash = 3;
+  // private_memory_files lists the owners of the private MemoryFiles whose
+  // metadata follows the application MemoryFile's, in that order.
+  repeated ResourceIDProto private_memory_files = 4;
+  // page_hashes_digest is the SHA-256 of the page hashes section of the pages
+  // metadata file if page_hash is not 0, and empty otherwise.
+  bytes page_hashes_digest = 5;
 }
