@@ -736,7 +736,12 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	p.WorkDir = workDir
 	p.IoUID = int(options.IoUID)
 	p.IoGID = int(options.IoGID)
-	p.Sandbox = specutils.SpecContainerType(spec) == specutils.ContainerTypeSandbox
+	// The root container is the one whose create boots the sandbox, and runsc
+	// takes any container that no annotation marks as a subcontainer for it, as
+	// it does for a container created by a client that is not a CRI, like ctr.
+	// The shim must agree, or it would run that create with its output captured
+	// in a pipe that the sandbox inherits and never closes.
+	p.Sandbox = specutils.IsRootContainer(spec)
 	p.UserLog = utils.UserLogPath(spec)
 	if uid, err := utils.PodUID(spec, r.Bundle); err == nil {
 		p.K8sPodUID = uid
