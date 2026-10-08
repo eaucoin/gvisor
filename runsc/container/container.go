@@ -55,8 +55,6 @@ import (
 	"gvisor.dev/gvisor/runsc/starttime"
 )
 
-const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
-
 // validateID validates the container id.
 func validateID(id string) error {
 	// See libcontainer/factory_linux.go.
@@ -2107,11 +2105,11 @@ func (c *Container) createParentCgroup(parentPath string, conf *config.Config) (
 }
 
 // setupCgroupForRoot configures and returns cgroup for the sandbox and the
-// root container. If `cgroupParentAnnotation` is set, use that path as the
+// root container. If specutils.CgroupParentAnnotation is set, use that path as the
 // sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
 func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, cgroup.Cgroup, error) {
 	var parentCgroup cgroup.Cgroup
-	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
+	if parentPath, ok := spec.Annotations[specutils.CgroupParentAnnotation]; ok {
 		var err error
 		parentCgroup, err = c.createParentCgroup(parentPath, conf)
 		if err != nil {
@@ -2148,7 +2146,7 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 // paths to discover new containers and report stats for them.
 func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, error) {
 	if specutils.IsRootContainer(spec) {
-		if _, ok := spec.Annotations[cgroupParentAnnotation]; !ok {
+		if _, ok := spec.Annotations[specutils.CgroupParentAnnotation]; !ok {
 			return nil, nil
 		}
 	}
