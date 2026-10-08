@@ -24,7 +24,9 @@ import (
 	"time"
 
 	task "github.com/containerd/containerd/api/runtime/task/v2"
+	runctypes "github.com/containerd/containerd/api/types/runc/options"
 	tasktype "github.com/containerd/containerd/api/types/task"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -49,9 +51,17 @@ func TestRestoreSandbox(t *testing.T) {
 		// matches a container to the image by. Without it runsc falls back to
 		// creation order, so both paths are worth covering.
 		named bool
+		// taskCheckpoint checkpoints through the containerd task service's
+		// Checkpoint, rather than gVisor's own.
+		taskCheckpoint bool
 	}{
 		{
 			name: "root container only",
+		},
+		{
+			name:           "containerd checkpoint",
+			subcontainers:  1,
+			taskCheckpoint: true,
 		},
 		{
 			name:          "with subcontainer",
@@ -145,15 +155,30 @@ func TestRestoreSandbox(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create checkpoint dir: %v", err)
 			}
-			// Checkpoint has no containerd equivalent, so it arrives on
-			// gVisor's own service — on the same socket as everything else.
-			gvisorClient := containerd.GetTTRPCClient(t)
-			checkpointReq := &pb.CheckpointRequest{
-				Id:        sandbox.ID(),
-				ImagePath: imagePath,
-			}
-			if err := gvisorClient.Call(t.Context(), "gvisor.task.TaskService", "Checkpoint", checkpointReq, &pb.CheckpointResponse{}); err != nil {
-				t.Fatalf("failed to checkpoint sandbox: %v", err)
+			if tc.taskCheckpoint {
+				checkpointOpts, err := typeurl.MarshalAnyToProto(&runctypes.CheckpointOptions{Exit: true})
+				if err != nil {
+					t.Fatalf("failed to marshal checkpoint options: %v", err)
+				}
+				checkpointReq := &task.CheckpointTaskRequest{
+					ID:      sandbox.ID(),
+					Path:    imagePath,
+					Options: checkpointOpts,
+				}
+				if _, err := client.Checkpoint(t.Context(), checkpointReq); err != nil {
+					t.Fatalf("failed to checkpoint sandbox: %v", err)
+				}
+			} else {
+				// gVisor's own service is on the same socket as everything
+				// else.
+				gvisorClient := containerd.GetTTRPCClient(t)
+				checkpointReq := &pb.CheckpointRequest{
+					Id:        sandbox.ID(),
+					ImagePath: imagePath,
+				}
+				if err := gvisorClient.Call(t.Context(), "gvisor.task.TaskService", "Checkpoint", checkpointReq, &pb.CheckpointResponse{}); err != nil {
+					t.Fatalf("failed to checkpoint sandbox: %v", err)
+				}
 			}
 
 			// Restore onto a fresh shim and a fresh runsc state directory,
