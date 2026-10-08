@@ -119,8 +119,26 @@ func (r *FDReader) AddReadv(id int, off int64, total uint64, _ DestinationFile, 
 // Wait implements AsyncReader.Wait.
 func (r *FDReader) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
 retry:
-	numCompletions := 0
 	aioCS, err := r.q.Wait(r.cs, minCompletions)
+	cs, numCompletions := r.complete(cs, aioCS)
+	if numCompletions < minCompletions {
+		minCompletions -= numCompletions
+		goto retry
+	}
+	return cs, err
+}
+
+// WaitOr implements WaitOrAsyncReader.WaitOr.
+func (r *FDReader) WaitOr(cs []Completion, wake <-chan struct{}) ([]Completion, error) {
+	cs, _ = r.complete(cs, r.q.WaitOr(r.cs, wake))
+	return cs, nil
+}
+
+// complete appends to cs the reads that aioCS completes, continues the reads
+// that aioCS only advances, and returns the updated cs and the number of
+// completions it appended.
+func (r *FDReader) complete(cs []Completion, aioCS []aio.Completion) ([]Completion, int) {
+	numCompletions := 0
 	for _, aioC := range aioCS {
 		id := int(aioC.ID)
 		inflight := &r.inflight[id]
@@ -165,9 +183,5 @@ retry:
 			}
 		}
 	}
-	if numCompletions < minCompletions {
-		minCompletions -= numCompletions
-		goto retry
-	}
-	return cs, err
+	return cs, numCompletions
 }
