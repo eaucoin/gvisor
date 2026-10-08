@@ -25,10 +25,14 @@ import (
 	"github.com/containerd/console"
 	apievents "github.com/containerd/containerd/api/events"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
+	runctypes "github.com/containerd/containerd/api/types/runc/options"
 	coreevents "github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
+	typeurl "github.com/containerd/typeurl/v2"
+	"github.com/google/go-cmp/cmp"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/protobuf/types/known/anypb"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
@@ -368,6 +372,67 @@ func TestNewInitRootContainer(t *testing.T) {
 			}
 			if p.Sandbox != tc.want {
 				t.Errorf("newInit(%v).Sandbox = %v, want %v", tc.annotations, p.Sandbox, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckpointOpts verifies how a containerd checkpoint request translates
+// into `runsc checkpoint` options.
+func TestCheckpointOpts(t *testing.T) {
+	anyOf := func(v any) *anypb.Any {
+		a, err := typeurl.MarshalAnyToProto(v)
+		if err != nil {
+			t.Fatalf("MarshalAnyToProto(%v): %v", v, err)
+		}
+		return a
+	}
+	for _, tc := range []struct {
+		name    string
+		req     *task.CheckpointTaskRequest
+		want    *runsccmd.CheckpointOpts
+		wantErr error
+	}{
+		{
+			name: "no options",
+			req:  &task.CheckpointTaskRequest{ID: "c", Path: "/ckpt"},
+			want: &runsccmd.CheckpointOpts{ImagePath: "/ckpt", LeaveRunning: true},
+		},
+		{
+			name: "exit",
+			req: &task.CheckpointTaskRequest{ID: "c", Path: "/ckpt", Options: anyOf(&runctypes.CheckpointOptions{
+				Exit:     true,
+				WorkPath: "/work",
+			})},
+			want: &runsccmd.CheckpointOpts{ImagePath: "/ckpt", WorkPath: "/work"},
+		},
+		{
+			name: "CRIU options",
+			req: &task.CheckpointTaskRequest{ID: "c", Path: "/ckpt", Options: anyOf(&runctypes.CheckpointOptions{
+				OpenTcp:   true,
+				FileLocks: true,
+				ImagePath: "/ckpt",
+			})},
+			want: &runsccmd.CheckpointOpts{ImagePath: "/ckpt", LeaveRunning: true},
+		},
+		{
+			name:    "no path",
+			req:     &task.CheckpointTaskRequest{ID: "c"},
+			wantErr: errdefs.ErrInvalidArgument,
+		},
+		{
+			name:    "other options",
+			req:     &task.CheckpointTaskRequest{ID: "c", Path: "/ckpt", Options: anyOf(&runctypes.Options{})},
+			wantErr: errdefs.ErrInvalidArgument,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := checkpointOpts(tc.req)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("checkpointOpts() error = %v, want %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("checkpointOpts() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
