@@ -225,4 +225,5 @@ go_test(
 proto_library(
     name = "pgalloc_metadata",
     srcs = ["pgalloc.proto"],
+    visibility = ["//:sandbox"],
 )
