@@ -44,6 +44,12 @@ type GvisorTaskServiceEndpoint struct {
 
 // NewServer creates a new GvisorTaskServer.
 func NewServer(rootDir, id string) (*GvisorTaskServiceEndpoint, error) {
+	// The root is runsc's, which runsc creates only when it creates the first
+	// container, after the shim has started: on a node's first sandbox it does
+	// not exist yet.
+	if err := os.MkdirAll(rootDir, 0711); err != nil {
+		return nil, err
+	}
 	addr := addrFromID(rootDir, id)
 	// If the socket already exists, remove it. This can happen if a previous instance of the server
 	// crashed before it was properly shut down.
