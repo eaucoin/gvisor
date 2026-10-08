@@ -69,13 +69,9 @@ var (
 	}
 )
 
-const (
-	// configFile is the default config file name. For containerd 1.2,
-	// we assume that a config.toml should exist in the runtime root.
-	configFile = "config.toml"
-
-	cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
-)
+// configFile is the default config file name. For containerd 1.2, we assume
+// that a config.toml should exist in the runtime root.
+const configFile = "config.toml"
 
 type oomPoller interface {
 	io.Closer
@@ -784,7 +780,7 @@ func setPodCgroup(spec *specs.Spec) bool {
 			if spec.Annotations == nil {
 				spec.Annotations = make(map[string]string)
 			}
-			spec.Annotations[cgroupParentAnnotation] = path
+			spec.Annotations[specutils.CgroupParentAnnotation] = path
 			return true
 		}
 	}
