@@ -390,6 +390,15 @@ restore_direct = true      # runsc restore --direct
 restore_background = true  # runsc restore --background
 ```
 
+This is the shape of Kubernetes' pod checkpoint and restore
+([KEP-5823](https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5823-pod-level-checkpoint-restore)):
+a CRI `CheckpointPod` maps onto the task service's `Checkpoint` of the pod's
+sandbox, with its output path as the image path, and a `RestorePod` onto tasks
+created with `CreateTaskRequest.checkpoint`. A container created from a
+checkpoint stays `CREATED`, as CRI wants it, until the kubelet's
+`StartContainer` restores it, and the sandbox resumes once all of its
+containers are restored.
+
 ## Restore validation
 
 A restore checks that the sandbox it brings back still matches what it finds on

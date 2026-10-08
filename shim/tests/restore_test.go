@@ -219,6 +219,16 @@ func TestRestoreSandbox(t *testing.T) {
 				if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
 					t.Fatalf("failed to create %s from checkpoint: %v", container.ID(), err)
 				}
+				// A container created from a checkpoint is CREATED until it
+				// is started, as CRI's RestorePod wants it: the start, CRI's
+				// StartContainer, restores it.
+				createdResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: container.ID()})
+				if err != nil {
+					t.Fatalf("failed to get state of %s created from checkpoint: %v", container.ID(), err)
+				}
+				if createdResp.Status != tasktype.Status_CREATED {
+					t.Fatalf("%s created from checkpoint has status %v, want %v", container.ID(), createdResp.Status, tasktype.Status_CREATED)
+				}
 				if err := startAndWaitForContainer(t.Context(), restoredClient, container.ID(), restored); err != nil {
 					t.Fatalf("failed to restore %s: %v", container.ID(), err)
 				}
