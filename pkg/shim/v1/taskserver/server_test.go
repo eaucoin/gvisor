@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -226,5 +227,19 @@ func TestServer(t *testing.T) {
 				t.Errorf("Socket file %q still exists", server.Address())
 			}
 		})
+	}
+}
+
+// TestNewServerCreatesRoot verifies that the server creates its root
+// directory, which runsc only creates later, with its first container.
+func TestNewServerCreatesRoot(t *testing.T) {
+	rootDir := filepath.Join(t.TempDir(), "runsc")
+	server, err := NewServer(rootDir, "some-id")
+	if err != nil {
+		t.Fatalf("NewServer(%q) failed: %v", rootDir, err)
+	}
+	defer server.Shutdown(t.Context())
+	if _, err := os.Stat(server.Address()); err != nil {
+		t.Errorf("socket %q: %v", server.Address(), err)
 	}
 }
