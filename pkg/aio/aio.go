@@ -182,6 +182,29 @@ func (q *GoQueue) Add(r Request) {
 	q.requests <- r
 }
 
+// WaitOr blocks until at least one inflight operation has completed or wake is
+// readable, then appends all completed inflight operations to cs and returns
+// the updated slice, which may have no new completions if wake was readable.
+// It receives from wake at most once.
+//
+// Preconditions:
+// - At least one operation is inflight, or wake will be readable.
+func (q *GoQueue) WaitOr(cs []Completion, wake <-chan struct{}) []Completion {
+	select {
+	case c := <-q.completions:
+		cs = append(cs, c)
+	case <-wake:
+	}
+	for {
+		select {
+		case c := <-q.completions:
+			cs = append(cs, c)
+		default:
+			return cs
+		}
+	}
+}
+
 // Wait implements Queue.Wait.
 func (q *GoQueue) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
 	i := 0
