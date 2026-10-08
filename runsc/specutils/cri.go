@@ -39,6 +39,10 @@ const (
 	// containerd to indicate the name of the container.
 	ContainerdContainerNameAnnotation = "io.kubernetes.cri.container-name"
 
+	// ContainerdImageNameAnnotation is the OCI annotation set by containerd
+	// to indicate the name of the image the container was created from.
+	ContainerdImageNameAnnotation = "io.kubernetes.cri.image-name"
+
 	// CRIOContainerTypeAnnotation is the OCI annotation set by
 	// CRI-O to indicate whether the container to create should have
 	// its own sandbox or a container within an existing sandbox.
@@ -55,6 +59,10 @@ const (
 	// which sandbox the container should be created in when the container
 	// is not the first container in the sandbox.
 	CRIOSandboxIDAnnotation = "io.kubernetes.cri-o.SandboxID"
+
+	// CRIOImageNameAnnotation is the OCI annotation set by CRI-O to indicate
+	// the name of the image the container was created from.
+	CRIOImageNameAnnotation = "io.kubernetes.cri-o.ImageName"
 )
 
 // ContainerType represents the type of container requested by the calling container manager.
