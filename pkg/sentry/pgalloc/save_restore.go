@@ -1175,6 +1175,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		return fmt.Errorf("failed to import metadata: %w", err)
 	}
 	chunks := f.chunksLoad()
+	if f.dirty.tracked.Load() {
+		// Dirty tracking was enabled before the metadata was loaded.
+		f.mu.Lock()
+		f.dirty.growLocked(len(chunks))
+		f.mu.Unlock()
+	}
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
