@@ -509,6 +509,21 @@ A restore checks that the sandbox it brings back still matches what it finds on
 the host, and fails rather than letting the application run on top of
 something else.
 
+### Specs
+
+The `--restore-spec-validation` flag (`enforce` by default, or `warning` or
+`ignore`) compares each restored container's OCI spec with the spec it was
+checkpointed with. What places a container on the host may change: its
+environment, hostname, cgroup (including the pod cgroup that the containerd
+shim records in `dev.gvisor.spec.cgroup-parent`), resources and OOM score
+adjustment, and the sources of its mounts. What the checkpointed processes
+depend on may not: among others their arguments, user, capabilities, mounts'
+destinations and options, and the image the container was created from, as its
+container manager names it (`io.kubernetes.cri.image-name` for containerd,
+`io.kubernetes.cri-o.ImageName` for CRI-O). So a sandbox may be restored into a
+new Kubernetes pod whose name, UID, IP address, labels, memory request and
+limit differ, but not with another image or another command.
+
 ### Files
 
 A checkpoint does not contain the files of the filesystems that gVisor reaches
