@@ -123,6 +123,20 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// WaitOrAsyncReader is an AsyncReader whose callers can be interrupted while
+// waiting for completions, e.g. to enqueue a read that another goroutine needs
+// urgently.
+type WaitOrAsyncReader interface {
+	AsyncReader
+
+	// WaitOr is equivalent to Wait(cs, 1), except that it also returns,
+	// possibly without new completions, when wake is readable. It receives
+	// from wake at most once.
+	//
+	// Preconditions: As for Wait(cs, 1).
+	WaitOr(cs []Completion, wake <-chan struct{}) ([]Completion, error)
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be
