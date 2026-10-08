@@ -45,6 +45,9 @@ func releaseTarballURL(ver, goarch string) (string, error) {
 	if !config.IsReleaseVersion(ver) {
 		return "", fmt.Errorf("cannot map version %q to a release download URL; please download sidecar binaries manually", ver)
 	}
+	if config.IsDistributorReleaseVersion(ver) {
+		return "", fmt.Errorf("version %q is a distributor's build, not one of gVisor's releases; please download sidecar binaries from its distributor", ver)
+	}
 	arch, ok := releaseArches[goarch]
 	if !ok {
 		return "", fmt.Errorf("unknown architecture %q", goarch)
