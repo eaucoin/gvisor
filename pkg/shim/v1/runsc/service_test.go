@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // errorPublisher is a publisher that always returns an error.
@@ -283,7 +284,7 @@ func TestCgroupPath(t *testing.T) {
 				},
 			}
 			updated := setPodCgroup(&spec)
-			if got := spec.Annotations[cgroupParentAnnotation]; got != tc.want {
+			if got := spec.Annotations[specutils.CgroupParentAnnotation]; got != tc.want {
 				t.Errorf("setPodCgroup(%q), want: %q, got: %q", tc.path, tc.want, got)
 			}
 			if shouldUpdate := len(tc.want) > 0; shouldUpdate != updated {
