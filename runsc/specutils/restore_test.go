@@ -36,7 +36,8 @@ func podSpec(podUID string) *specs.Spec {
 		},
 		Hostname: "pod-" + podUID,
 		Annotations: map[string]string{
-			CgroupParentAnnotation: "/kubepods/burstable/pod" + podUID,
+			CgroupParentAnnotation:        "/kubepods/burstable/pod" + podUID,
+			ContainerdImageNameAnnotation: "docker.io/library/busybox:1.37.0",
 		},
 		Linux: &specs.Linux{
 			CgroupsPath: "/kubepods/burstable/pod" + podUID + "/" + podUID + "-container",
@@ -81,6 +82,20 @@ func TestValidateSpecsAcrossPods(t *testing.T) {
 				spec.Annotations["dev.gvisor.spec.rootfs.overlay"] = "memory"
 			},
 			wantErr: `"Annotations" does not match`,
+		},
+		{
+			name: "image",
+			mutate: func(spec *specs.Spec) {
+				spec.Annotations[ContainerdImageNameAnnotation] = "docker.io/library/busybox:1.36.1"
+			},
+			wantErr: `"Image" does not match`,
+		},
+		{
+			// A client that is not a CRI names no image.
+			name: "image not named",
+			mutate: func(spec *specs.Spec) {
+				delete(spec.Annotations, ContainerdImageNameAnnotation)
+			},
 		},
 		{
 			name: "args",
