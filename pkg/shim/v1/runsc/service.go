@@ -470,9 +470,53 @@ func (s *runscService) CloseIO(ctx context.Context, r *task.CloseIORequest) (*ty
 	return empty, nil
 }
 
-// Checkpoint checkpoints the container.
+// Checkpoint checkpoints the sandbox of the container into r.Path, as `runsc
+// checkpoint` does.
 func (s *runscService) Checkpoint(ctx context.Context, r *task.CheckpointTaskRequest) (*types.Empty, error) {
-	return empty, errdefs.ErrNotImplemented
+	opts, err := checkpointOpts(r)
+	if err != nil {
+		return nil, errgrpc.ToGRPC(err)
+	}
+	c, err := s.getContainer(r.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.CheckpointSandbox(ctx, opts); err != nil {
+		return nil, errgrpc.ToGRPC(err)
+	}
+	return empty, nil
+}
+
+// checkpointOpts translates a containerd checkpoint request into the options
+// of `runsc checkpoint`.
+//
+// containerd passes the options of runc, its default runtime. Those that make
+// CRIU save more than it does by default (open TCP connections, external
+// sockets, terminals, file locks) have no equivalent: runsc saves all of the
+// sandbox. Those that shape a CRIU restore (empty namespaces, the cgroups mode)
+// have no equivalent either.
+func checkpointOpts(r *task.CheckpointTaskRequest) (*runsccmd.CheckpointOpts, error) {
+	if r.Path == "" {
+		return nil, fmt.Errorf("checkpoint path is required: %w", errdefs.ErrInvalidArgument)
+	}
+	opts := &runsccmd.CheckpointOpts{
+		ImagePath:    r.Path,
+		LeaveRunning: true,
+	}
+	if r.Options == nil {
+		return opts, nil
+	}
+	v, err := typeurl.UnmarshalAny(r.Options)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint options: %w", err)
+	}
+	o, ok := v.(*runctypes.CheckpointOptions)
+	if !ok {
+		return nil, fmt.Errorf("checkpoint options of type %T: %w", v, errdefs.ErrInvalidArgument)
+	}
+	opts.LeaveRunning = !o.Exit
+	opts.WorkPath = o.WorkPath
+	return opts, nil
 }
 
 // Restore restores the container.
