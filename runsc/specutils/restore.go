@@ -175,6 +175,12 @@ func shouldValidateAnnotation(key string) bool {
 	if strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source") {
 		return false
 	}
+	// The cgroup parent names the pod the sandbox runs in, so it changes when a
+	// sandbox is restored into another pod. Like Linux.CgroupsPath, it places
+	// the sandbox on the host and is not part of the checkpointed state.
+	if key == CgroupParentAnnotation {
+		return false
+	}
 	// Flag annotations controlling debug logging can change. They don't impact
 	// the restorability of the snapshot.
 	if strings.HasPrefix(key, annotationFlagPrefix) {
