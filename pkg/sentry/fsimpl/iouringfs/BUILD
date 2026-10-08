@@ -33,7 +33,16 @@ go_library(
 go_test(
     name = "iouringfs_test",
     size = "small",
-    srcs = ["iouringfs_test.go"],
+    srcs = [
+        "dirty_test.go",
+        "iouringfs_test.go",
+    ],
     library = ":iouringfs",
-    deps = ["//pkg/hostarch"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/hostarch",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/vfs",
+    ],
 )
