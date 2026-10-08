@@ -160,6 +160,7 @@ go_test(
     name = "tmpfs_test",
     size = "small",
     srcs = [
+        "dirty_test.go",
         "pipe_test.go",
         "regular_file_test.go",
         "stat_test.go",
@@ -177,6 +178,7 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/vfs",
         "//pkg/usermem",
     ],
