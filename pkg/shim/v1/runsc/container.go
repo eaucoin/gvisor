@@ -104,6 +104,11 @@ type ContainerConfig struct {
 	// are matched by creation order instead, so an unnamed set must be restored
 	// in the order it was created.
 	RestoreImagePath string
+
+	// RestoreDirect and RestoreBackground restore with --direct and
+	// --background, in addition to the containers whose options ask for them.
+	RestoreDirect     bool
+	RestoreBackground bool
 }
 
 // NewContainer returns a new runsc container
@@ -252,8 +257,8 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 	if conf.RestoreImagePath != "" {
 		restoreConf = &extension.RestoreConfig{
 			ImagePath:  conf.RestoreImagePath,
-			Direct:     opts.RestoreDirect,
-			Background: opts.RestoreBackground,
+			Direct:     opts.RestoreDirect || conf.RestoreDirect,
+			Background: opts.RestoreBackground || conf.RestoreBackground,
 		}
 	}
 	c := Container{
