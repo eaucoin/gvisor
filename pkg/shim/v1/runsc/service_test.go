@@ -447,7 +447,7 @@ func TestCgroupPath(t *testing.T) {
 				},
 			}
 			updated := setPodCgroup(&spec)
-			if got := spec.Annotations[cgroupParentAnnotation]; got != tc.want {
+			if got := spec.Annotations[specutils.CgroupParentAnnotation]; got != tc.want {
 				t.Errorf("setPodCgroup(%q), want: %q, got: %q", tc.path, tc.want, got)
 			}
 			if shouldUpdate := len(tc.want) > 0; shouldUpdate != updated {
