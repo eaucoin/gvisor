@@ -571,6 +571,14 @@ const (
 	// pages without writing to them, and by the manual zeroing that replaces
 	// a failed decommit.
 	DirtyMarkDecommit
+
+	// DirtyMarkTmpfsWrite is the mark made by tmpfs before it writes file
+	// data to a disk-backed MemoryFile through the MemoryFile's FD.
+	DirtyMarkTmpfsWrite
+
+	// DirtyMarkIOUring is io_uring's registration of its rings with
+	// MarkAlwaysDirty.
+	DirtyMarkIOUring
 )
 
 // disabledDirtyMarkPath is the DirtyMarkPath disabled by
