@@ -541,6 +541,31 @@ containers are restored. CRI also wants a runtime to reject the restore options
 it does not know; containerd does not implement `RestorePod` yet, so no such
 options reach the shim, and there is nothing for it to check.
 
+### Restoring a pod from its annotations
+
+On Kubernetes versions whose CRI has no `RestorePod`, the kubelet never sets
+`CreateTaskRequest.checkpoint`. Pod annotations select the same restore
+instead, once containerd passes them to the containers' specs:
+
+```toml
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+  pod_annotations = [ "dev.gvisor.internal.restore.*" ]
+```
+
+-   `dev.gvisor.internal.restore.host-image-path`: the host path of the
+    checkpoint to restore the pod from. A pod whose checkpoint does not exist
+    fails to start; it does not start afresh.
+-   `dev.gvisor.internal.restore.direct`: `true` restores with `--direct`.
+-   `dev.gvisor.internal.restore.background`: `true` restores with
+    `--background`.
+
+The shim removes these annotations from the specs it passes to runsc, and
+refuses any other annotation with the `dev.gvisor.internal.restore.` prefix.
+The restored pod's spec is validated against the checkpointed one as with any
+restore (see below), so it must have the same containers, names, images and
+commands.
+
 ## Restore validation
 
 A restore checks that the sandbox it brings back still matches what it finds on
