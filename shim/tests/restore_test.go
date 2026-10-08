@@ -16,7 +16,9 @@ package shim_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +56,9 @@ func TestRestoreSandbox(t *testing.T) {
 		// taskCheckpoint checkpoints through the containerd task service's
 		// Checkpoint, rather than gVisor's own.
 		taskCheckpoint bool
+		// annotations restores from the restore annotations on the
+		// containers' specs, rather than from CreateTaskRequest.checkpoint.
+		annotations bool
 	}{
 		{
 			name: "root container only",
@@ -62,6 +67,12 @@ func TestRestoreSandbox(t *testing.T) {
 			name:           "containerd checkpoint",
 			subcontainers:  1,
 			taskCheckpoint: true,
+		},
+		{
+			name:          "restore annotations",
+			subcontainers: 1,
+			named:         true,
+			annotations:   true,
 		},
 		{
 			name:          "with subcontainer",
@@ -216,6 +227,13 @@ func TestRestoreSandbox(t *testing.T) {
 					Options:    restoredOpts,
 					Checkpoint: imagePath,
 				}
+				if tc.annotations {
+					createReq.Checkpoint = ""
+					annotateSpec(t, container.Bundle(), map[string]string{
+						"dev.gvisor.internal.restore.host-image-path": imagePath,
+						"dev.gvisor.internal.restore.background":      "true",
+					})
+				}
 				if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
 					t.Fatalf("failed to create %s from checkpoint: %v", container.ID(), err)
 				}
@@ -338,6 +356,60 @@ func TestRestoreSubcontainerBeforeRoot(t *testing.T) {
 	// The create left a sandbox running, with nothing restored into it.
 	if _, err := restoredClient.Kill(t.Context(), &task.KillRequest{ID: sandbox.ID(), Signal: 9, All: true}); err != nil {
 		t.Logf("failed to kill sandbox %s: %v", sandbox.ID(), err)
+	}
+}
+
+// TestRestoreAnnotationsMissingCheckpoint verifies that a container whose
+// restore annotation names a checkpoint that does not exist fails to create,
+// rather than starting afresh.
+func TestRestoreAnnotationsMissingCheckpoint(t *testing.T) {
+	containerd := shimutils.NewMockContainerd(t, nil, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	spec := shimutils.NewSandboxSpec()
+	spec.Annotations["dev.gvisor.internal.restore.host-image-path"] = filepath.Join(containerd.WorkingDir(), "no-checkpoint")
+	sandbox, err := shimutils.NewContainer(spec, containerd)
+	if err != nil {
+		t.Fatalf("failed to create sandbox: %v", err)
+	}
+	if err := containerd.StartShim(t, sandbox); err != nil {
+		t.Fatalf("failed to start shim: %v", err)
+	}
+	opts, err := containerd.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options: %v", err)
+	}
+	createReq := &task.CreateTaskRequest{
+		ID:      sandbox.ID(),
+		Bundle:  sandbox.Bundle(),
+		Options: opts,
+	}
+	if _, err := containerd.GetClient(t).Create(t.Context(), createReq); err == nil {
+		t.Errorf("creating %s from a missing checkpoint succeeded, want an error", sandbox.ID())
+	} else if want := "no such file or directory"; !strings.Contains(err.Error(), want) {
+		t.Errorf("creating %s from a missing checkpoint: got error %v, want it to contain %q", sandbox.ID(), err, want)
+	}
+}
+
+// annotateSpec adds annotations to the spec in a container's bundle, as
+// containerd does with the pod annotations its runtime passes on.
+func annotateSpec(t *testing.T, bundle string, annotations map[string]string) {
+	t.Helper()
+	path := filepath.Join(bundle, "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read spec: %v", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("failed to parse spec: %v", err)
+	}
+	maps.Copy(spec.Annotations, annotations)
+	if data, err = json.Marshal(&spec); err != nil {
+		t.Fatalf("failed to marshal spec: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("failed to write spec: %v", err)
 	}
 }
 
