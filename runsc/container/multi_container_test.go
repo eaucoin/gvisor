@@ -4477,6 +4477,10 @@ func TestMultiContainerSharedVolumeCheckpointRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal("Error finding test_app:", err)
 	}
+	appInfo, err := os.Stat(appSrc)
+	if err != nil {
+		t.Fatalf("error statting %q: %v", appSrc, err)
+	}
 
 	setupSpecRoots := func(containerSpecs []*specs.Spec, ids []string) (func(), error) {
 		var cleanupSpecRoots cleanup.Cleanup
@@ -4492,6 +4496,12 @@ func TestMultiContainerSharedVolumeCheckpointRestore(t *testing.T) {
 			appDst := filepath.Join(contRootPath, "app")
 			if err := copyFile(appSrc, appDst); err != nil {
 				return nil, fmt.Errorf("error copying app binary from %q to %q: %v", appSrc, appDst, err)
+			}
+			// The roots of the restored containers are new copies of the same
+			// files, as a container manager creates them from the same image,
+			// which restore's validation of root filesystems accepts.
+			if err := os.Chtimes(appDst, time.Time{}, appInfo.ModTime()); err != nil {
+				return nil, fmt.Errorf("error setting the modification time of %q: %v", appDst, err)
 			}
 		}
 		return cleanupSpecRoots.Release(), nil
