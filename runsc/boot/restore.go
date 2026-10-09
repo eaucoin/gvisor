@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -62,6 +63,13 @@ const (
 	// ContainerSpecsKey is the key used to add and pop the container specs to the
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
+	// PlatformKey is the key used to save the name of the platform in the save
+	// metadata, for tools that check where an image can be restored.
+	PlatformKey = "platform"
+	// CPUFeaturesKey is the key used to save the CPU features that the sandbox
+	// exposes, comma-separated, in the save metadata, for tools that check
+	// where an image can be restored.
+	CPUFeaturesKey = "cpu_features"
 
 	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
 
@@ -729,6 +737,22 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
 
+// cpuFeatureNames returns the names of the CPU features of fs,
+// comma-separated.
+func cpuFeatureNames(fs cpuid.FeatureSet) string {
+	var names []string
+	for _, f := range cpuid.AllFeatures() {
+		if !fs.HasFeature(f) {
+			continue
+		}
+		// Features without a name cannot be checked by name.
+		if _, ok := cpuid.FeatureFromString(f.String()); ok {
+			names = append(names, f.String())
+		}
+	}
+	return strings.Join(names, ",")
+}
+
 // saveWithOpts saves the kernel with the given options.
 func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
 	// Fully serialize save operations, including post-save cleanup. See
@@ -754,6 +778,8 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 	saveOpts.Metadata[VersionKey] = version.Version()
 
 	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
+	saveOpts.Metadata[PlatformKey] = l.root.conf.Platform
+	saveOpts.Metadata[CPUFeaturesKey] = cpuFeatureNames(l.k.FeatureSet())
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
