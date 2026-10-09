@@ -22,11 +22,15 @@
 //
 // - main allocates and touches MIB MiB ("READY <ms to touch>"), then serves
 //   commands read from stdin, one per line: "ping X" answers "PONG X";
-//   "touch" writes every page and answers "TOUCHED <ms>"; "quit" exits.
+//   "touch" writes every page and answers "TOUCHED <ms>"; "verify" checks
+//   that every page holds the dirtier's last write to it and answers
+//   "VERIFIED <pages checked> <pages wrong>"; "quit" exits.
 // - dirtier, BURST_HZ times a second, writes the next
 //   MIB * DIRTY_PCT / 100 / BURST_HZ pages (cycling through the buffer), and
 //   once a second prints "STAT <bursts> <pages> <p50 us> <max us>" for the
-//   bursts of that second.
+//   bursts of that second. Pass G through the buffer writes the byte G % 256
+//   at offset (G % 64) * 8 of each page, so a page that lost its last write,
+//   as a checkpoint that missed it would make it, holds another byte there.
 // - ticker sleeps 1 ms in a loop and prints "GAP <ms>" whenever
 //   CLOCK_MONOTONIC advanced by more than GAP_MS between two wake-ups: the
 //   workload was stopped (checkpoint pause, restore downtime, a demand fault,
@@ -46,6 +50,11 @@
 
 static uint8_t* buf;
 static size_t npages, pagesz;
+// The dirtier's position: the next page it writes, in pass gen. Guarded by mu,
+// which the dirtier holds for each burst.
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static size_t next;
+static uint64_t gen = 1;
 static double dirty_pct;
 static int burst_hz = 10;
 static double gap_ms = 10;
@@ -82,23 +91,23 @@ static void* ticker(void* arg) {
 static void* dirtier(void* arg) {
   (void)arg;
   size_t per_burst = (size_t)(npages * dirty_pct / 100.0 / burst_hz);
-  size_t next = 0;
-  uint8_t gen = 1;
   double lat[1024];
   double period = 1000.0 / burst_hz, start = now_ms(), report = start + 1000;
   int n = 0;
   size_t pages = 0;
   if (per_burst == 0) return NULL;
   for (;;) {
+    pthread_mutex_lock(&mu);
     double t0 = now_ms();
     for (size_t i = 0; i < per_burst; i++) {
-      buf[next * pagesz + (gen % 64) * 8] = gen;
+      buf[next * pagesz + (gen % 64) * 8] = (uint8_t)gen;
       if (++next == npages) {
         next = 0;
         gen++;
       }
     }
     double t1 = now_ms();
+    pthread_mutex_unlock(&mu);
     if (n < 1024) lat[n++] = (t1 - t0) * 1e3;
     pages += per_burst;
     if (t1 >= report) {
@@ -162,6 +171,19 @@ int main(int argc, char** argv) {
       double s = now_ms();
       for (size_t p = 0; p < npages; p++) buf[p * pagesz + pagesz - 1]++;
       printf("TOUCHED %.1f\n", now_ms() - s);
+    } else if (!strncmp(line, "verify", 6)) {
+      // Pages before next were last written in pass gen, the others in the
+      // pass before (or never, in the first pass).
+      size_t checked = 0, wrong = 0;
+      pthread_mutex_lock(&mu);
+      for (size_t p = 0; p < npages; p++) {
+        uint64_t g = p < next ? gen : gen - 1;
+        if (g == 0) continue;
+        checked++;
+        wrong += buf[p * pagesz + (g % 64) * 8] != (uint8_t)g;
+      }
+      pthread_mutex_unlock(&mu);
+      printf("VERIFIED %zu %zu\n", checked, wrong);
     } else if (!strncmp(line, "quit", 4)) {
       break;
     }
