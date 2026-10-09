@@ -144,6 +144,28 @@ func TestDigest(t *testing.T) {
 	}
 }
 
+func TestParseLayerPath(t *testing.T) {
+	d := digestOf("x")
+	p := LayerPath(d, checkpointfiles.PagesFileName)
+	if gotD, gotName, ok := ParseLayerPath(p); !ok || gotD != d || gotName != checkpointfiles.PagesFileName {
+		t.Errorf("ParseLayerPath(%q) = %v, %q, %t; want %v, %q, true", p, gotD, gotName, ok, d, checkpointfiles.PagesFileName)
+	}
+	for _, p := range []string{
+		checkpointfiles.PagesFileName,
+		"layers/" + d.String(),
+		"layers/" + d.String() + "/",
+		"layers/" + d.String() + "/fs/" + checkpointfiles.PagesFileName,
+		"layers/" + strings.ToUpper(d.String()) + "/" + checkpointfiles.PagesFileName,
+		"layers/00/" + checkpointfiles.PagesFileName,
+		"/layers/" + d.String() + "/" + checkpointfiles.PagesFileName,
+		"other/" + d.String() + "/" + checkpointfiles.PagesFileName,
+	} {
+		if _, _, ok := ParseLayerPath(p); ok {
+			t.Errorf("ParseLayerPath(%q) succeeded", p)
+		}
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	parent := digestOf("parent")
 	ip := testImage(parent)
