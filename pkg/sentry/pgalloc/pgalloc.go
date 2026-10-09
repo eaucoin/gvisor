@@ -1484,13 +1484,24 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 
 // MapInternal implements memmap.File.MapInternal.
 func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	return f.mapInternal(fr, at, true /* track */)
+}
+
+// MapInternalUntracked is MapInternal, except that it does not mark pages
+// dirty if at.Write is true. It is used by callers that track their writes
+// through the returned mappings themselves.
+func (f *MemoryFile) MapInternalUntracked(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	return f.mapInternal(fr, at, false /* track */)
+}
+
+func (f *MemoryFile) mapInternal(fr memmap.FileRange, at hostarch.AccessType, track bool) (safemem.BlockSeq, error) {
 	if !fr.WellFormed() || fr.Length() == 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 	if at.Execute {
 		return safemem.BlockSeq{}, linuxerr.EACCES
 	}
-	if at.Write {
+	if at.Write && track {
 		f.markDirtyInternal(fr)
 	}
 

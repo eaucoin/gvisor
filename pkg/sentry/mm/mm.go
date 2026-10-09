@@ -158,6 +158,13 @@ type MemoryManager struct {
 	// maxRSS is protected by activeMu.
 	maxRSS uint64
 
+	// dirtyUnit is the size of the units of pmas that a write disarms for
+	// dirty tracking; see dirty.go. If dirtyUnit is 0,
+	// DefaultDirtyTrackingUnit applies.
+	//
+	// dirtyUnit is protected by activeMu.
+	dirtyUnit hostarch.Addr `state:"nosave"`
+
 	// hasPinned is true if pages in this MemoryManager have ever been pinned
 	// by Pin. It is never cleared, even if all pinned pages are unpinned;
 	// compare Linux's MMF_HAS_PINNED.
@@ -376,6 +383,13 @@ type pma struct {
 	//
 	// Invariant: If huge == true, then private == true.
 	huge bool
+
+	// If dirtyArmed is true, file is a dirty-tracked pgalloc.MemoryFile, and
+	// Write is withheld from effectivePerms and maxPerms so that the next
+	// write to the pma marks it dirty; see dirty.go. dirtyArmed is saved with
+	// the permissions it withholds, so that the next write after a restore
+	// restores them, whether or not the restored MemoryFile is tracked.
+	dirtyArmed bool
 
 	// If internalMappings is not empty, it is the cached return value of
 	// file.MapInternal for the memmap.FileRange mapped by this pma.
