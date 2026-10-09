@@ -112,6 +112,7 @@ deps_test(
 
         # External deps.
         "@com_github_cenkalti_backoff//:go_default_library",
+        "@com_github_cespare_xxhash_v2//:go_default_library",
         "@com_github_google_btree//:go_default_library",
         "@com_github_google_subcommands//:go_default_library",
         "@com_github_moby_sys_capability//:go_default_library",
