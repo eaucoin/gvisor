@@ -45,6 +45,18 @@ TEXT ·AddrOfTouch(SB),NOSPLIT,$0-8
 	MOVD R0, ret+0(FP)
 	RET
 
+TEXT ·store(SB),NOSPLIT,$0
+start:
+	MOVD R8, 0(R8)
+	MOVD $SYS_GETPID, R8   // getpid
+	SVC
+	B start
+
+TEXT ·AddrOfStore(SB),NOSPLIT,$0-8
+	MOVD $·store(SB), R0
+	MOVD R0, ret+0(FP)
+	RET
+
 TEXT ·haltLoop(SB),NOSPLIT,$0
 start:
 	HLT
