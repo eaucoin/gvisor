@@ -24,8 +24,9 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
-	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/timing"
 )
@@ -209,20 +210,30 @@ func (w *CheckpointWaitable) signal(gen CheckpointGeneration, err error) {
 	}
 }
 
-// loadPrivateMemoryFiles loads the private MemoryFiles from mfmap and it reads
-// private MemoryFile metadata from `r`. This consumes bytes from `r`, so this
-// must be called only once.
-func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, fsCheckpointed map[checkpoint.ResourceID]struct{}, opts *pgalloc.LoadOpts) error {
-	// Load the metadata.
-	var meta privateMemoryFileMetadata
-	if _, err := state.Load(ctx, r, &meta); err != nil {
-		return err
+// privateMemoryFileOwners returns the owners of the private MemoryFiles of
+// the image whose image-level metadata is image, in the order in which their
+// metadata is saved.
+func privateMemoryFileOwners(image *pgallocpb.ImageProto) []checkpoint.ResourceID {
+	owners := make([]checkpoint.ResourceID, len(image.GetPrivateMemoryFiles()))
+	for i, id := range image.GetPrivateMemoryFiles() {
+		owners[i] = checkpoint.ResourceID{
+			ContainerName: id.GetContainerName(),
+			Path:          id.GetPath(),
+		}
 	}
+	return owners
+}
+
+// loadPrivateMemoryFiles loads the private MemoryFiles from mfmap and it reads
+// private MemoryFile metadata from `r`, in the order of the owners recorded in
+// opts.Image. This consumes bytes from `r`, so this must be called only once.
+func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, fsCheckpointed map[checkpoint.ResourceID]struct{}, opts *pgalloc.LoadOpts) error {
+	owners := privateMemoryFileOwners(opts.Image)
 	// Ensure that it is consistent with mfmap, unless we are restoring from
 	// split filesystem checkpoint.
 	if fsCheckpointed != nil {
-		ownersMap := make(map[checkpoint.ResourceID]struct{}, len(meta.owners))
-		for _, fsID := range meta.owners {
+		ownersMap := make(map[checkpoint.ResourceID]struct{}, len(owners))
+		for _, fsID := range owners {
 			ownersMap[fsID] = struct{}{}
 		}
 
@@ -239,10 +250,10 @@ func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoi
 		}
 
 		// Load from sentry checkpoint.
-		for _, fsID := range meta.owners {
+		for _, fsID := range owners {
 			mf, ok := mfmap[fsID]
 			if !ok {
-				return fmt.Errorf("saved private memory file for %q was not configured on restore", fsID)
+				return fmt.Errorf("saved private memory file %q was not configured on restore", fsID)
 			}
 			err := mf.LoadFrom(ctx, r, opts)
 			if err != nil {
@@ -251,14 +262,14 @@ func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoi
 		}
 		return nil
 	}
-	if len(mfmap) != len(meta.owners) {
-		return fmt.Errorf("inconsistent private memory files on restore: savedMFOwners = %v, mfmap = %v", meta.owners, mfmap)
+	if len(mfmap) != len(owners) {
+		return fmt.Errorf("inconsistent private memory files on restore: savedMFOwners = %v, mfmap = %v", owners, mfmap)
 	}
 	// Load all private memory files.
-	for _, fsID := range meta.owners {
+	for _, fsID := range owners {
 		mf, ok := mfmap[fsID]
 		if !ok {
-			return fmt.Errorf("saved private memory file for %q was not configured on restore", fsID)
+			return fmt.Errorf("saved private memory file %q was not configured on restore", fsID)
 		}
 		err := mf.LoadFrom(ctx, r, opts)
 		if err != nil {
@@ -268,8 +279,15 @@ func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoi
 	return nil
 }
 
+// loadMemoryFiles loads MemoryFiles saved inline in the state file r.
 func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
-	var opts pgalloc.LoadOpts
+	opts := pgalloc.LoadOpts{Image: &pgallocpb.ImageProto{}}
+	if err := checkpointimage.ReadRecord(r, opts.Image, checkpointimage.MaxBodySize); err != nil {
+		return fmt.Errorf("failed to read image metadata: %w", err)
+	}
+	if err := checkpointimage.ValidateImage(opts.Image); err != nil {
+		return err
+	}
 	if err := k.mf.LoadFrom(ctx, r, &opts); err != nil {
 		return fmt.Errorf("failed to load main MemoryFile %p: %w", k.mf, err)
 	}
@@ -301,6 +319,7 @@ type AsyncMFLoader struct {
 	metadataErr error
 
 	loadWg  sync.WaitGroup
+	loadMu  sync.Mutex
 	loadErr error
 }
 
@@ -309,56 +328,65 @@ type privateMFsInfo struct {
 	fsCheckpointed map[checkpoint.ResourceID]struct{}
 }
 
-// NewAsyncMFLoader creates a new AsyncMFLoader. It takes ownership of
-// pagesMetadata and pagesFile. It creates a background goroutine that will
-// load all the MemoryFiles. The background goroutine immediately starts
-// loading the main MemoryFile.
+// NewAsyncMFLoader creates a new AsyncMFLoader of the MemoryFiles of image,
+// whose layers' pages files are pagesFiles. It takes ownership of pagesFiles.
+// It creates a background goroutine that will load all the MemoryFiles. The
+// background goroutine immediately starts loading the main MemoryFile.
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
 		privateMFsChan: make(chan privateMFsInfo, 1),
 	}
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline)
+	go mfl.backgroundGoroutine(image, pagesFiles, mainMF, timeline)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
+func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
 	defer timeline.End()
-	defer pagesMetadata.Close()
 	cu := cleanup.Make(func() {
 		mfl.metadataWg.Done()
 		mfl.loadWg.Done()
 	})
 	defer cu.Clean()
 
-	mfl.loadWg.Add(1)
-	apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
-		defer mfl.loadWg.Done()
-		mfl.loadErr = err
-	}, timeline) // transfers ownership of pagesFile
-	if err != nil {
-		mfl.loadWg.Done()
-		log.Warningf("Failed to start async page loading: %v", err)
-		return
-	}
-	cu.Add(apfl.MemoryFilesDone)
-
+	// Start loading from the pages file of every layer.
 	opts := pgalloc.LoadOpts{
-		PagesFile: apfl,
-		Timeline:  timeline,
+		Image:      image.Proto,
+		PagesFiles: make([]*pgalloc.AsyncPagesFileLoad, len(pagesFiles)),
+		Timeline:   timeline,
 	}
-	// Note that we depend on opts.PagesFileOffset being carried between
-	// LoadFrom calls, so the same opts must be used for all calls.
+	for i, pagesFile := range pagesFiles {
+		mfl.loadWg.Add(1)
+		apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
+			defer mfl.loadWg.Done()
+			mfl.setLoadErr(err)
+		}, timeline) // transfers ownership of pagesFile
+		if err != nil {
+			mfl.loadWg.Done()
+			for _, pagesFile := range pagesFiles[i+1:] {
+				pagesFile.Close()
+			}
+			err = fmt.Errorf("failed to start async page loading from layer %d: %w", i, err)
+			log.Warningf("%v", err)
+			mfl.mainMetadataErr = err
+			mfl.metadataErr = err
+			mfl.mainMFStartWg.Done()
+			return
+		}
+		cu.Add(apfl.MemoryFilesDone)
+		opts.PagesFiles[i] = apfl
+	}
 
 	timeline.Reached("loading mainMF")
 	log.Infof("Loading metadata for main MemoryFile: %p", mainMF)
 	ctx := context.Background()
-	err = mainMF.LoadFrom(ctx, pagesMetadata, &opts)
+	records := image.MemoryFileRecords()
+	err := mainMF.LoadFrom(ctx, records, &opts)
 	mfl.metadataErr = err
 	mfl.mainMetadataErr = err
 	mfl.mainMFStartWg.Done()
@@ -370,7 +398,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	info := <-mfl.privateMFsChan
 	timeline.Reached("received privateMFs info")
 	log.Infof("Loading metadata for %d private MemoryFiles", len(info.mfmap))
-	if err := loadPrivateMemoryFiles(ctx, pagesMetadata, info.mfmap, info.fsCheckpointed, &opts); err != nil {
+	if err := loadPrivateMemoryFiles(ctx, records, info.mfmap, info.fsCheckpointed, &opts); err != nil {
 		log.Warningf("Failed to load private MemoryFiles: %v", err)
 		mfl.metadataErr = err
 		return
@@ -389,6 +417,18 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 		return
 	}
 	log.Infof("All MemoryFile pages have been loaded.")
+}
+
+// setLoadErr records err, if it is the first error of a pages file.
+func (mfl *AsyncMFLoader) setLoadErr(err error) {
+	if err == nil {
+		return
+	}
+	mfl.loadMu.Lock()
+	defer mfl.loadMu.Unlock()
+	if mfl.loadErr == nil {
+		mfl.loadErr = err
+	}
 }
 
 // KickoffPrivate notifies the background goroutine of the private MemoryFiles.
