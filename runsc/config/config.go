@@ -436,6 +436,16 @@ type Config struct {
 	// TestOnlyAutosaveResume indicates save resume for syscall tests.
 	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
 
+	// TestOnlyAutosaveCompression is the compression level of auto saves for
+	// syscall tests: "none" writes a separate pages file, which runsc restore
+	// --background loads lazily.
+	TestOnlyAutosaveCompression string `flag:"TESTONLY-autosave-compression"`
+
+	// TestOnlyRestoreReadRate, if not 0, limits the rate at which a restore
+	// reads its pages files, in bytes per second, as a throttled disk does,
+	// for tests that cannot throttle a device.
+	TestOnlyRestoreReadRate uint64 `flag:"TESTONLY-restore-read-rate"`
+
 	// RestoreSpecValidation indicates the level of spec validation to be
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
