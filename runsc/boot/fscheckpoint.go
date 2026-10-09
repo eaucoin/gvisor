@@ -34,6 +34,7 @@ import (
 	fspb "gvisor.dev/gvisor/pkg/sentry/fscheckpoint/fscheckpoint_proto_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
@@ -229,6 +230,9 @@ type fsRestoreBundle struct {
 
 	// immutable after fsRestore.wg.Wait()
 	apfl *pgalloc.AsyncPagesFileLoad
+	// image is the image the bundle's MemoryFiles are loaded with: its pages
+	// file is their one layer.
+	image *pgallocpb.ImageProto
 }
 
 // fsRestore holds the state of a filesystem restore.
@@ -504,6 +508,11 @@ func startFSRestore(optsList []fsRestoreOpts) (*fsRestore, error) {
 				return fmt.Errorf("failed to start async page loading: %w", err)
 			}
 			bundle.apfl = apfl
+			// The pages of the bundle's MemoryFiles are all in its pages file,
+			// and are not hashed.
+			bundle.image = &pgallocpb.ImageProto{
+				Layers: []*pgallocpb.LayerProto{{PagesSize: manifest.PagesSize}},
+			}
 			// Note that apfl.MemoryFilesDone() will never be called on success.
 			// This is because if a container fails and is restarted, we also want
 			// to restore the filesystem of the restarted container, so we need to
@@ -630,13 +639,10 @@ func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (
 	if mmf.PagesMetadataStart > mmf.PagesMetadataEnd || mmf.PagesMetadataEnd > uint64(len(pagesMetadata)) {
 		return nil, nil, c.setError(fmt.Errorf("MemoryFile %q has invalid pages metadata range [%d, %d) for file size %d", mmf.ResourceID, mmf.PagesMetadataStart, mmf.PagesMetadataEnd, len(pagesMetadata))) // +checklocksignore
 	}
-	if !hostarch.IsPageAligned(mmf.PagesStart) {
-		return nil, nil, c.setError(fmt.Errorf("MemoryFile %q pages offset %d is not page-aligned (page size %d)", mmf.ResourceID, mmf.PagesStart, hostarch.PageSize)) // +checklocksignore
-	}
 	c.asyncLoads++ // +checklocksignore
 	return bytes.NewReader(pagesMetadata[mmf.PagesMetadataStart:mmf.PagesMetadataEnd]), &pgalloc.LoadOpts{
-		PagesFile:       bundle.apfl,
-		PagesFileOffset: mmf.PagesStart,
+		Image:      bundle.image,
+		PagesFiles: []*pgalloc.AsyncPagesFileLoad{bundle.apfl},
 		DoneCallback: func(err error) {
 			fsr.waitMu.Lock()
 			defer fsr.waitMu.Unlock()

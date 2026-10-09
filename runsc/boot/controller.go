@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -400,7 +402,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		// limit.
 		readerCPUs = cm.l.root.applicationCores
 	}
-	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o, readerCPUs)
+	stateFile, image, pagesFiles, err := getRestoreReaders(o, readerCPUs)
 	if err != nil {
 		return err
 	}
@@ -408,10 +410,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		if stateFile != nil {
 			stateFile.Close()
 		}
-		if pagesMetadata != nil {
-			pagesMetadata.Close()
-		}
-		if pagesFile != nil {
+		for _, pagesFile := range pagesFiles {
 			pagesFile.Close()
 		}
 	}()
@@ -434,9 +433,8 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		// This immediately starts loading the main MemoryFile asynchronously.
 		// For background restore, throttle page loading until the kernel is
 		// restored, so that restore does not wait behind page reads.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
-		pagesMetadata = nil
-		pagesFile = nil
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
+		pagesFiles = nil
 		timer.Reached("created async MF loader")
 	}
 
@@ -499,16 +497,19 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	return err
 }
 
-// getRestoreReaders returns readers for the checkpoint files
-// (appropriate for `cpus` CPUs).
-func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+// getRestoreReaders returns the readers of the checkpoint files in o: the
+// state file and, if o.HavePagesFile, the image read from the pages metadata
+// file and the pages file of each of its layers (appropriate for `cpus`
+// CPUs). The pages metadata file and the identity of every layer are checked
+// before anything is loaded.
+func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
 	if o.UseCheckpointGofer {
 		return getRestoreReadersForCheckpointGofer(o)
 	}
 	return getRestoreReadersForLocalCheckpointFiles(o, cpus)
 }
 
-func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
 	stateFile, err := o.ReleaseFD(0)
 	if err != nil {
 		return nil, nil, nil, err
@@ -527,27 +528,56 @@ func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int
 		cu.Release()
 		return stateFile, nil, nil, nil
 	}
+	want := 3 + o.LayerFiles
+	if o.HaveDeviceFile {
+		want++
+	}
+	if len(o.Files) != want {
+		return nil, nil, nil, fmt.Errorf("got %d files, want %d", len(o.Files), want)
+	}
 	pagesMetadataFile, err := o.ReleaseFD(1)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	cu.Add(func() { pagesMetadataFile.Close() })
-	pagesFile, err := o.ReleaseFD(2)
+	pagesMetadata := bufio.NewReader(pagesMetadataFile)
+	image, err := checkpointimage.ReadMetadata(pagesMetadata)
 	if err != nil {
-		return nil, nil, nil, err
+		pagesMetadataFile.Close()
+		return nil, nil, nil, fmt.Errorf("reading pages metadata file: %w", err)
+	}
+	// Loading needs only the metadata; incremental saves need the page
+	// hashes too.
+	image.ReadHashesAsync(pagesMetadata, func() { pagesMetadataFile.Close() })
+	layers := image.Layers()
+	if len(layers) != 1+o.LayerFiles {
+		return nil, nil, nil, fmt.Errorf("image has %d layers, but %d pages files were passed", len(layers), 1+o.LayerFiles)
+	}
+	var pagesFiles []stateio.AsyncReader
+	cu.Add(func() {
+		for _, pagesFile := range pagesFiles {
+			pagesFile.Close()
+		}
+	})
+	for i, layer := range layers {
+		pagesFile, err := o.ReleaseFD(2 + i)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if err := unix.Fstat(pagesFile.FD(), &stat); err != nil {
+			pagesFile.Close()
+			return nil, nil, nil, err
+		}
+		if uint64(stat.Size) != layer.PagesSize {
+			pagesFile.Close()
+			return nil, nil, nil, fmt.Errorf("pages file of layer %d (%v) is %d bytes, the image expects %d", i, layer.Digest, stat.Size, layer.PagesSize)
+		}
+		pagesFiles = append(pagesFiles, stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release()), cpus))
 	}
 	cu.Release()
-	// //pkg/state/wire reads one byte at a time; buffer reads from
-	// pagesMetadataFile to avoid making one syscall per read. For the state
-	// file, this buffering is handled by statefile.NewReader() =>
-	// compressio.Reader or compressio.NewSimpleReader().
-	return stateFile,
-		stateio.NewBufioReadCloser(pagesMetadataFile),
-		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release()), cpus),
-		nil
+	return stateFile, image, pagesFiles, nil
 }
 
-func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
 	clientFD, err := unix.Dup(int(o.Files[0].Fd()))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to dup checkpoint gofer client FD: %w", err)
@@ -571,29 +601,77 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to buffer state file: %w", err)
 	}
+	cu := cleanup.Make(func() { stateFile.Close() })
+	defer cu.Clean()
 
-	pagesMetadataAsync, err := afc.OpenRead(checkpointfiles.PagesMetadataFileName)
+	pagesMetadata, err := afc.OpenRead(checkpointfiles.PagesMetadataFileName)
 	if err != nil {
 		// This might be fs.ErrNotExist or unix.ENOENT, but this detail is lost
 		// by URPC (which only preserves the error string), so log and continue
 		// under the assumption that it is.
 		log.Infof("Failed to open pages metadata file: %v", err)
 		o.HavePagesFile = false
+		cu.Release()
 		return stateFile, nil, nil, nil
 	}
-	pagesMetadata, err := stateio.NewBufReader(pagesMetadataAsync /* transfers ownership */, 8<<20 /* size = 8 MiB */)
+	image, err := readImage(pagesMetadata /* transfers ownership */, checkpointfiles.PagesMetadataFileName, true /* hashes */)
 	if err != nil {
-		stateFile.Close()
-		return nil, nil, nil, fmt.Errorf("failed to buffer pages metadata file: %w", err)
+		return nil, nil, nil, err
 	}
-	pagesFile, err := afc.OpenRead(checkpointfiles.PagesFileName)
-	if err != nil {
-		pagesMetadata.Close()
-		stateFile.Close()
-		return nil, nil, nil, fmt.Errorf("failed to open pages file: %w", err)
+	var pagesFiles []stateio.AsyncReader
+	cu.Add(func() {
+		for _, pagesFile := range pagesFiles {
+			pagesFile.Close()
+		}
+	})
+	for i, layer := range image.Layers() {
+		name := checkpointfiles.PagesFileName
+		if i != 0 {
+			// Check the layer's identity before reading its pages.
+			metaName := checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesMetadataFileName)
+			layerMetadata, err := afc.OpenRead(metaName)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("layer %d (%v): failed to open %s: %w", i, layer.Digest, metaName, err)
+			}
+			layerImage, err := readImage(layerMetadata /* transfers ownership */, metaName, false /* hashes */)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("layer %d (%v): %w", i, layer.Digest, err)
+			}
+			if layerImage.Digest != layer.Digest {
+				return nil, nil, nil, fmt.Errorf("layer %d: %s has digest %v", i, metaName, layerImage.Digest)
+			}
+			name = checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesFileName)
+		}
+		pagesFile, err := afc.OpenRead(name)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to open pages file %s: %w", name, err)
+		}
+		pagesFiles = append(pagesFiles, pagesFile)
 	}
 	o.HavePagesFile = true
-	return stateFile, pagesMetadata, pagesFile, nil
+	cu.Release()
+	return stateFile, image, pagesFiles, nil
+}
+
+// readImage reads the metadata of the pages metadata file f, named name, and if
+// hashes is true, its page hashes in the background
+// (checkpointimage.ReadHashesAsync). It takes ownership of f.
+func readImage(f stateio.AsyncReader, name string, hashes bool) (*checkpointimage.Image, error) {
+	r, err := stateio.NewBufReader(f /* transfers ownership */, 1<<20 /* size = 1 MiB */)
+	if err != nil {
+		return nil, fmt.Errorf("failed to buffer %s: %w", name, err)
+	}
+	image, err := checkpointimage.ReadMetadata(r)
+	if err != nil {
+		r.Close()
+		return nil, fmt.Errorf("reading %s: %w", name, err)
+	}
+	if hashes {
+		image.ReadHashesAsync(r, func() { r.Close() })
+	} else {
+		r.Close()
+	}
+	return image, nil
 }
 
 func (cm *containerManager) onRestoreFailed(err error) {
