@@ -690,6 +690,15 @@ touching all of 512 MiB right after a restore took 0.17-0.25 s longer
 (0.10-0.15 s for a Python one). `4K` records no memory that was not touched,
 at the cost of a page fault for every page.
 
+Since what an application touches first after a restore varies little from
+one restore to the next, a background restore of an image that holds a working
+set (`--background`) reads the set's pages before the rest of `pages.img`,
+while faults still come first, unless `--working-set-prefetch=off`, or unless
+the image loads whole within 300 ms, when reading it first cannot help.
+Rewriting the image with `--working-set-first` makes reading it one sequential
+read of the head of `pages.img`, which matters on object stores, where every
+read is a request.
+
 The restore's log reports how much of what the application touched the
 restored image's working set held, and how much of it was not touched; the
 metrics `/checkpoint/working_set_hit_bytes`, `/checkpoint/working_set_miss_bytes`

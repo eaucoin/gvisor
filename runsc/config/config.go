@@ -487,6 +487,10 @@ type Config struct {
 	// WorkingSetUnit is the granularity of working sets.
 	WorkingSetUnit WorkingSetUnit `flag:"working-set-unit"`
 
+	// WorkingSetPrefetch is whether a background restore loads the working set
+	// saved in the image before the rest of its memory.
+	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -1977,6 +1981,58 @@ func (u WorkingSetUnit) String() string {
 		return "64K"
 	default:
 		panic(fmt.Sprintf("invalid working set unit %d", u))
+	}
+}
+
+// WorkingSetPrefetch is the policy of a background restore for the working set
+// saved in the image.
+type WorkingSetPrefetch int
+
+// WorkingSetPrefetch values.
+const (
+	// WorkingSetPrefetchAuto loads the working set before the rest of the
+	// image's memory, unless the image would load whole quickly enough that
+	// prefetching cannot help.
+	WorkingSetPrefetchAuto WorkingSetPrefetch = iota
+
+	// WorkingSetPrefetchOff loads the image's memory in the order of its
+	// pages files.
+	WorkingSetPrefetchOff
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *WorkingSetPrefetch) Set(v string) error {
+	switch v {
+	case "auto":
+		*p = WorkingSetPrefetchAuto
+	case "off":
+		*p = WorkingSetPrefetchOff
+	default:
+		return fmt.Errorf("invalid working set prefetch policy %q: must be auto or off", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p WorkingSetPrefetch) Ptr() *WorkingSetPrefetch {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *WorkingSetPrefetch) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p WorkingSetPrefetch) String() string {
+	switch p {
+	case WorkingSetPrefetchAuto:
+		return "auto"
+	case WorkingSetPrefetchOff:
+		return "off"
+	default:
+		panic(fmt.Sprintf("invalid working set prefetch policy %d", p))
 	}
 }
 
