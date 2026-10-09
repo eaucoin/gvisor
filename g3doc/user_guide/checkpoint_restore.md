@@ -134,7 +134,10 @@ An uncompressed checkpoint image is a directory of three files:
 
 The SHA-256 of `pages_meta.img` up to its page hashes identifies the image: it
 covers the location of every saved page and the digest of the page hashes, so
-it changes whenever the image's memory does.
+it changes whenever the image's memory does. The metadata at the start of
+`checkpoint.img` gives the version of the format of `pages_meta.img` as
+`image_format`. The [checkpoint image format](../proposals/checkpoint_image_format.md)
+describes these files byte by byte, and how images refer to their layers.
 
 The pages of an image may be held by the `pages.img` of other images, its
 *layers*, which `pages_meta.img` names by their identity. However long the
