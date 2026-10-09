@@ -3,7 +3,9 @@
 # and save/resume variants, sharded; runsc's container checkpoint tests run on
 # systrap, on systrap with transparent huge pages for shared memory (as
 # runsc/boot sets them up), and on kvm, which GitHub's runners expose as
-# nested virtualization, together with the kvm platform's own tests; runsc is
+# nested virtualization, together with the kvm platform's own tests and, on
+# systrap and kvm, a pod checkpointed and restored through the containerd shim
+# in a one-node Kubernetes cluster (tools/fork/pod_restore_test.sh); runsc is
 # built and smoke-tested on aarch64; and the tests of every direct dependent
 # of a changed package are built. The
 # result is posted as the "fork-nightly" commit status of the commit tested.
@@ -223,6 +225,9 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/release"
           make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
           ../fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --platform=${{ matrix.platform }}
+      - name: Pod checkpoint and restore through the shim
+        if: ${{ !matrix.thp }}
+        run: fork/tools/fork/pod_restore_test.sh "${RUNNER_TEMP}/release" --platform=${{ matrix.platform }}
       - name: kvm platform tests
         if: matrix.platform == 'kvm'
         working-directory: src
