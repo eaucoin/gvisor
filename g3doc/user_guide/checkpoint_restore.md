@@ -116,6 +116,54 @@ that until the sandbox has fully restored (async page loading has completed):
 You can use `runsc wait --restore` to wait for restore to complete fully, after
 which you can clean up the `--image-path` directory if necessary.
 
+## Checkpoint images and their layers
+
+An uncompressed checkpoint image is a directory of three files:
+
+-   `checkpoint.img`: the state of the sandbox's kernel, and metadata such as
+    the version of runsc that saved it. A runsc binary restores only images
+    saved by the same version.
+-   `pages.img`: the contents of memory pages, page-aligned, in any order.
+-   `pages_meta.img`: where the contents of each saved page are, then a hash of
+    each saved page. It starts with the magic `gVisorPM` and a major and minor
+    format version (a build of runsc reads only its own major version, and
+    minor versions up to its own), and its header and contents are protected by
+    CRC-64 checksums, which `runsc restore` checks before reading anything
+    else. A restore does not wait for the page hashes, which are 2 MiB per GiB
+    of memory.
+
+The SHA-256 of `pages_meta.img` up to its page hashes identifies the image: it
+covers the location of every saved page and the digest of the page hashes, so
+it changes whenever the image's memory does.
+
+The pages of an image may be held by the `pages.img` of other images, its
+*layers*, which `pages_meta.img` names by their identity. However long the
+chain of images that produced it, every range of memory is read directly from
+the layer that holds it. To restore such an image, `runsc restore` looks for
+each layer, in order:
+
+1.  in the image's own directory, at `layers/<identity>/` (a directory holding
+    the layer's `pages_meta.img` and `pages.img`, or a symbolic link to one);
+2.  in each directory given with `--layer-path`, which may be the layer's image
+    directory itself or a directory of image directories named by their
+    identity.
+
+`runsc restore` checks the identity of each layer it finds and the size of its
+`pages.img`, and fails before starting the sandbox if a layer is missing or
+does not match:
+
+```bash
+runsc restore --image-path=<path> --layer-path=<parent image path> <container id>
+```
+
+Images read through a checkpoint gofer (such as `gs://` image paths) find their
+layers under the image's prefix, as objects `layers/<identity>/pages_meta.img`
+and `layers/<identity>/pages.img`.
+
+With `--background`, pages are loaded from every layer in parallel, each
+layer's `pages.img` read from start to end, and an access to a page that is not
+loaded yet waits for the layer that holds it.
+
 ## How to use checkpoint/restore in Docker:
 
 Run a container:
