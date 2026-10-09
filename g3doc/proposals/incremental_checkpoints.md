@@ -262,6 +262,29 @@ stopping round 0 early would move the rest of memory into the pause. So the
 first checkpoint with `auto` always runs round 0, and the later ones decide
 before any round.
 
+### Throttling
+
+A sandbox that dirties memory faster than half the store's speed keeps the
+rounds from converging; the halving rule then stops them, and the pause writes
+most of memory anyway (2.3 s at 200 MiB/s against a 100 MiB/s store). With
+`--precopy-throttle=on`, the first round that does not halve the bytes left
+throttles instead of stopping: until the save completes, each MemoryManager's
+tasks may dirty memory at most at a quarter of the write bandwidth measured,
+at which each round writes at most a quarter of the bytes of the previous one.
+This is QEMU's dirty-limit, applied to MemoryManagers rather than vCPUs: the
+write-protection source counts the bytes that each MemoryManager's faults
+disarm, and after a fault the faulting task waits, in an interruptible block,
+as long as a token bucket (100 ms of burst) says its MemoryManager is over the
+limit. Tasks that write little are never delayed. Throttling therefore needs
+the write-protection source's faults; a source without per-task faults, such
+as userfaultfd, would have to throttle through scheduling.
+
+On experiment 06's workload at 200 MiB/s with writes limited to 100 MiB/s
+(median of 3), the rounds stop after the first without throttling, with a
+2,036 ms pause and 1.7 times the image written; with it, they converge after
+4 rounds (the model predicts 4), with a 61 ms pause (56–99 ms) and 2.1 times
+the image written, and the checkpoint takes 5.8 s instead of 4.7 s.
+
 ### Metrics
 
 Metric                                | Kind                                       | What
@@ -274,10 +297,12 @@ Metric                                | Kind                                    
 `/checkpoint/precopy_stops`           | counter, field `reason`                    | pre-copies by why their rounds stopped: `converged`, `round_cap`, `not_halved`, `skipped`
 `/checkpoint/precopy_pause`           | distribution, ns                           | the pause of each save that completed a pre-copy
 `/checkpoint/precopy_longest_stall`   | distribution, ns                           | per pre-copy, the longest that tasks were kept from running before the pause
+`/checkpoint/precopy_throttled_ns`    | counter                                    | time that throttling delayed tasks
 
 Tasks are kept from running while a pre-copy starts dirty tracking (a Kernel
-pause) and while it re-arms the dirty sources for a round (Sentry
-write-protection pauses the Kernel to arm every MemoryManager).
+pause), while it re-arms the dirty sources for a round (Sentry
+write-protection pauses the Kernel to arm every MemoryManager), and while
+throttling delays them.
 
 ### Measurements
 
