@@ -961,6 +961,16 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	if f.dirty.tracked.Load() {
 		f.dirty.growLocked(int(newNrChunks))
 	}
+	if f.dirty.writesArmed {
+		if err := f.armInternalWritesLocked(newChunks); err != nil {
+			// The new chunks are not added.
+			f.dirty.armedChunks = int(oldNrChunks)
+			if _, _, errno := unix.Syscall(unix.SYS_MUNMAP, mapStart, uintptr(incFileSize), 0); errno != 0 {
+				log.Warningf("Failed to unmap new chunks %#x-%#x: %v", mapStart, mapStart+uintptr(incFileSize), errno)
+			}
+			return err
+		}
+	}
 	f.chunks.Store(&newChunks)
 
 	// Mark void pages free.
