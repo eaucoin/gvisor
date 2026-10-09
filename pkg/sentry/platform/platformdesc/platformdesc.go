@@ -34,7 +34,35 @@ type Requirements struct {
 	// FrequentHostThreadWakeups indicates that the platform wakes sleeping
 	// host threads at a very high rate.
 	FrequentHostThreadWakeups bool
+
+	// WriteTracking is how the platform supports write tracking.
+	WriteTracking WriteTracking
 }
+
+// WriteTracking is how a platform supports write tracking: reporting the
+// application's stores to MemoryFiles that track dirty pages (see
+// pgalloc.MemoryFile.EnableDirtyTracking), which the Sentry does not see.
+type WriteTracking int
+
+const (
+	// WriteTrackingUnsupported means that the platform cannot track writes.
+	WriteTrackingUnsupported WriteTracking = iota
+
+	// WriteTrackingInternalMappings means that the application writes to
+	// MemoryFiles through the Sentry's internal mappings of them, so that
+	// tracking the writes through those mappings
+	// (pgalloc.EnableInternalWriteTracking), which the Sentry's own writes
+	// go through, tracks the application's.
+	WriteTrackingInternalMappings
+
+	// WriteTrackingPlatform means that the application writes to
+	// MemoryFiles through the platform's own mappings of them, whose writes
+	// the platform tracks if it is created with
+	// platform.Options.WriteTrackingProcFS; it then implements
+	// platform.WriteTracker. The Sentry's own writes are tracked through its
+	// internal mappings, as for WriteTrackingInternalMappings.
+	WriteTrackingPlatform
+)
 
 // Desc describes a platform.
 type Desc struct {
@@ -51,6 +79,12 @@ type Desc struct {
 var descs = map[string]Desc{
 	"kvm": {
 		Device: "/dev/kvm",
+		Requirements: Requirements{
+			// Guest-physical memory is the Sentry's address space: the
+			// application writes to MemoryFiles through the Sentry's
+			// mappings.
+			WriteTracking: WriteTrackingInternalMappings,
+		},
 	},
 	"ptrace": {
 		Requirements: Requirements{
@@ -61,6 +95,7 @@ var descs = map[string]Desc{
 		Requirements: Requirements{
 			RequiresCapSysPtrace:      true,
 			FrequentHostThreadWakeups: true,
+			WriteTracking:             WriteTrackingPlatform,
 		},
 	},
 }
