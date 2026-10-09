@@ -129,6 +129,7 @@ go_library(
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
         "debug.go",
+        "dirty.go",
         "io.go",
         "io_list.go",
         "lifecycle.go",
@@ -184,6 +185,7 @@ go_test(
     size = "small",
     srcs = [
         "address_space_test.go",
+        "dirty_test.go",
         "mm_test.go",
     ],
     library = ":mm",
@@ -203,6 +205,7 @@ go_test(
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
+        "//pkg/state",
         "//pkg/usermem",
     ],
 )
