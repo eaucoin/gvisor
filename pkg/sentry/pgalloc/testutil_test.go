@@ -373,6 +373,13 @@ type testLoad struct {
 // pages load asynchronously. The test must release fs's pages before it ends.
 func startLoad(t *testing.T, img *testImage, ar stateio.AsyncReader, fs ...*MemoryFile) *testLoad {
 	t.Helper()
+	return startLoadWithPrefetch(t, img, ar, PrefetchOff, fs...)
+}
+
+// startLoadWithPrefetch is startLoad, with fs[0] holding the image's working
+// set, which it reads first as prefetch decides.
+func startLoadWithPrefetch(t *testing.T, img *testImage, ar stateio.AsyncReader, prefetch PrefetchPolicy, fs ...*MemoryFile) *testLoad {
+	t.Helper()
 	l := &testLoad{
 		done:   make(chan struct{}),
 		mfErrs: make(chan error, len(fs)),
@@ -397,8 +404,9 @@ func startLoad(t *testing.T, img *testImage, ar stateio.AsyncReader, fs ...*Memo
 		}
 	})
 	r := img.img.MemoryFileRecords()
-	opts := LoadOpts{Image: img.img.Proto, PagesFiles: []*AsyncPagesFileLoad{apfl}}
-	for _, f := range fs {
+	opts := LoadOpts{Image: img.img.Proto, PagesFiles: []*AsyncPagesFileLoad{apfl}, Prefetch: prefetch}
+	for i, f := range fs {
+		opts.WorkingSet = i == 0
 		opts.DoneCallback = func(err error) { l.mfErrs <- err }
 		if err := f.LoadFrom(context.Background(), r, &opts); err != nil {
 			t.Fatalf("LoadFrom: %v", err)
