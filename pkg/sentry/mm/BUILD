@@ -129,6 +129,7 @@ go_library(
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
         "debug.go",
+        "dirty.go",
         "io.go",
         "io_list.go",
         "lifecycle.go",
@@ -182,7 +183,10 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "dirty_test.go",
+        "mm_test.go",
+    ],
     library = ":mm",
     deps = [
         "//pkg/context",
@@ -195,6 +199,7 @@ go_test(
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
+        "//pkg/state",
         "//pkg/usermem",
     ],
 )
