@@ -306,6 +306,21 @@ func TestInvalidFlags(t *testing.T) {
 			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
 			error: "the embedded sidecar fallback has been removed",
 		},
+		{
+			name:  "dirty-tracking",
+			value: "invalid",
+			error: "invalid dirty tracking mode",
+		},
+		{
+			name:  "dirty-tracking-verify",
+			value: "invalid",
+			error: "invalid dirty tracking verification mode",
+		},
+		{
+			name:  "TESTONLY-dirty-tracking-break",
+			value: "invalid",
+			error: "invalid dirty tracking path",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -460,6 +475,28 @@ func TestValidationFail(t *testing.T) {
 				"platform_device_path": "/dev/kvm2",
 			},
 			error: "--platform=auto accepts only --platform_device_path={platform}={path}",
+		},
+		{
+			name: "dirty-tracking-verify-without-tracking",
+			flags: map[string]string{
+				"dirty-tracking-verify": "hash",
+			},
+			error: "dirty-tracking-verify requires dirty tracking",
+		},
+		{
+			name: "dirty-tracking-break-without-tracking",
+			flags: map[string]string{
+				"TESTONLY-dirty-tracking-break": "fault",
+			},
+			error: "TESTONLY-dirty-tracking-break requires dirty tracking",
+		},
+		{
+			name: "dirty-tracking-unit",
+			flags: map[string]string{
+				"dirty-tracking":      "wp",
+				"dirty-tracking-unit": "12288",
+			},
+			error: "dirty-tracking-unit must be a power of 2 of at least 4096",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
