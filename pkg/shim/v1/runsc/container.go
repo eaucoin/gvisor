@@ -116,6 +116,11 @@ type ContainerConfig struct {
 	RestoreDirect     bool
 	RestoreBackground bool
 
+	// RestoreLayerPaths are directories in which runsc looks for the layers
+	// of the image at RestoreImagePath (--layer-path), such as the parent of
+	// an incremental checkpoint.
+	RestoreLayerPaths []string
+
 	// RestorePaused restores with --paused: the container is paused once
 	// restored, until resumed. Set it on every container of the sandbox
 	// being restored, as RestoreImagePath.
@@ -291,6 +296,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 			ImagePath:  conf.RestoreImagePath,
 			Direct:     opts.RestoreDirect || conf.RestoreDirect,
 			Background: opts.RestoreBackground || conf.RestoreBackground,
+			LayerPaths: conf.RestoreLayerPaths,
 			Paused:     conf.RestorePaused,
 		}
 	}
