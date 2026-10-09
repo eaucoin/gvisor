@@ -79,6 +79,7 @@ def _syscall_test(
         directfs = False,
         leak_check = False,
         save = False,
+        save_background = False,
         save_resume = False,
         netstack_sr = False,
         nftables = False,
@@ -102,6 +103,8 @@ def _syscall_test(
         name += "_directfs"
     if save:
         name += "_save"
+    if save_background:
+        name += "_background"
     if save_resume:
         name += "_save_resume"
     if save and netstack_sr:
@@ -178,6 +181,7 @@ def _syscall_test(
         "--directfs=" + str(directfs),
         "--leak-check=" + str(leak_check),
         "--save=" + str(save),
+        "--save-background=" + str(save_background),
         "--save-resume=" + str(save_resume),
         "--netstack-sr=" + str(netstack_sr),
         "--nftables=" + str(nftables),
@@ -582,6 +586,32 @@ def syscall_test(
                 kvm_use_cpu_nums = kvm_use_cpu_nums,
                 **kwargs
             )
+
+        # Restore lazily, loading memory while the test runs, on the default
+        # platform.
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = use_tmpfs,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            add_host_tty = add_host_tty,
+            tags = platforms.get(default_platform, []) + tags,
+            iouring = iouring,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            save = True,
+            save_background = True,
+            size = "large",
+            timeout = "long",
+            nftables = nftables,
+            kvm_use_cpu_nums = kvm_use_cpu_nums,
+            in_sandbox_cgroup = in_sandbox_cgroup,
+            **kwargs
+        )
 
         # Add save resume variant to all other variants generated above.
         syscall_test_variants(
