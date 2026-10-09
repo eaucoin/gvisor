@@ -1,0 +1,259 @@
+# Releases of the fork, built from main.
+#
+# A release is tagged release-<upstream release>-eaucoin.<k>: the upstream
+# release main is based on, then this fork's distributor suffix and a count
+# of its releases on that base. Every day this workflow checks whether one is
+# due: the first on a new base (an upstream release adopted), or a monthly one
+# when main changed since the last, as long as main carries a series besides
+# the fork's own (series/fork-*); it can also be dispatched, and dispatched as
+# a dry run, which builds and checks but neither tags nor publishes. main must
+# have passed tiers 1 and 2. The binaries are built with Bazel as upstream
+# builds its releases, natively for x86_64 (aarch64 once checkpoint and
+# restore work there), checked by the smoke test, and published as upstream
+# publishes them (gvisor-<arch>.tar.{bz2,zstd}: runsc, its gvisor-bin/
+# sidecars, the checkpoint gofer among them, and the containerd shim), with
+# SHA-512 sums and GitHub build provenance attestations.
+
+name: Fork release
+
+"on":
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      title:
+        description: What this release brings, in a few words, for its notes
+        required: false
+        type: string
+      dry_run:
+        description: Build and check only; neither tag nor publish
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  SUFFIX: eaucoin
+
+jobs:
+  plan:
+    name: Decide
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      base: ${{ steps.plan.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          # What main was built from: fork-integrate's note on its tip.
+          git fetch --quiet origin refs/notes/series:refs/notes/series
+          git notes --ref=series show "${sha}" >"${RUNNER_TEMP}/built-from"
+          base="$(awk '$1 == "base" {print $2}' "${RUNNER_TEMP}/built-from")"
+          stem="${base}-${SUFFIX}"
+          last="$(git for-each-ref --count=1 --sort=-v:refname --format='%(refname:lstrip=2)' "refs/tags/${stem}.*")"
+          features="$(awk '$1 ~ /^series\// && $1 !~ /^series\/fork-/' "${RUNNER_TEMP}/built-from" | wc -l)"
+          reason=""
+          if [[ -n "${last}" && "$(git rev-parse "${last}^{commit}")" == "${sha}" ]]; then
+            echo "main is ${last} already." >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ "${EVENT}" == workflow_dispatch ]]; then
+            reason="dispatched"
+          elif [[ "${features}" -eq 0 ]]; then
+            echo "main carries only the fork's own series." >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ -z "${last}" ]]; then
+            reason="first release on ${base}"
+          elif [[ "$(date -u +%d)" == 01 ]]; then
+            reason="monthly release"
+          fi
+          if [[ -z "${reason}" ]]; then
+            echo "No release due." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          for context in fork-ci fork-nightly; do
+            state="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/status" \
+              --jq "[.statuses[] | select(.context == \"${context}\")][0].state // \"none\"")"
+            if [[ "${state}" != success && "${DRY_RUN}" == true ]]; then
+              echo "::warning::${context} is ${state} at main's ${sha}; a dry run goes on."
+            elif [[ "${state}" != success ]]; then
+              echo "::error::A release is due (${reason}), but ${context} is ${state} at main's ${sha}."
+              exit 1
+            fi
+          done
+          k=1
+          if [[ -n "${last}" ]]; then
+            k=$(( ${last##*.} + 1 ))
+          fi
+          tag="${stem}.${k}"
+          echo "Releasing ${tag} at ${sha} (${reason})." >>"${GITHUB_STEP_SUMMARY}"
+          {
+            echo "tag=${tag}"
+            echo "sha=${sha}"
+            echo "base=${base}"
+          } >>"${GITHUB_OUTPUT}"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          # Not aarch64 yet: on GitHub's aarch64 runners a restored application
+          # dies of SIGILL at once, on the base as well (tier 2's arm64 job).
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Build the release tarballs
+        run: |
+          # The version stamped into the binaries is "git describe --tags".
+          git tag "${TAG}" "${SHA}"
+          make release-tarball DESTINATION=dist/
+          ls -l dist
+      - name: Check the version and smoke-test
+        run: |
+          mkdir -p "${RUNNER_TEMP}/install"
+          tar -C "${RUNNER_TEMP}/install" --zstd -xf dist/gvisor.tar.zstd
+          version="$("${RUNNER_TEMP}/install/runsc" --version | sed -n 1p)"
+          if [[ "${version}" != "runsc version ${TAG}" ]]; then
+            echo "::error::runsc reports \"${version}\", not ${TAG}"
+            exit 1
+          fi
+          tools/fork/smoke_test.sh "${RUNNER_TEMP}/install/runsc"
+      - name: Name the assets by architecture
+        run: |
+          mkdir -p assets
+          for ext in tar.bz2 tar.zstd; do
+            mv "dist/gvisor.${ext}" "assets/gvisor-${{ matrix.arch }}.${ext}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: assets-${{ matrix.arch }}
+          path: assets/
+          retention-days: 7
+
+  publish:
+    name: Tag and publish
+    needs: [plan, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      BASE: ${{ needs.plan.outputs.base }}
+      TITLE: ${{ inputs.title }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          for f in gvisor-*; do
+            sha512sum "${f}" >"${f}.sha512"
+          done
+          mapfile -t assets < <(find . -maxdepth 1 -name 'gvisor-*' ! -name '*.sha512' -printf '%P\n' | sort)
+          sha256sum -- "${assets[@]}" >SHA256SUMS
+          sha512sum -- "${assets[@]}" >SHA512SUMS
+          cat SHA512SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/gvisor-*.tar.bz2
+            dist/gvisor-*.tar.zstd
+      - name: Release notes
+        run: |
+          git fetch --quiet origin refs/notes/series:refs/notes/series
+          repo="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          {
+            echo "gVisor upstream [\`${BASE}\`](https://github.com/google/gvisor/releases/tag/${BASE}) with this fork's series${TITLE:+: ${TITLE}}."
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "ARCH=\$(uname -m)"
+            echo "URL=${repo}/releases/download/${TAG}"
+            echo "curl -fsSL -O \"\${URL}/gvisor-\${ARCH}.tar.zstd\" -O \"\${URL}/gvisor-\${ARCH}.tar.zstd.sha512\""
+            echo "sha512sum -c \"gvisor-\${ARCH}.tar.zstd.sha512\""
+            echo "gh attestation verify \"gvisor-\${ARCH}.tar.zstd\" --repo ${GITHUB_REPOSITORY}"
+            echo "sudo tar -C /usr/local/bin --zstd -xf \"gvisor-\${ARCH}.tar.zstd\""
+            echo '```'
+            echo
+            echo "\`runsc --version\` reports \`${TAG}\`. A checkpoint restores only under the build"
+            echo "that took it, so keep this release for as long as you keep its checkpoints."
+            echo
+            echo "## Series"
+            echo
+            git notes --ref=series show "${SHA}" |
+              awk '$1 ~ /^series\// {print "- `" $1 "` (" $3 " commits)"}'
+            echo
+            echo "## Commits on top of \`${BASE}\`"
+            echo
+            echo '```text'
+            git log --reverse --format='%h %s' "${BASE}..${SHA}"
+            echo '```'
+          } >"${RUNNER_TEMP}/notes.md"
+          cat "${RUNNER_TEMP}/notes.md"
+      - name: Tag
+        env:
+          FORK_PUSH_KEY: ${{ secrets.FORK_PUSH_KEY }}
+        run: |
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a "${TAG}" "${SHA}" -m "gVisor ${TAG}" -m "${BASE} with this fork's series${TITLE:+: ${TITLE}}."
+          tools/fork/push.sh "refs/tags/${TAG}"
+      - name: Publish
+        run: |
+          gh release create "${TAG}" --verify-tag --latest --title "gVisor ${TAG}" \
+            --notes-file "${RUNNER_TEMP}/notes.md" dist/*
+      - name: Measure the release
+        run: gh workflow run fork-bench.yml -R "${GITHUB_REPOSITORY}" -f ref="${TAG}"
