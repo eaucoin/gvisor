@@ -437,3 +437,46 @@ func TestCheckpointOpts(t *testing.T) {
 		})
 	}
 }
+
+// TestRestoreLayerPaths verifies that containerd's parent checkpoint, CRIU's
+// parent images, becomes a layer path of the restore.
+func TestRestoreLayerPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		req       *task.CreateTaskRequest
+		imagePath string
+		want      []string
+		wantErr   error
+	}{
+		{
+			name: "no checkpoint",
+			req:  &task.CreateTaskRequest{ID: "c"},
+		},
+		{
+			name:      "full checkpoint",
+			req:       &task.CreateTaskRequest{ID: "c", Checkpoint: "/ckpt"},
+			imagePath: "/ckpt",
+		},
+		{
+			name:      "incremental checkpoint",
+			req:       &task.CreateTaskRequest{ID: "c", Checkpoint: "/ckpt", ParentCheckpoint: "/parent"},
+			imagePath: "/ckpt",
+			want:      []string{"/parent"},
+		},
+		{
+			name:    "parent without a checkpoint",
+			req:     &task.CreateTaskRequest{ID: "c", ParentCheckpoint: "/parent"},
+			wantErr: errdefs.ErrInvalidArgument,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := restoreLayerPaths(tc.req, tc.imagePath)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("restoreLayerPaths() error = %v, want %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("restoreLayerPaths() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
