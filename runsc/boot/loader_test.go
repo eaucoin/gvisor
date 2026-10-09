@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -690,5 +691,23 @@ func TestSignalUnkillablePolicyMapping(t *testing.T) {
 		if got := signalUnkillablePolicy(tc.confPolicy); got != tc.kernelPolicy {
 			t.Errorf("signalUnkillablePolicy(%v) = %v, want %v", tc.confPolicy, got, tc.kernelPolicy)
 		}
+	}
+}
+
+// TestDirtyMarkPaths checks that every value of
+// --TESTONLY-dirty-tracking-break disables a path of its own.
+func TestDirtyMarkPaths(t *testing.T) {
+	seen := make(map[pgalloc.DirtyMarkPath]config.DirtyTrackingBreak)
+	// DirtyTrackingBreakArm is the last value.
+	for b := config.DirtyTrackingBreakNone; b <= config.DirtyTrackingBreakArm; b++ {
+		p, ok := dirtyMarkPaths[b]
+		if !ok {
+			t.Errorf("--TESTONLY-dirty-tracking-break=%v disables no path", b)
+			continue
+		}
+		if other, ok := seen[p]; ok {
+			t.Errorf("--TESTONLY-dirty-tracking-break=%v and %v disable the same path", b, other)
+		}
+		seen[p] = b
 	}
 }
