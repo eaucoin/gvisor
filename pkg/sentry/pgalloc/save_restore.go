@@ -1621,7 +1621,16 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), fr, fr.Length())
 		}
 	}
-	return apfl.err()
+	if err := apfl.err(); err != nil {
+		// As above, pages loaded before the failure are usable.
+		apfl.mu.Lock()
+		loaded := amfl.unloaded.IsEmptyRange(fr)
+		apfl.mu.Unlock()
+		if !loaded {
+			return err
+		}
+	}
+	return nil
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
@@ -2010,6 +2019,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		// Process completions.
 		apfl.amflsMu.Lock()
 		apfl.mu.Lock()
+		failed := false
 		for _, c := range completions {
 			op := &apfl.ops[c.ID]
 			apfl.opsBusy.Remove(uint32(c.ID))
@@ -2023,12 +2033,18 @@ func (apfl *AsyncPagesFileLoad) main() {
 					decRefs = append(decRefs, aplFileRange{op.amfl, fr})
 				}
 			}
+			if failed {
+				continue
+			}
 			if c.N != op.total {
 				log.Warningf("Async page loading failed: read for MemoryFile(%p) pages %v (total %d bytes) returned %d bytes, error: %v", op.amfl.f, op.frs, op.total, c.N, c.Err)
 				apfl.errVal.Store(linuxerr.EIO)
-				apfl.mu.Unlock()
-				apfl.amflsMu.Unlock()
-				return
+				// Still release the references of the other completions,
+				// and wake the waiters of those already processed: their
+				// pages are loaded and no longer in unloaded, where the
+				// deferred cleanup finds the waiters to wake.
+				failed = true
+				continue
 			}
 			apfl.bytesLoaded += op.total
 			amfl := op.amfl
@@ -2093,6 +2109,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			w.wakeup.Notify(1)
 		}
 		wakeups = wakeups[:0]
+		if failed {
+			return
+		}
 		dropDelayedDecRefs()
 	}
 }
