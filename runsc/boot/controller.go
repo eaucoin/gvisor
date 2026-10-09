@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -655,7 +656,11 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		prefetch := pgalloc.PrefetchAuto
+		if cm.l.root.conf.WorkingSetPrefetch == config.WorkingSetPrefetchOff {
+			prefetch = pgalloc.PrefetchOff
+		}
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader")) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")
 	}
