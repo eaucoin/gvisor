@@ -284,11 +284,6 @@ a container, and the first after enabling dirty tracking, are full. An
 incremental checkpoint records its parent's identity in its state file
 metadata as `parent_id`, which `runsc image inspect` prints.
 
-Restoring an image opens every layer it refers to, so keep chains short: take a
-full checkpoint (without `--parent-image-path`) every so often, or compact the
-chain with `runsc image compact` or `runsc image flatten` (see above) and
-restore from the result, whose next incremental checkpoint is then of it.
-
 Tracking makes the first write to a page after a checkpoint fault into the
 sandbox's kernel: `--dirty-tracking-unit` (64 KiB by default) is the size of
 the memory that one such fault marks written, trading the cost of writes after
@@ -297,7 +292,55 @@ incremental image (more pages with a larger one).
 `--dirty-tracking-verify=hash` makes every checkpoint also check, by hashing
 every page, that no page changed without being tracked, and fail if one did;
 it is meant for tests and debugging. [Dirty page tracking](../proposals/dirty_tracking.md)
-describes how the sandbox tracks writes, and what tracking costs.
+describes how the sandbox tracks writes, and what tracking costs, and
+[incremental checkpoints](../proposals/incremental_checkpoints.md) how
+checkpoints use it.
+
+### Templates
+
+Any image can be the parent of many incremental checkpoints: every container
+restored from it starts its own chain. A template, such as a checkpoint of an
+interpreter that has imported its libraries, is then stored once and its pages
+are shared by the checkpoints of every container restored from it; most of
+them stay unchanged (83 % of a Python REPL with numpy and pandas imported,
+after a session that built a DataFrame, ran pytest and edited code):
+
+```bash
+runsc checkpoint --image-path=<template> <container id>
+runsc --dirty-tracking=wp restore --image-path=<template> <container a>
+runsc --dirty-tracking=wp restore --image-path=<template> <container b>
+runsc checkpoint --image-path=<a 1> --parent-image-path=<template> <container a>
+runsc checkpoint --image-path=<b 1> --parent-image-path=<template> <container b>
+```
+
+`runsc image rebase --onto=<template>` makes an image taken without
+`--parent-image-path`, or of another chain, refer to the template's pages
+where they are the same.
+
+### Compacting chains
+
+A chain grows by each of its checkpoints, and restoring an image opens every
+image it refers to. Rewrite a long chain into one image, off the restore path,
+and restore from that image, whose next incremental checkpoint is then of it:
+
+```bash
+runsc image flatten --layer-path=<image 1> --layer-path=<image 2> --output=<flat> <image 3>
+runsc image compact --keep-layer=<template digest> --layer-path=<template> --layer-path=<a 1> --working-set-first --output=<compacted> <a 2>
+```
+
+`flatten` writes every page into the new image; `compact --keep-layer` keeps
+referring to a template's pages, and `--working-set-first` puts the working
+set that the image records first in the new `pages.img`, which background
+restores then load first. A full
+checkpoint (without `--parent-image-path`) also starts a new chain.
+
+Interpreters and development servers change 0.5 to 2 MiB of memory per small
+command once they have started, but some rewrite 5 to 14 MiB whenever their
+garbage collector runs while idle. A policy that follows those measurements
+compacts a chain when the sum of its incremental checkpoints reaches the size
+of its first image, when one incremental checkpoint exceeds half of the image
+(a full checkpoint then costs about as much), or when the chain is deeper than
+16 images.
 
 ## How to use checkpoint/restore in Docker:
 
