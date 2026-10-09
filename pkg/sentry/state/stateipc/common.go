@@ -116,6 +116,18 @@ type RegisterClientFileResponse struct {
 	Handle uint32 `json:"handle"`
 }
 
+// WakeRequest is the request type for AsyncFileServer.Wake.
+type WakeRequest struct {
+	// Handle is the handle of the opened server file, which must be opened for
+	// reading.
+	Handle uint32 `json:"handle"`
+}
+
+// WakeResponse is the response type for AsyncFileServer.Wake.
+type WakeResponse struct {
+	// empty
+}
+
 // The following types are used on per-file Flipcall I/O connections.
 //
 // For connections serving reads, the datagram sent from client to server
@@ -138,8 +150,11 @@ type readRequestHeader struct {
 	// should accumulate before returning control to the client.
 	MinCompletions uint32
 
-	// Padding is unused, but aligns the first read submission to 8 bytes.
-	Padding uint32
+	// If Wakeable is non-zero and MinCompletions is 1, the server may also
+	// return control to the client, possibly with no completions, when the
+	// client calls AsyncFileServer.Wake. Wakeable also aligns the first read
+	// submission to 8 bytes.
+	Wakeable uint32
 }
 
 type readSubmissionHeader struct {

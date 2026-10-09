@@ -117,8 +117,10 @@ func (s *AsyncFileServer) Open(req *OpenRequest, resp *OpenResponse) error {
 				maxParallel: uint32(maxParallel),
 				slicesUsed:  make([]asyncIOSlices, maxParallel),
 			},
-			ar: ar,
+			ar:   ar,
+			wake: make(chan struct{}, 1),
 		}
+		rf.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
 		rf.impl = rf
 		f = &rf.openFile
 	case OpenModeWrite:
@@ -275,6 +277,28 @@ func (s *AsyncFileServer) RegisterClientFile(req *RegisterClientFileRequest, res
 	return nil
 }
 
+// Wake makes the server return control to the client of the file with the
+// given handle, if the client is waiting for completions of its reads with
+// stateio.WaitOrAsyncReader.WaitOr and the server's reader implements it too.
+// Otherwise the next such wait returns without waiting.
+func (s *AsyncFileServer) Wake(req *WakeRequest, resp *WakeResponse) error {
+	s.filesMu.Lock()
+	f := s.files[req.Handle]
+	s.filesMu.Unlock()
+	if f == nil {
+		return fmt.Errorf("invalid file handle: %v", req.Handle)
+	}
+	rf, ok := f.impl.(*readFile)
+	if !ok {
+		return fmt.Errorf("file handle %v is not opened for reading", req.Handle)
+	}
+	select {
+	case rf.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 // openFile represents an opened server file.
 type openFile struct {
 	// Immutable fields:
@@ -320,7 +344,15 @@ type openFileImpl interface {
 // readFile represents a server file opened for reading.
 type readFile struct {
 	openFile
-	ar                stateio.AsyncReader
+	ar stateio.AsyncReader
+
+	// waitOr is ar if it implements stateio.WaitOrAsyncReader, and nil
+	// otherwise. waitOr is immutable.
+	waitOr stateio.WaitOrAsyncReader
+
+	// wake is notified by AsyncFileServer.Wake. wake is immutable.
+	wake chan struct{}
+
 	dstFiles          destinationFileAtomicPtrMap
 	nextDstFileHandle uint32
 }
@@ -361,9 +393,14 @@ func (f *readFile) readerMain() {
 		for range numSubmissions {
 			cs = f.handleReadSubmission(cs)
 		}
-		minCompletions := max(int(f.ioep.readRequestHeader().MinCompletions)-len(cs), 0)
+		reqHdr := f.ioep.readRequestHeader()
+		minCompletions := max(int(reqHdr.MinCompletions)-len(cs), 0)
 		var err error
-		cs, err = f.ar.Wait(cs, minCompletions)
+		if reqHdr.Wakeable != 0 && minCompletions == 1 && f.waitOr != nil {
+			cs, err = f.waitOr.WaitOr(cs, f.wake)
+		} else {
+			cs, err = f.ar.Wait(cs, minCompletions)
+		}
 		numCompletions = uint32(len(cs))
 		f.ioep.resetForCompletions()
 		*f.ioep.ioResponseHeader() = ioResponseHeader{
