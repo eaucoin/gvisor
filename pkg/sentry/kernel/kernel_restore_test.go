@@ -35,7 +35,7 @@ func TestAsyncMFLoaderStartupError(t *testing.T) {
 		// A sub-page read limit fails before metadata or mainMF is loaded.
 		pages := stateio.NewIOReader(bytes.NewReader(nil), 1, 1, 1)
 		image := &checkpointimage.Image{Proto: &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{}}}}
-		loader := NewAsyncMFLoader(image, []stateio.AsyncReader{pages}, nil, nil, pgalloc.AsyncPagesFileLoadOpts{Throttled: true})
+		loader := NewAsyncMFLoader(image, []stateio.AsyncReader{pages}, nil, pgalloc.PrefetchAuto, nil, pgalloc.AsyncPagesFileLoadOpts{Throttled: true})
 		defer loader.Unthrottle()
 
 		startErr := loader.WaitMainMFStart()
