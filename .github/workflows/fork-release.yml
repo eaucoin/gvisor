@@ -6,7 +6,8 @@
 # due: the first on a new base (an upstream release adopted), or a monthly one
 # when main changed since the last, as long as main carries a series besides
 # the fork's own (series/fork-*); it can also be dispatched, and dispatched as
-# a dry run, which builds and checks but neither tags nor publishes. main must
+# a dry run, which builds and checks but neither tags nor publishes. A monthly
+# release is due only if a series besides the fork's own changed. main must
 # have passed tiers 1 and 2. The binaries are built with Bazel as upstream
 # builds its releases, natively for x86_64 (aarch64 once checkpoint and
 # restore work there), checked by the smoke test and by a pod checkpointed and
@@ -77,16 +78,22 @@ jobs:
           base="$(awk '$1 == "base" {print $2}' "${RUNNER_TEMP}/built-from")"
           stem="${base}-${SUFFIX}"
           last="$(git for-each-ref --count=1 --sort=-v:refname --format='%(refname:lstrip=2)' "refs/tags/${stem}.*")"
-          features="$(awk '$1 ~ /^series\// && $1 !~ /^series\/fork-/' "${RUNNER_TEMP}/built-from" | wc -l)"
+          # The series that make what is released: all but the fork's own
+          # infrastructure (series/fork-*), with their tips.
+          features() {
+            git notes --ref=series show "$1" | awk '$1 ~ /^series\// && $1 !~ /^series\/fork-/ {print $1, $2}'
+          }
           reason=""
           if [[ -n "${last}" && "$(git rev-parse "${last}^{commit}")" == "${sha}" ]]; then
             echo "main is ${last} already." >>"${GITHUB_STEP_SUMMARY}"
           elif [[ "${EVENT}" == workflow_dispatch ]]; then
             reason="dispatched"
-          elif [[ "${features}" -eq 0 ]]; then
+          elif [[ -z "$(features "${sha}")" ]]; then
             echo "main carries only the fork's own series." >>"${GITHUB_STEP_SUMMARY}"
           elif [[ -z "${last}" ]]; then
             reason="first release on ${base}"
+          elif [[ "$(features "${sha}")" == "$(features "${last}^{commit}")" ]]; then
+            echo "Only the fork's own series changed since ${last}." >>"${GITHUB_STEP_SUMMARY}"
           elif [[ "$(date -u +%d)" == 01 ]]; then
             reason="monthly release"
           fi
@@ -170,14 +177,55 @@ jobs:
           path: assets/
           retention-days: 7
 
+  measure:
+    name: Measure (x86_64)
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE: ${{ needs.plan.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: assets-x86_64
+          path: ${{ runner.temp }}/assets
+      - name: Install the release and upstream's build of its base
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release" "${RUNNER_TEMP}/upstream"
+          tar -C "${RUNNER_TEMP}/release" --zstd -xf "${RUNNER_TEMP}/assets/gvisor-x86_64.tar.zstd"
+          cd "${RUNNER_TEMP}/upstream"
+          gh release download "${BASE}" -R google/gvisor -p gvisor-x86_64.tar.zstd -p SHA512SUMS
+          grep ' gvisor-x86_64.tar.zstd$' SHA512SUMS | sha512sum -c
+          tar --zstd -xf gvisor-x86_64.tar.zstd
+      - name: Prepare the workloads
+        run: sudo python3 tools/fork/bench/bench.py prepare
+      - name: Measure
+        run: |
+          tools/fork/bench/measure.sh "${RUNNER_TEMP}/bench" "${RUNNER_TEMP}/release/runsc" \
+            "${RUNNER_TEMP}/upstream/runsc"
+          cat "${RUNNER_TEMP}/bench/summary.md" >>"${GITHUB_STEP_SUMMARY}"
+      - name: Clean up
+        if: always()
+        run: sudo python3 tools/fork/bench/bench.py clean --all
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench
+          path: ${{ runner.temp }}/bench/
+          retention-days: 90
+
   publish:
     name: Tag and publish
-    needs: [plan, build]
+    needs: [plan, build, measure]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      actions: write
       attestations: write
       contents: write
       id-token: write
@@ -199,6 +247,10 @@ jobs:
           pattern: assets-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench
+          path: ${{ runner.temp }}/bench
       - name: Checksums
         working-directory: dist
         run: |
@@ -218,6 +270,10 @@ jobs:
         run: |
           git fetch --quiet origin refs/notes/series:refs/notes/series
           repo="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          # The checkpoint image format's version, major.minor.
+          format="$(sed -n -e 's/^\tMajorVersion = \([0-9]*\)$/\1/p' -e 's/^\tMinorVersion = \([0-9]*\)$/.\1/p' \
+            pkg/sentry/state/checkpointimage/checkpointimage.go | tr -d '\n')"
+          [[ "${format}" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "::error::no image format version found"; exit 1; }
           {
             echo "gVisor upstream [\`${BASE}\`](https://github.com/google/gvisor/releases/tag/${BASE}) with this fork's series${TITLE:+: ${TITLE}}."
             echo
@@ -234,6 +290,9 @@ jobs:
             echo
             echo "\`runsc --version\` reports \`${TAG}\`. A checkpoint restores only under the build"
             echo "that took it, so keep this release for as long as you keep its checkpoints."
+            echo "Its checkpoint images are in format ${format} (\`pages_meta.img\`, see"
+            echo "\`g3doc/user_guide/checkpoint_restore.md\`). Built for x86_64 only: on aarch64,"
+            echo "restored applications die of SIGILL, upstream's build of the base as well."
             echo
             echo "## Series"
             echo
@@ -245,6 +304,12 @@ jobs:
             echo '```text'
             git log --reverse --format='%h %s' "${BASE}..${SHA}"
             echo '```'
+            echo
+            echo "## Measurements"
+            echo
+            echo "Tier 3's bench (\`tools/fork/bench\`) on a GitHub runner, median and runs:"
+            echo
+            cat "${RUNNER_TEMP}/bench/summary.md"
           } >"${RUNNER_TEMP}/notes.md"
           cat "${RUNNER_TEMP}/notes.md"
       - name: Tag
@@ -259,5 +324,3 @@ jobs:
         run: |
           gh release create "${TAG}" --verify-tag --latest --title "gVisor ${TAG}" \
             --notes-file "${RUNNER_TEMP}/notes.md" dist/*
-      - name: Measure the release
-        run: gh workflow run fork-bench.yml -R "${GITHUB_REPOSITORY}" -f ref="${TAG}"
