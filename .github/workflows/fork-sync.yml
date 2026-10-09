@@ -1,0 +1,103 @@
+# Mirrors upstream gVisor: master and go are fast-forwarded to upstream's, and
+# upstream's release tags are copied, so that a newer release can become the
+# base (SERIES). It refuses anything but a fast-forward; a mirror that has
+# diverged opens an issue.
+name: Fork sync
+
+"on":
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: https://github.com/google/gvisor
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Fetch upstream
+        # Unfiltered: the fork lacks upstream's new blobs, so the push must
+        # carry them.
+        run: |
+          git fetch --no-tags "${UPSTREAM}" \
+            '+refs/heads/master:refs/upstream/master' '+refs/heads/go:refs/upstream/go' \
+            '+refs/tags/release-*:refs/upstream-tags/release-*'
+
+      - name: Fast-forward master and go, copy release tags
+        id: sync
+        env:
+          FORK_PUSH_KEY: ${{ secrets.FORK_PUSH_KEY }}
+        run: |
+          declare -a refspecs=()
+          diverged=""
+          for branch in master go; do
+            mine="$(git rev-parse "refs/remotes/origin/${branch}")"
+            theirs="$(git rev-parse "refs/upstream/${branch}")"
+            if [[ "${mine}" == "${theirs}" ]]; then
+              echo "- ${branch}: up to date at \`${mine:0:12}\`" >>"${GITHUB_STEP_SUMMARY}"
+            elif git merge-base --is-ancestor "${mine}" "${theirs}"; then
+              refspecs+=("${theirs}:refs/heads/${branch}")
+              echo "- ${branch}: \`${mine:0:12}\` → \`${theirs:0:12}\`" >>"${GITHUB_STEP_SUMMARY}"
+            else
+              diverged+="${branch} "
+            fi
+          done
+          # Release tags only (release-YYYYMMDD.N), never moved once copied.
+          while read -r tag; do
+            if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+              refspecs+=("refs/upstream-tags/${tag}:refs/tags/${tag}")
+              echo "- new tag ${tag}" >>"${GITHUB_STEP_SUMMARY}"
+            fi
+          done < <(git for-each-ref --format='%(refname:lstrip=2)' refs/upstream-tags/ |
+            grep -E '^release-[0-9]{8}\.[0-9]+$')
+          if [[ ${#refspecs[@]} -gt 0 ]]; then
+            tools/fork/push.sh --atomic "${refspecs[@]}"
+          fi
+          echo "diverged=${diverged}" >>"${GITHUB_OUTPUT}"
+          if [[ -n "${diverged}" ]]; then
+            echo "::error::not a fast-forward: ${diverged}"
+            exit 1
+          fi
+
+      - name: Report divergence
+        if: always()
+        env:
+          DIVERGED: ${{ steps.sync.outputs.diverged }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Upstream mirror diverged"
+          issue="$(gh issue list --state open --search "in:title \"${title}\"" --json number --jq '.[0].number // empty')"
+          if [[ -z "${DIVERGED}" ]]; then
+            if [[ -n "${issue}" ]]; then
+              gh issue close "${issue}" --comment "In sync again: ${RUN_URL}."
+            fi
+          elif [[ -z "${issue}" ]]; then
+            gh issue create --title "${title}" \
+              --body "Upstream's ${DIVERGED}is not a fast-forward of this fork's; nothing was pushed for it. ${RUN_URL}"
+          fi
