@@ -86,6 +86,20 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		}
 		saveOpts.Parent = &d
 	}
+	switch o.Precopy {
+	case "":
+	case "on", "auto":
+		if o.PrecopyBudget <= 0 || o.PrecopyMaxRounds <= 0 {
+			return nil, fmt.Errorf("pre-copy requires a positive budget and round cap, got %v and %d", o.PrecopyBudget, o.PrecopyMaxRounds)
+		}
+		saveOpts.Precopy = &kernel.PrecopyOpts{
+			Budget:    o.PrecopyBudget,
+			MaxRounds: o.PrecopyMaxRounds,
+			Auto:      o.Precopy == "auto",
+		}
+	default:
+		return nil, fmt.Errorf("invalid pre-copy mode %q", o.Precopy)
+	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
 		return nil, err
