@@ -1,0 +1,50 @@
+# Tests that fail on the base, upstream gVisor at the release in SERIES, on
+# GitHub's runners: the save/restore tier leaves them out, so that it fails
+# only on what the series change. Each group of targets follows a comment that
+# says how they fail.
+# Variants that series add (save_background, from 11) fail where their
+# siblings do, for the same reason. Remove a line when the base, or a series,
+# makes the test pass.
+#
+# Found by fork-nightly on series/fork-infra (base + the fork's own series),
+# runs 37884262655 and 37897071711, 2026-10-09.
+
+# PipeTest.PipeFdCount: pipe2 fails with EMFILE after a save, in every file
+# access mode.
+//test/syscalls:pipe_test_runsc_systrap_directfs_save
+//test/syscalls:pipe_test_runsc_systrap_directfs_save_resume
+//test/syscalls:pipe_test_runsc_systrap_overlay_save
+//test/syscalls:pipe_test_runsc_systrap_overlay_save_resume
+//test/syscalls:pipe_test_runsc_systrap_shared_save
+//test/syscalls:pipe_test_runsc_systrap_shared_save_resume
+//test/syscalls:pipe_test_runsc_systrap_save_background
+
+# The CPU affinity tests find one CPU in their mask after a save
+# (affinity.cc:53, "__sched_cpucount(...) > 1, actual: 1 vs 1").
+//test/syscalls:affinity_test_runsc_systrap_directfs_save
+//test/syscalls:affinity_test_runsc_systrap_directfs_save_resume
+//test/syscalls:affinity_test_runsc_systrap_shared_save
+//test/syscalls:affinity_test_runsc_systrap_shared_save_resume
+//test/syscalls:affinity_test_runsc_systrap_save_background
+
+# Time out (915 s) in some runs. In save_background's (run 37936949573),
+# Openat2Test.InRootRaceWithMount was still looping at the timeout: it calls
+# openat2(RESOLVE_IN_ROOT) up to 50000 times until a racing mount makes one fail
+# with EAGAIN, while the sandbox was checkpointed about three times a second.
+//test/syscalls:socket_ip_tcp_generic_loopback_test_runsc_systrap_directfs_save
+//test/syscalls:socket_ip_tcp_generic_loopback_test_runsc_systrap_shared_save_netstack_save
+//test/syscalls:openat2_test_runsc_systrap_directfs_save
+//test/syscalls:openat2_test_runsc_systrap_overlay_save
+//test/syscalls:openat2_test_runsc_systrap_save_background
+
+# truncate.cc:204: after a save, a child that unshares a user namespace
+# truncates a 0555 file on FUSE without CAP_DAC_OVERRIDE (expected EACCES).
+//test/syscalls:truncate_test_runsc_systrap_fuse_save
+//test/syscalls:truncate_test_runsc_systrap_fuse_save_resume
+
+# xattr.cc:181, now and then: in XattrTest.WriteRemovesSecurityCapability, a
+# child that set its user ID to nobody fails to open a 0666 file on FUSE for
+# writing (exit status 2), without the FUSE server seeing a request; on the
+# base in 2 of 60 runs of fuse_save_resume (fork-repeat run 37967232154).
+//test/syscalls:xattr_test_runsc_systrap_fuse_save
+//test/syscalls:xattr_test_runsc_systrap_fuse_save_resume
