@@ -103,6 +103,18 @@ const (
 	PageSize = 4096
 )
 
+// FormatMetadataKey is the key of the entry of a checkpoint's state file
+// metadata that holds FormatVersion, if the checkpoint's memory is in a pages
+// file described by a pages metadata file: tools read it with the rest of the
+// state file metadata, without parsing anything else.
+const FormatMetadataKey = "image_format"
+
+// FormatVersion returns the version of the format that this package writes,
+// as "<major>.<minor>".
+func FormatVersion() string {
+	return fmt.Sprintf("%d.%d", MajorVersion, MinorVersion)
+}
+
 var crcTable = crc64.MakeTable(crc64.ECMA)
 
 // ErrFormat is wrapped by every error that reports a malformed or
