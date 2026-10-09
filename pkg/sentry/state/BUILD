@@ -20,6 +20,7 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/kernel",
         "//pkg/sentry/platform",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
         "//pkg/sentry/vfs",
