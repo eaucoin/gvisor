@@ -202,8 +202,11 @@ type SaveOpts struct {
 	BaseLayers []uint32
 
 	// If Clean is not nil, Clean(off) returns true if the page at MemoryFile
-	// offset off is known not to have changed since Base was saved. Clean is
-	// called in increasing offset order.
+	// offset off is known not to have changed since Base was saved. SaveTo
+	// neither reads clean pages nor waits for them to be loaded: if f is still
+	// loading pages asynchronously from Base or an image that Base refers to
+	// for them, the pages not yet loaded are clean, and SaveTo saves while
+	// loading continues.
 	Clean func(off uint64) bool
 
 	// If PageHashes is true, SaveTo records the page hash (XXH64) of every
@@ -223,8 +226,13 @@ type SaveOpts struct {
 // (layer 0 is opts.PagesFile) and, if opts.PageHashes, their page hashes.
 // Otherwise, it writes the metadata followed by the pages.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
-	if err := f.AwaitLoadAll(); err != nil {
-		return fmt.Errorf("previous async page loading failed: %w", err)
+	// Pages still loading are clean (writing them requires loading them
+	// first), so a save with Clean refers to their data in the layers it is
+	// loading from instead of waiting for it.
+	if opts.Clean == nil {
+		if err := f.AwaitLoadAll(); err != nil {
+			return fmt.Errorf("previous async page loading failed: %w", err)
+		}
 	}
 
 	// Wait for memory release.
@@ -453,7 +461,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
 				pg := bs[pgoff : pgoff+hostarch.PageSize]
 				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPageBytes[:])
+				var isZeroed bool
+				if opts.Clean != nil && opts.Clean(off) {
+					// The page is unchanged since Base was saved: a page
+					// committed then is still committed, and a page that is
+					// not known to be committed was not in Base (it was freed
+					// or decommitted since, which dirtied it) and is zero.
+					isZeroed = !wasCommitted
+				} else {
+					isZeroed = bytes.Equal(pg, zeroPageBytes[:])
+				}
 				if isZeroed {
 					if !wasCommitted {
 						alreadyUncommittedBytes += hostarch.PageSize

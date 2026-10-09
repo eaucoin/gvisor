@@ -119,18 +119,23 @@ func (ti *testImage) mfImage() *checkpointimage.MemoryFileImage {
 // layers of the image.
 func saveTestImage(t *testing.T, f *MemoryFile, parent *testImage, clean func(uint64) bool) *testImage {
 	t.Helper()
+	return saveTestImageOpts(t, f, parent, SaveOpts{Clean: clean, PageHashes: true})
+}
+
+// saveTestImageOpts is saveTestImage with the given SaveOpts, whose Base,
+// BaseLayers and PagesFile it sets.
+func saveTestImageOpts(t *testing.T, f *MemoryFile, parent *testImage, opts SaveOpts) *testImage {
+	t.Helper()
 	ip := &pgallocpb.ImageProto{
 		Layers:   []*pgallocpb.LayerProto{{}},
 		PageHash: checkpointimage.PageHashXXH64,
 	}
-	opts := SaveOpts{PageHashes: true}
 	if parent != nil {
 		opts.Base = parent.mfImage()
 		for i, d := range parent.layerDigests() {
 			ip.Layers = append(ip.Layers, &pgallocpb.LayerProto{Digest: bytes.Clone(d[:]), PagesSize: parent.img.Layers()[i].PagesSize})
 			opts.BaseLayers = append(opts.BaseLayers, uint32(1+i))
 		}
-		opts.Clean = clean
 	}
 
 	var pagesBuf bytes.Buffer
@@ -544,6 +549,54 @@ func TestImageAwaitAcrossLayers(t *testing.T) {
 		t.Fatalf("MapInternal: %v", err)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// TestImageDeltaDuringLoad checks that a delta of the image a MemoryFile is
+// still loading from neither waits for loading nor reads the clean pages,
+// which loading has not filled yet, and refers them to the image.
+func TestImageDeltaDuringLoad(t *testing.T) {
+	for _, exclude := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ExcludeCommittedZeroPages=%t", exclude), func(t *testing.T) {
+			tf := newImageTestFile(t, 8)
+			parent := saveTestImage(t, tf.f, nil, nil)
+
+			gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+			f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+			var openGate sync.Once
+			defer openGate.Do(func() { close(gate.gate) })
+			saved := make(chan *testImage, 1)
+			go func() {
+				saved <- saveTestImageOpts(t, f2, parent, SaveOpts{
+					Clean:                     func(uint64) bool { return true },
+					ExcludeCommittedZeroPages: exclude,
+					PageHashes:                true,
+				})
+			}()
+			var delta *testImage
+			select {
+			case delta = <-saved:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("saving a delta of the image being loaded waits for loading")
+			}
+			openGate.Do(func() { close(gate.gate) })
+
+			if got := len(delta.pages); got != 0 {
+				t.Errorf("delta wrote %d bytes of pages, want 0", got)
+			}
+			parentLayers := pageLayers(parent.mfImage(), tf.fr)
+			for off, layer := range pageLayers(delta.mfImage(), tf.fr) {
+				want := parentLayers[off]
+				if want >= 0 {
+					want++
+				}
+				if layer != want {
+					t.Errorf("page %#x: in layer %d of the delta, want %d", off, layer, want)
+				}
+			}
+			checkSameContents(t, loadTestImage(t, delta), tf.f, tf.fr)
+			checkSameContents(t, f2, tf.f, tf.fr)
+		})
+	}
 }
 
 // TestImageLoadRejects checks that loading fails, before reading any page, if
