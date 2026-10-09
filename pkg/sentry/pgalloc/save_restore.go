@@ -1399,7 +1399,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 
 	// Register this MemoryFile with async page loading from the pages file of
 	// each layer that holds some of its pages.
-	loads, err := f.startAsyncLoads(&pb, opts.PagesFiles, fileSize, doneCallback, mfTimeline.Transfer())
+	loadMapping, err := f.mapLoadMapping(chunks, fileSize)
+	if err != nil {
+		return err
+	}
+	loads, err := f.startAsyncLoads(&pb, opts.PagesFiles, fileSize, loadMapping, doneCallback, mfTimeline.Transfer())
 	if err != nil {
 		return err
 	}
@@ -1576,6 +1580,13 @@ type asyncMemoryFileLoads struct {
 	f        *MemoryFile
 	timeline *timing.Timeline
 
+	// If loadMapping is not 0, it is the address of a mapping of the
+	// MemoryFile's first fileSize bytes through which pages are loaded,
+	// rather than through its chunks' mappings; see write_tracking.go. It is
+	// unmapped when loading from every layer has completed.
+	loadMapping uintptr
+	fileSize    uint64
+
 	// amfls holds the state of loading from each layer: amfls[i] loads from
 	// layer i's pages file, or is nil if no page of f is in layer i. amfls is
 	// immutable.
@@ -1648,10 +1659,12 @@ type aplExtent struct {
 
 // startAsyncLoads registers f for async page loading from pagesFiles, one per
 // layer, of the pages of the layers that hold some of f's pages per pb.
-func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, pagesFiles []*AsyncPagesFileLoad, fileSize uint64, doneCallback func(error), timeline *timing.Timeline) (*asyncMemoryFileLoads, error) {
+func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, pagesFiles []*AsyncPagesFileLoad, fileSize uint64, loadMapping uintptr, doneCallback func(error), timeline *timing.Timeline) (*asyncMemoryFileLoads, error) {
 	loads := &asyncMemoryFileLoads{
 		f:            f,
 		timeline:     timeline,
+		loadMapping:  loadMapping,
+		fileSize:     fileSize,
 		amfls:        make([]*asyncMemoryFileLoad, len(pagesFiles)),
 		doneCallback: doneCallback,
 	}
@@ -1709,6 +1722,7 @@ func (loads *asyncMemoryFileLoads) unregister(n int) {
 		amfl.pf.mu.Unlock()
 		amfl.pf.amflsMu.Unlock()
 	}
+	loads.releaseLoadMapping()
 	loads.timeline.End()
 }
 
@@ -1729,6 +1743,7 @@ func (loads *asyncMemoryFileLoads) lfDone() {
 	if loads.layers() == 0 {
 		// There is nothing to load.
 		loads.f.asyncPageLoad.Store(nil)
+		loads.releaseLoadMapping()
 		loads.timeline.End()
 		if loads.doneCallback != nil {
 			loads.doneCallback(nil)
@@ -1799,10 +1814,33 @@ func (loads *asyncMemoryFileLoads) amflDone(err error) {
 		// reports the failure for pages that will never be loaded.
 		loads.f.asyncPageLoad.Store(nil)
 	}
+	// No read into the MemoryFile is in flight anymore.
+	loads.releaseLoadMapping()
 	loads.timeline.End()
 	if loads.doneCallback != nil {
 		loads.doneCallback(err)
 	}
+}
+
+// releaseLoadMapping unmaps loads.loadMapping, if any. Its callers may hold
+// the loader's locks, and unmapping a large mapping can take a while, so it
+// is done asynchronously.
+//
+// Preconditions: No read into the MemoryFile is in flight or will be issued.
+func (loads *asyncMemoryFileLoads) releaseLoadMapping() {
+	if m := loads.loadMapping; m != 0 {
+		go unmapLoadMapping(m, loads.fileSize) // S/R-SAFE: unmaps nothing saved.
+	}
+}
+
+// forEachLoadSlice calls fn on a sequence of slices of the mappings through
+// which pages are loaded, which together span fr, in order.
+func (loads *asyncMemoryFileLoads) forEachLoadSlice(fr memmap.FileRange, fn func([]byte)) {
+	if loads.loadMapping == 0 {
+		loads.f.forEachMappingSlice(fr, fn)
+		return
+	}
+	fn(loadSliceAt(loads.loadMapping, fr))
 }
 
 // startSweep sets amfl.sweep to the extents in amfl's pages file among
@@ -2220,7 +2258,7 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	amfl.f.forEachMappingSlice(fr, func(bs []byte) {
+	amfl.loads.forEachLoadSlice(fr, func(bs []byte) {
 		if len(op.iovecs) > 0 {
 			if canMergeIovecAndSlice(op.iovecs[len(op.iovecs)-1], bs) {
 				op.iovecs[len(op.iovecs)-1].Len += uint64(len(bs))
