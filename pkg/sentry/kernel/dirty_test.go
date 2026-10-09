@@ -104,7 +104,7 @@ func save(t *testing.T, ctx context.Context, k *Kernel, saveErr error) (*DirtyEp
 			t.Fatalf("SaveTo: %v", err)
 		}
 	}
-	return e, k.endDirtySave(ctx, e, []*pgalloc.MemoryFile{k.mf}, saveErr)
+	return e, k.endDirtySave(ctx, e, []*pgalloc.MemoryFile{k.mf}, nil /* image */, saveErr)
 }
 
 // pages returns the pages of fr in s, as indices into fr.
