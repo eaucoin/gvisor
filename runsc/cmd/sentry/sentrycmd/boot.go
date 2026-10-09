@@ -764,7 +764,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	if b.procMountSyncFD != -1 {
 		l.PreSeccompCallback = func() {
 			// Call validateOpenFDs() before umounting /proc.
-			validateOpenFDs(bootArgs.PassFDs)
+			validateOpenFDs(bootArgs.PassFDs, l.WriteTrackingProcFD())
 			// This callback runs on the same goroutine as the rest of sandbox
 			// startup (for now at least...), so safe to record here.
 			timer.Reached("open FDs validated")
@@ -846,8 +846,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 }
 
 // validateOpenFDs checks that the sandbox process does not have any open
-// directory FDs.
-func validateOpenFDs(passFDs []sentryapi.FDMapping) {
+// directory FDs, other than passed FDs and procFD, the procfs FD of write
+// tracking (or -1).
+func validateOpenFDs(passFDs []sentryapi.FDMapping, procFD int) {
 	passHostFDs := make(map[int]struct{})
 	for _, passFD := range passFDs {
 		passHostFDs[passFD.Host] = struct{}{}
@@ -879,6 +880,11 @@ func validateOpenFDs(passFDs []sentryapi.FDMapping) {
 		dirLink, err := os.Readlink(path)
 		if err != nil {
 			return fmt.Errorf("os.Readlink(%s) failed: %v", path, err)
+		}
+		if fdNo == procFD {
+			// Write tracking opens its stubs' pagemaps through it; see
+			// runsc/boot/dirty_uffd.go.
+			return nil
 		}
 		if _, ok := passHostFDs[fdNo]; ok {
 			// Passed FDs are allowed to be directories. The user must be knowing

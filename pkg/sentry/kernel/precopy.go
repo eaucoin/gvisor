@@ -297,6 +297,15 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 	if !k.DirtyTrackingEnabled() {
 		return fmt.Errorf("pre-copy requires dirty tracking")
 	}
+	if opts.Throttle {
+		// Throttling delays tasks at the faults that disarm write-protected
+		// units; userfaultfd records writes without faulting into the Sentry.
+		for _, s := range k.dirty.Sources {
+			if _, ok := s.(*uffdDirtySource); ok {
+				return fmt.Errorf("pre-copy throttling requires dirty tracking by write-protection (--dirty-tracking=wp), not %q", s.Name())
+			}
+		}
+	}
 	if parent != nil {
 		if last, ok := k.LastImageDigest(); !ok || last != *parent {
 			return fmt.Errorf("incremental save: image %v is not the image the sandbox was last saved to or restored from", *parent)
