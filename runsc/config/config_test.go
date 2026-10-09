@@ -259,6 +259,21 @@ func TestInvalidFlags(t *testing.T) {
 			value: "invalid",
 			error: "invalid value \"invalid\"; must be NEVER, ALWAYS, or IF_RELEASE_BUILD",
 		},
+		{
+			name:  "dirty-tracking",
+			value: "invalid",
+			error: "invalid dirty tracking mode",
+		},
+		{
+			name:  "dirty-tracking-verify",
+			value: "invalid",
+			error: "invalid dirty tracking verification mode",
+		},
+		{
+			name:  "TESTONLY-dirty-tracking-break",
+			value: "invalid",
+			error: "invalid dirty tracking path",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -353,6 +368,28 @@ func TestValidationFail(t *testing.T) {
 				"overlay2": "all:memory",
 			},
 			error: "overlay flag has been replaced with overlay2 flag",
+		},
+		{
+			name: "dirty-tracking-verify-without-tracking",
+			flags: map[string]string{
+				"dirty-tracking-verify": "hash",
+			},
+			error: "dirty-tracking-verify requires dirty tracking",
+		},
+		{
+			name: "dirty-tracking-break-without-tracking",
+			flags: map[string]string{
+				"TESTONLY-dirty-tracking-break": "fault",
+			},
+			error: "TESTONLY-dirty-tracking-break requires dirty tracking",
+		},
+		{
+			name: "dirty-tracking-unit",
+			flags: map[string]string{
+				"dirty-tracking":      "wp",
+				"dirty-tracking-unit": "12288",
+			},
+			error: "dirty-tracking-unit must be a power of 2 of at least 4096",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

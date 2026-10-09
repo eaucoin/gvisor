@@ -190,6 +190,7 @@ go_test(
         "//pkg/sentry/fsimpl/erofs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/vfs",
         "//pkg/sync",
