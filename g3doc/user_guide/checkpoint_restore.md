@@ -670,6 +670,31 @@ Gateway and others), the file is `s3_opts.json`:
     cannot, so configure the bucket to delete incomplete multipart uploads
     after a day, as stores allow with a lifecycle rule.
 
+## Working sets
+
+With `--working-set-window` (a runsc flag, given when the sandbox is
+restored), gVisor records which memory the application touches after a
+restore, in the order it touches it, for that long (`3s` covers the first
+requests a restored application serves) or until the next checkpoint, in units
+of `--working-set-unit` (`64K` by default, or `4K`). The next checkpoint saves
+this working set in its image; a checkpoint of a sandbox that was not restored
+since, or that was restored without recording, keeps the set it was restored
+with.
+
+Recording is off by default (`--working-set-window=0`), since it costs every
+restore some speed: while it lasts, gVisor maps memory into the application in
+units of `--working-set-unit`, so that the set holds no more than was touched,
+and the application takes a page fault for each unit it touches first. At
+64 KiB on systrap that is about 0.2-0.5 ms per MiB touched: an application
+touching all of 512 MiB right after a restore took 0.17-0.25 s longer
+(0.10-0.15 s for a Python one). `4K` records no memory that was not touched,
+at the cost of a page fault for every page.
+
+The restore's log reports how much of what the application touched the
+restored image's working set held, and how much of it was not touched; the
+metrics `/checkpoint/working_set_hit_bytes`, `/checkpoint/working_set_miss_bytes`
+and `/checkpoint/working_set_unused_bytes` count the same.
+
 ## Networking
 
 Checkpoint/restore is supported with `--network=sandbox` (default),
