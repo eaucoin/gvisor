@@ -1,0 +1,364 @@
+# Tier 2 of the fork's CI: gVisor's save/restore suites, nightly on main and
+# on demand for a series. The system call tests run in their save/restore
+# and save/resume variants, sharded; runsc's container checkpoint tests run on
+# systrap, on systrap with transparent huge pages for shared memory (as
+# runsc/boot sets them up), and on kvm, which GitHub's runners expose as
+# nested virtualization, together with the kvm platform's own tests; runsc is
+# built and smoke-tested on aarch64; and the tests of every direct dependent
+# of a changed package are built. The
+# result is posted as the "fork-nightly" commit status of the commit tested.
+name: Fork nightly
+
+"on":
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to test (main or a series/ branch)
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  REF: ${{ inputs.ref || 'main' }}
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+  # Test results stay out of the disk cache, so that each comes from a run.
+  TEST_OPTIONS: --modify_execution_info=TestRunner=+no-cache
+  SHARDS: 8
+
+jobs:
+  build:
+    name: Build runsc and the tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      base: ${{ steps.resolve.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: resolve
+        working-directory: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sha="$(git rev-parse --verify "refs/remotes/origin/${REF}^{commit}")"
+          echo "sha=${sha}" >>"${GITHUB_OUTPUT}"
+          echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${sha}" -f state=pending \
+            -f context=fork-nightly -f description="Tier 2 running" -f target_url="${RUN_URL}" >/dev/null
+          echo "Testing ${REF} at ${sha}" >>"${GITHUB_STEP_SUMMARY}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-nightly-${{ steps.resolve.outputs.base }}-${{ steps.resolve.outputs.sha }}
+          restore-keys: |
+            bazel-nightly-${{ steps.resolve.outputs.base }}-
+            bazel-${{ steps.resolve.outputs.base }}-
+      - name: Build runsc and the tests
+        working-directory: src
+        run: |
+          # Bazel in the build container, as upstream's Makefile runs it: the
+          # queries go to it as files, so no shell expands them, and the
+          # build takes any number of targets (make build cannot). The
+          # first make may start the container and print its ID.
+          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
+          mkdir -p "${RUNNER_TEMP}/targets"
+          for variant in save_restore save_resume; do
+            printf '%s\n' "attr(tags, '\\b${variant}\\b', tests(//test/syscalls/...))" >/tmp/sr.query
+            "${bazel[@]}" query --query_file=/tmp/sr.query | sort |
+              grep -vxFf <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' ../fork/tools/fork/known_failures) \
+                >"${RUNNER_TEMP}/targets/${variant}"
+            echo "${variant}: $(wc -l <"${RUNNER_TEMP}/targets/${variant}") tests (known failures left out)" >>"${GITHUB_STEP_SUMMARY}"
+          done
+          mapfile -t tests < <(cat "${RUNNER_TEMP}"/targets/*)
+          "${bazel[@]}" build --color=no --curses=no "${BAZEL_REMOTE_CACHE}" -- //:release \
+            //runsc/container:container_test //pkg/sentry/platform/kvm:kvm_test "${tests[@]}"
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-nightly-${{ steps.resolve.outputs.base }}-${{ steps.resolve.outputs.sha }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: targets
+          path: ${{ runner.temp }}/targets
+          retention-days: 7
+
+  syscalls:
+    name: System call tests (${{ matrix.variant }} ${{ matrix.shard }}/8)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [save_restore, save_resume]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
+        # themselves in one, as on upstream's test hosts.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-nightly-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: targets
+          path: ${{ runner.temp }}/targets
+      - name: Test
+        env:
+          VARIANT: ${{ matrix.variant }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          targets="$(awk -v n="${SHARDS}" -v i="${SHARD}" 'NR % n == i - 1' "${RUNNER_TEMP}/targets/${VARIANT}" | tr '\n' ' ')"
+          echo "$(wc -w <<<"${targets}") tests" >>"${GITHUB_STEP_SUMMARY}"
+          make syscall-tests OPTIONS="${TEST_OPTIONS}" TARGETS="${targets}"
+      - name: Test logs
+        if: failure()
+        run: |
+          # The logs and outputs (runsc's own logs among them) of the tests
+          # that failed, kept as an artifact.
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
+
+  containers:
+    name: Container checkpoint tests (${{ matrix.platform }}${{ matrix.thp && ', THP' || '' }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: systrap
+          - platform: systrap
+            thp: true
+          - platform: kvm
+    steps:
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
+        # themselves in one, as on upstream's test hosts.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Give access to /dev/kvm
+        if: matrix.platform == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          grep -o -m 1 -E 'vmx|svm' /proc/cpuinfo
+      - name: Use transparent huge pages for shared memory
+        if: matrix.thp
+        run: |
+          echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+          echo defer | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-nightly-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+      - name: Smoke test
+        working-directory: src
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          ../fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --platform=${{ matrix.platform }}
+      - name: kvm platform tests
+        if: matrix.platform == 'kvm'
+        working-directory: src
+        run: make test OPTIONS="${TEST_OPTIONS}" TARGETS=//pkg/sentry/platform/kvm:kvm_test
+      - name: Container checkpoint tests
+        working-directory: src
+        # On the base, TestCheckpointRestoreAnnotation now and then hangs in
+        # WaitCheckpoint until the test times out (runs 37884262655 with THP,
+        # 37897071711 on kvm, 2026-10-09).
+        env:
+          SKIP: TestCheckpointRestoreAnnotation
+        run: |
+          make test TARGETS=//runsc/container:container_test \
+            OPTIONS="${TEST_OPTIONS} --test_env=CGROUPV2=true '--test_filter=Checkpoint|Restore|Resume|Save' --test_arg=--test_platforms=${{ matrix.platform }} --test_arg=-test.skip=${SKIP}"
+      - name: Test logs
+        if: failure()
+        working-directory: src
+        run: |
+          # The logs and outputs (runsc's own logs among them) of the tests
+          # that failed, kept as an artifact.
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
+
+  arm64:
+    name: Build and smoke-test on aarch64
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    # On the base, a restored application dies of SIGILL at once on GitHub's
+    # aarch64 runners (run 37897071711, 2026-10-09): kept, so that the day it
+    # passes shows, but not failing the tier.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-arm64-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+          restore-keys: bazel-arm64-${{ needs.build.outputs.base }}-
+      - name: Build
+        working-directory: src
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-arm64-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+      - name: Smoke test
+        run: fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
+
+  dependents:
+    name: Build the tests of the changed packages' dependents
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-dependents-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+          restore-keys: |
+            bazel-dependents-${{ needs.build.outputs.base }}-
+            bazel-nightly-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+      - name: Build
+        working-directory: src
+        run: |
+          ../fork/tools/fork/affected_tests.sh "${{ needs.build.outputs.base }}" dependents >/tmp/dependents.query
+          if [[ ! -s /tmp/dependents.query ]]; then
+            echo "No Bazel package changed." | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
+          mapfile -t tests < <("${bazel[@]}" query --query_file=/tmp/dependents.query)
+          echo "${#tests[@]} tests built" >>"${GITHUB_STEP_SUMMARY}"
+          "${bazel[@]}" build --color=no --curses=no "${BAZEL_REMOTE_CACHE}" --keep_going \
+            --build_tag_filters=-network_plugins -- "${tests[@]}"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-dependents-${{ needs.build.outputs.base }}-${{ needs.build.outputs.sha }}
+
+  report:
+    name: Report
+    needs: [build, syscalls, containers, arm64, dependents]
+    if: always() && needs.build.outputs.sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.build.outputs.sha }}
+          RESULTS: ${{ needs.build.result }} ${{ needs.syscalls.result }} ${{ needs.containers.result }} ${{ needs.arm64.result }} ${{ needs.dependents.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "${RESULTS}" in
+            "success success success success success") state=success description="Tier 2 passed" ;;
+            *cancelled*) state=error description="Tier 2 cancelled" ;;
+            *) state=failure description="Tier 2 failed (build, syscalls, containers, arm64, dependents: ${RESULTS})" ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" -f state="${state}" \
+            -f context=fork-nightly -f description="${description}" -f target_url="${RUN_URL}" >/dev/null
