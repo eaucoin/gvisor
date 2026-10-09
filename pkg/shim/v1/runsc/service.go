@@ -198,6 +198,10 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		}
 		restoreImagePath = restore.imagePath
 	}
+	layerPaths, err := restoreLayerPaths(rfs.Create, restoreImagePath)
+	if err != nil {
+		return nil, err
+	}
 
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
@@ -211,6 +215,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		FSRestoreImagePath: rfs.Conf.ImagePath,
 		FSRestoreDirect:    rfs.Conf.Direct,
 		RestoreImagePath:   restoreImagePath,
+		RestoreLayerPaths:  layerPaths,
 		RestoreDirect:      restore.direct,
 		RestoreBackground:  restore.background,
 	})
@@ -482,6 +487,20 @@ func (s *runscService) CloseIO(ctx context.Context, r *task.CloseIORequest) (*ty
 		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
+}
+
+// restoreLayerPaths returns the directories in which runsc looks for the
+// layers of the image at restoreImagePath, which r restores: r's parent
+// checkpoint, CRIU's parent images, which a restore of an incremental CRIU
+// checkpoint reads, as runsc reads the layers of an incremental checkpoint.
+func restoreLayerPaths(r *task.CreateTaskRequest, restoreImagePath string) ([]string, error) {
+	if r.ParentCheckpoint == "" {
+		return nil, nil
+	}
+	if restoreImagePath == "" {
+		return nil, fmt.Errorf("parent checkpoint %q without a checkpoint: %w", r.ParentCheckpoint, errdefs.ErrInvalidArgument)
+	}
+	return []string{r.ParentCheckpoint}, nil
 }
 
 // Checkpoint checkpoints the sandbox of the container into r.Path, as `runsc
@@ -896,6 +915,7 @@ func (g *GvisorTaskServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		CudaCheckpointSequential:  req.GetCudaCheckpointSequential(),
 		WorkPath:                  req.GetWorkPath(),
 		FSPath:                    req.GetFsPath(),
+		ParentImagePath:           req.GetParentImagePath(),
 	}
 
 	if req.GetFsCheckpoint() {

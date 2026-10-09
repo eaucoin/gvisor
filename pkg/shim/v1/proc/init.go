@@ -286,6 +286,7 @@ func (p *Init) start(ctx context.Context, restoreConf *extension.RestoreConfig) 
 			Detach:     true,
 			Direct:     restoreConf.Direct,
 			Background: restoreConf.Background,
+			LayerPaths: restoreConf.LayerPaths,
 		}); err != nil {
 			return p.runtimeError(err, "OCI runtime restore failed")
 		}

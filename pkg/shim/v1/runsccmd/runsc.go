@@ -270,6 +270,10 @@ type RestoreOpts struct {
 	Detach     bool
 	Direct     bool
 	Background bool
+
+	// LayerPaths are directories in which runsc looks for the images that
+	// are layers of the image at ImagePath (--layer-path).
+	LayerPaths []string
 }
 
 func (o *RestoreOpts) args() []string {
@@ -288,6 +292,9 @@ func (o *RestoreOpts) args() []string {
 	}
 	if o.Background {
 		out = append(out, "--background")
+	}
+	for _, p := range o.LayerPaths {
+		out = append(out, fmt.Sprintf("--layer-path=%s", p))
 	}
 	return out
 }
@@ -314,6 +321,10 @@ type CheckpointOpts struct {
 	CudaCheckpointSequential  bool
 	WorkPath                  string
 	FSPath                    string
+
+	// ParentImagePath makes the checkpoint incremental, of the image at this
+	// path (--parent-image-path).
+	ParentImagePath string
 }
 
 func (o *CheckpointOpts) checkpointArgs() []string {
@@ -347,6 +358,9 @@ func (o *CheckpointOpts) checkpointArgs() []string {
 	}
 	if o.WorkPath != "" {
 		out = append(out, fmt.Sprintf("--work-path=%s", o.WorkPath))
+	}
+	if o.ParentImagePath != "" {
+		out = append(out, fmt.Sprintf("--parent-image-path=%s", o.ParentImagePath))
 	}
 	return out
 }

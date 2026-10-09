@@ -14,6 +14,7 @@ go_test(
         "shim_test.go",
     ],
     deps = [
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/shim/v1/taskserver:task_server_go_proto",
         "//pkg/test/testutil",
         "//runsc/specutils",
