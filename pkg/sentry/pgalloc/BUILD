@@ -159,6 +159,7 @@ go_library(
         "apfl_mutex.go",
         "apfs_mutex.go",
         "apl_unloaded_set.go",
+        "async_load_budget.go",
         "context.go",
         "debug.go",
         "evictable_range.go",
@@ -209,6 +210,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "async_load_budget_test.go",
         "image_test.go",
         "loader_test.go",
         "pgalloc_64k_test.go",
