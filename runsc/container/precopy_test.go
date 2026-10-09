@@ -294,16 +294,19 @@ func TestCheckpointPrecopyAB(t *testing.T) {
 // MADV_DONTNEED, and forks children that write their copies of its pages),
 // with dirty tracking verified: the checkpoint must find no write that
 // escaped tracking, and its restore must pass the writer's check. As negative
-// controls, with each of the dirty source's own marking paths disabled, the
-// verification of the checkpoint must fail.
+// controls, with each of the dirty source's own marking paths whose loss
+// loses the writer's stores or the writes made before its mappings change
+// (storeBreaksOn, remapBreaksOn) disabled, the verification of the checkpoint
+// must fail.
 func TestCheckpointPrecopyChurn(t *testing.T) {
 	const storeRate = 16 << 20
 	for name, conf := range configs(t, true /* noOverlay */) {
 		for _, src := range incrementalDirtySources {
-			breaks := append([]config.DirtyTrackingBreak{config.DirtyTrackingBreakNone}, src.breaks...)
+			breaks := append([]config.DirtyTrackingBreak{config.DirtyTrackingBreakNone}, src.storeBreaksOn(conf.Platform)...)
+			breaks = append(breaks, src.remapBreaksOn(conf.Platform)...)
 			for _, brk := range breaks {
 				t.Run(fmt.Sprintf("%s/%s/%v", name, src.name, brk), func(t *testing.T) {
-					c := withRootDir(t, incrementalConf(precopyConf(conf, storeRate), src, true /* verify */, brk))
+					c := withRootDir(t, incrementalConf(t, precopyConf(conf, storeRate), src, true /* verify */, brk))
 					w := startABWriter(t, c, "-c", "32", "4")
 					image, err := w.checkpoint(precopyOpts("on"))
 					if brk != config.DirtyTrackingBreakNone {
