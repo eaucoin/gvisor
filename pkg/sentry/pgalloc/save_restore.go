@@ -1245,9 +1245,31 @@ type LoadOpts struct {
 	Timeline *timing.Timeline
 
 	// If WorkingSet is true, the image's working set (Image.WorkingSet), if
-	// any, is the MemoryFile's (see MemoryFile.SetWorkingSet).
+	// any, is the MemoryFile's (see MemoryFile.SetWorkingSet), and async page
+	// loading reads its pages before the other pages of each pages file, as
+	// Prefetch decides.
 	WorkingSet bool
+	Prefetch   PrefetchPolicy
 }
+
+// PrefetchPolicy is how async page loading reads the working set of a
+// MemoryFile.
+type PrefetchPolicy int
+
+const (
+	// PrefetchAuto reads the working set first, unless the pages file
+	// delivers all of its pages within aplPrefetchMinLoadTime.
+	PrefetchAuto PrefetchPolicy = iota
+
+	// PrefetchOff reads the pages that no one waits for in pages file order.
+	PrefetchOff
+)
+
+// aplPrefetchMinLoadTime is the time to load a pages file below which
+// reading its working set first cannot shorten waits enough to be worth its
+// smaller, scattered reads: restores of images loading whole within
+// 0.15-0.35 s gained nothing from it (gvisor-work experiment 08).
+const aplPrefetchMinLoadTime = 300 * time.Millisecond
 
 // LoadFrom loads MemoryFile state from the given stream.
 func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) (err error) {
@@ -1425,6 +1447,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		})
 		amfl.pf.mu.Unlock()
 	}
+	if ws := opts.Image.GetWorkingSet(); opts.WorkingSet && ws != nil && opts.Prefetch != PrefetchOff {
+		loads.setPrefetch(ws, pb.Extents)
+	}
 	// Let each layer's loader read the pages it holds in pages file order.
 	for _, amfl := range loads.amfls {
 		if amfl != nil {
@@ -1511,6 +1536,12 @@ type AsyncPagesFileLoad struct {
 	// bytesLoaded is protected by mu.
 	bytesLoaded uint64
 
+	// bytesTotal is the number of bytes that the MemoryFiles registered so
+	// far load from the pages file, and prefetchTotal the number of bytes of
+	// their working sets. These fields are protected by mu.
+	bytesTotal    uint64
+	prefetchTotal uint64
+
 	// Following fields are exclusive to the async page loader goroutine.
 
 	timeline     *timing.Timeline // immutable
@@ -1536,6 +1567,26 @@ type AsyncPagesFileLoad struct {
 	// it.
 	bgInflight uint64
 	bgBudget   aplBackgroundBudget
+
+	// prefetch is true once the loader decided to read the working sets of
+	// the MemoryFiles first (see decidePrefetch), and prefetched is the
+	// number of bytes of background reads of working sets.
+	prefetch   bool
+	prefetched uint64
+
+	// The first round is the background reads issued before one of them
+	// completed: firstRoundReads of them, the first issued at
+	// firstRoundStart, of which firstRoundDone, totalling firstRoundBytes,
+	// have completed. firstRoundClosed is true once one of them completed.
+	// Their bytes over the time they took are the bandwidth of the pages file
+	// with as many reads in flight as loading starts with, which decides
+	// whether to read working sets first (see decidePrefetch). These fields
+	// are exclusive to the async page loader goroutine.
+	firstRoundReads  uint64
+	firstRoundDone   uint64
+	firstRoundBytes  uint64
+	firstRoundStart  int64
+	firstRoundClosed bool
 
 	// The async page loader combines multiple loads with contiguous pages file
 	// offsets (the common case) into a single read, even if their
@@ -1627,6 +1678,13 @@ type asyncMemoryFileLoad struct {
 	// loads. done is protected by pf.mu.
 	done bool
 
+	// prefetch holds the ranges of the MemoryFile's working set whose pages
+	// are in this pages file, in first-touch order. The async page loader
+	// reads their pages that are not awaited before the other pages of the
+	// sweep. prefetch is set at most once, by MemoryFile.LoadFrom() before
+	// it sets sweep; it is protected by pf.mu.
+	prefetch []memmap.FileRange
+
 	// sweep holds the extents of the MemoryFile in this pages file, merged
 	// and sorted by pages file offset. The async page loader reads pages
 	// that are not awaited in this order, so that the pages file is read
@@ -1643,9 +1701,12 @@ type asyncMemoryFileLoad struct {
 
 	// sweepIndex is the index in sweep of the extent that the loader is
 	// sweeping, and sweepNext is the MemoryFile offset in that extent from
-	// which it continues.
-	sweepIndex int
-	sweepNext  uint64
+	// which it continues. prefetchIndex and prefetchNext are the same for
+	// prefetch.
+	sweepIndex    int
+	sweepNext     uint64
+	prefetchIndex int
+	prefetchNext  uint64
 }
 
 // aplExtent is a range of MemoryFile offsets and the pages file offset of its
@@ -1864,8 +1925,46 @@ func (amfl *asyncMemoryFileLoad) startSweep(extents []*pgallocpb.ExtentProto) {
 	}
 	amfl.pf.mu.Lock()
 	amfl.sweep = merged
+	for _, e := range merged {
+		amfl.pf.bytesTotal += e.Length()
+	}
 	amfl.pf.mu.Unlock()
 	amfl.pf.lfStatus.Notify(aplLFPending)
+}
+
+// setPrefetch makes the async page loader of each layer read the pages of the
+// working set ws that the layer holds, per the MemoryFile's extents, before
+// its other pages that no one waits for.
+func (loads *asyncMemoryFileLoads) setPrefetch(ws *pgallocpb.WorkingSetProto, extents []*pgallocpb.ExtentProto) {
+	prefetch := make([][]memmap.FileRange, len(loads.amfls))
+	var bytes uint64
+	for _, r := range ws.GetExtents() {
+		fr := memmap.FileRange{Start: r.GetStart(), End: r.GetEnd()}
+		// extents are sorted by MemoryFile offset.
+		i := sort.Search(len(extents), func(i int) bool { return extents[i].End > fr.Start })
+		for ; i < len(extents) && extents[i].Start < fr.End; i++ {
+			e := extents[i]
+			pfr := fr.Intersect(memmap.FileRange{Start: e.Start, End: e.End})
+			if n := len(prefetch[e.Layer]); n != 0 && prefetch[e.Layer][n-1].End == pfr.Start {
+				prefetch[e.Layer][n-1].End = pfr.End
+			} else {
+				prefetch[e.Layer] = append(prefetch[e.Layer], pfr)
+			}
+			bytes += pfr.Length()
+		}
+	}
+	for i, amfl := range loads.amfls {
+		if amfl == nil || len(prefetch[i]) == 0 {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		amfl.prefetch = prefetch[i]
+		for _, pfr := range prefetch[i] {
+			amfl.pf.prefetchTotal += pfr.Length()
+		}
+		amfl.pf.mu.Unlock()
+	}
+	log.Infof("MemoryFile(%p): the working set holds %d bytes of loaded pages, in %d ranges recorded over %v", loads.f, bytes, len(ws.GetExtents()), time.Duration(ws.GetWindowNs()))
 }
 
 // aplUnloadedInfo is the value type of asyncMemoryFileLoad.unloaded.
@@ -1933,6 +2032,10 @@ type aplOp struct {
 	// read's own included if it is a background read.
 	issued     int64
 	bgInflight uint64
+
+	// firstRound is true if the read is one of the first round (see
+	// AsyncPagesFileLoad.firstRoundReads).
+	firstRound bool
 }
 
 func (op *aplOp) off() int64 {
@@ -2167,6 +2270,13 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 		apfl.bgInflight += op.total
 	}
 	op.bgInflight = apfl.bgInflight
+	op.firstRound = op.tempRef && !apfl.firstRoundClosed
+	if op.firstRound {
+		if apfl.firstRoundReads == 0 {
+			apfl.firstRoundStart = op.issued
+		}
+		apfl.firstRoundReads++
+	}
 	if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized read to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncReader implementation.
@@ -2335,6 +2445,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}()
 
 	maxParallel := apfl.ar.MaxParallel()
+	// prefetchDecided is true once decidePrefetch was called.
+	prefetchDecided := false
 	// Storage reused between main loop iterations:
 	var completions []stateio.Completion
 	var wakeups []*aplWaiter
@@ -2465,7 +2577,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
 				amfl.f.mu.Lock()
 				apfl.mu.Lock()
-				full := false
+				full := apfl.prefetch && apfl.enqueuePrefetchLocked(amfl)
 				for !full && amfl.sweepIndex < len(amfl.sweep) {
 					e := &amfl.sweep[amfl.sweepIndex]
 					ulseg := amfl.unloaded.LowerBoundSegment(max(e.Start, amfl.sweepNext))
@@ -2528,6 +2640,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				durTotal := time.Duration(aplNanotime() - timeStart)
 				apfl.mu.Lock()
 				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s)", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget)
+				if apfl.prefetchTotal != 0 {
+					log.Infof("Async page loading read %d of %d bytes of working sets first", apfl.prefetched, apfl.prefetchTotal)
+				}
 				apfl.mu.Unlock()
 				return
 			}
@@ -2570,6 +2685,11 @@ func (apfl *AsyncPagesFileLoad) main() {
 				}
 			}
 			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight)
+			if op.firstRound {
+				apfl.firstRoundClosed = true
+				apfl.firstRoundDone++
+				apfl.firstRoundBytes += c.N
+			}
 			if op.tempRef {
 				apfl.bgInflight -= op.total
 				// Delay f.DecRef(fr) until after dropping locks. This is
@@ -2650,7 +2770,76 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		dropDelayedDecRefs()
 		apfl.bgBudget.update(now)
+		if !prefetchDecided && apfl.firstRoundClosed && apfl.firstRoundDone == apfl.firstRoundReads {
+			prefetchDecided = true
+			apfl.decidePrefetch(float64(apfl.firstRoundBytes) / time.Duration(now-apfl.firstRoundStart).Seconds())
+		}
 	}
+}
+
+// decidePrefetch decides, once the first round of background reads has
+// completed, whether to read the working sets of the MemoryFiles loading from
+// the pages file before their other pages: not if the pages file, delivering
+// bandwidth bytes per second as it did to the first round, would deliver all
+// of their pages within aplPrefetchMinLoadTime. The first round measures the
+// bandwidth of as many reads as loading starts with, in parallel on an
+// object store as in order on a disk: the first read alone delivers all of
+// a disk's bandwidth, but only a fraction of an object store's.
+func (apfl *AsyncPagesFileLoad) decidePrefetch(bandwidth float64) {
+	apfl.mu.Lock()
+	remaining, prefetchTotal := apfl.bytesTotal-apfl.bytesLoaded, apfl.prefetchTotal
+	apfl.mu.Unlock()
+	if prefetchTotal == 0 {
+		return
+	}
+	estimate := time.Duration(float64(remaining) / bandwidth * float64(time.Second))
+	if estimate < aplPrefetchMinLoadTime {
+		log.Infof("Async page loading: not reading working sets first, since the rest of the pages file loads in about %v", estimate.Round(time.Millisecond))
+		return
+	}
+	apfl.prefetch = true
+	log.Infof("Async page loading: reading working sets (%d bytes) first; the rest of the pages file loads in about %v", prefetchTotal, estimate.Round(time.Millisecond))
+}
+
+// enqueuePrefetchLocked enqueues background reads of the pages of amfl's
+// working set that are not being loaded, in first-touch order, and returns
+// true if it could not enqueue all of them.
+//
+// Preconditions:
+//   - amfl.f.mu and apfl.mu must be locked.
+//   - apfl.canEnqueue() == true.
+func (apfl *AsyncPagesFileLoad) enqueuePrefetchLocked(amfl *asyncMemoryFileLoad) bool {
+	for amfl.prefetchIndex < len(amfl.prefetch) {
+		pfr := amfl.prefetch[amfl.prefetchIndex]
+		ulseg := amfl.unloaded.LowerBoundSegment(max(pfr.Start, amfl.prefetchNext))
+		for ulseg.Ok() && ulseg.Start() < pfr.End {
+			if ulseg.ValuePtr().started {
+				amfl.prefetchNext = ulseg.End()
+				ulseg = ulseg.NextSegment()
+				continue
+			}
+			ulFR := ulseg.Range().Intersect(pfr)
+			ulseg = amfl.unloaded.Isolate(ulseg, ulFR)
+			// As in the sweep, take page references during reading.
+			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */)
+			if n == 0 {
+				return true
+			}
+			ulFR.End = ulFR.Start + n
+			ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
+			ulseg.ValuePtr().started = true
+			amfl.prefetchNext = ulFR.End
+			amfl.f.incRefLocked(ulFR)
+			apfl.prefetched += n
+			if !apfl.canEnqueue() {
+				return true
+			}
+			ulseg = ulseg.NextSegment()
+		}
+		amfl.prefetchIndex++
+		amfl.prefetchNext = 0
+	}
+	return false
 }
 
 // cancelWasteLoad cancels loading of pages in fr.

@@ -530,7 +530,14 @@ early by a checkpoint; 0 disables recording), in units of `--working-set-unit`
 (`64K` by default, or `4K`, which records no memory that was not touched at the
 cost of a page fault for every page touched while recording). The next
 checkpoint saves this working set in its image; a checkpoint of a sandbox that
-was not restored since keeps the set it was restored with.
+was not restored since keeps the set it was restored with. Since what an
+application touches first after a restore varies little from one restore to
+the next, a background restore of that image (`--background`) reads the working
+set's pages before the rest of `pages.img`, while faults still come first,
+unless `--working-set-prefetch=off`, or unless the image loads whole within
+300 ms, when reading it first cannot help. Rewriting the image with
+`--working-set-first` makes reading it one sequential read of the head of
+`pages.img`, which matters on object stores, where every read is a request.
 
 The restore's log reports how much of what the application touched the
 restored image's working set held, and how much of it was not touched; the
