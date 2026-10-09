@@ -27,6 +27,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -281,6 +284,109 @@ func TestSaveLoadPrivateMemoryFiles(t *testing.T) {
 			checkInvariants(t, restored[i])
 			ms[i].check(t, restored[i])
 		})
+	}
+}
+
+// TestSaveLoadPrivateMemoryFilesWithoutImage saves private MemoryFiles to one
+// pages file with their records written back to back rather than through a
+// checkpointimage.Writer, as a filesystem checkpoint saves its tmpfs and
+// overlay MemoryFiles, and loads each from its own record, as a filesystem
+// restore does. Such records have no page hashes, and load against an image
+// without them.
+func TestSaveLoadPrivateMemoryFilesWithoutImage(t *testing.T) {
+	const n = 2
+	var (
+		fs       [n]*MemoryFile
+		restored [n]*MemoryFile
+		ms       [n]*testMemory
+	)
+	for i := range fs {
+		fs[i] = newTestMemoryFile(t, testMemoryFileOpts{diskBacked: true})
+		ms[i] = buildTestMemory(t, fs[i], uint64(i+1))
+		restored[i] = newTestMemoryFile(t, testMemoryFileOpts{diskBacked: true})
+	}
+
+	var pages bytes.Buffer
+	saveDone := make(chan error, 1)
+	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 256<<10, 64, 4), func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave: %v", err)
+	}
+	var records [n][]byte
+	for i, f := range fs {
+		var meta bytes.Buffer
+		if err := f.SaveTo(context.Background(), &meta, &SaveOpts{PagesFile: apfs}); err != nil {
+			t.Fatalf("SaveTo of MemoryFile %d: %v", i, err)
+		}
+		records[i] = meta.Bytes()
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("async page saving: %v", err)
+	}
+	for i, rec := range records {
+		var mf pgallocpb.MemoryFileMetadataProto
+		if err := checkpointimage.ReadRecord(bytes.NewReader(rec), &mf, uint64(len(rec))); err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if got := len(mf.GetPageHashes()); got != 0 {
+			t.Errorf("record %d has %d bytes of page hashes, want none", i, got)
+		}
+	}
+
+	ar := newTestPagesFile(t, pages.Bytes(), testPagesFileOpts{})
+	loadDone := make(chan error, 1)
+	apfl, err := StartAsyncPagesFileLoad(ar, func(err error) { loadDone <- err }, nil /* timeline */)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	ip := &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{PagesSize: uint64(pages.Len())}}}
+	mfErrs := make(chan error, n)
+	for i, f := range restored {
+		opts := LoadOpts{
+			Image:        ip,
+			PagesFiles:   []*AsyncPagesFileLoad{apfl},
+			DoneCallback: func(err error) { mfErrs <- err },
+		}
+		if err := f.LoadFrom(context.Background(), bytes.NewReader(records[i]), &opts); err != nil {
+			t.Fatalf("LoadFrom of MemoryFile %d: %v", i, err)
+		}
+	}
+	apfl.MemoryFilesDone()
+	ar.finish()
+	if err := <-loadDone; err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	for range restored {
+		if err := <-mfErrs; err != nil {
+			t.Fatalf("async page loading of a MemoryFile: %v", err)
+		}
+	}
+	for i := range restored {
+		t.Run(fmt.Sprintf("MemoryFile %d", i), func(t *testing.T) {
+			t.Cleanup(func() { releaseAll(t, restored[i]) })
+			checkInvariants(t, restored[i])
+			ms[i].check(t, restored[i])
+		})
+	}
+}
+
+// TestSaveOptsPageHashes checks that SaveTo refuses page hashes without a
+// pages file, and a delta without page hashes.
+func TestSaveOptsPageHashes(t *testing.T) {
+	f := newTestMemoryFile(t, testMemoryFileOpts{})
+	var meta bytes.Buffer
+	if err := f.SaveTo(context.Background(), &meta, &SaveOpts{PageHashes: true}); err == nil {
+		t.Errorf("SaveTo with page hashes and no pages file succeeded")
+	}
+	base := checkpointimage.NewMemoryFileImage(&pgallocpb.MemoryFileMetadataProto{})
+	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&bytes.Buffer{}, 256<<10, 64, 4), func(error) {})
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave: %v", err)
+	}
+	defer apfs.MemoryFilesDone()
+	if err := f.SaveTo(context.Background(), &meta, &SaveOpts{PagesFile: apfs, Base: base}); err == nil {
+		t.Errorf("SaveTo of a delta without page hashes succeeded")
 	}
 }
 
