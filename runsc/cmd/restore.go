@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -40,6 +41,10 @@ type Restore struct {
 
 	// imagePath is the path to the saved container image
 	imagePath string
+
+	// layerPaths are where to look for the images that are layers of the
+	// image at imagePath, besides imagePath/layers.
+	layerPaths pathList
 
 	// detach indicates that runsc has to start a process and exit without waiting it.
 	detach bool
@@ -78,6 +83,7 @@ func (*Restore) Usage() string {
 func (r *Restore) SetFlags(f *flag.FlagSet) {
 	r.Create.SetFlags(f)
 	f.StringVar(&r.imagePath, "image-path", "", "directory path to saved container image")
+	f.Var(&r.layerPaths, "layer-path", "directory in which to look for the images that are layers of the image at --image-path, besides its layers/ subdirectory: an image directory, or a directory of image directories named by their digest; can be repeated, or given comma-separated")
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
@@ -187,7 +193,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, r.layerPaths, r.direct, r.background, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}
@@ -211,4 +217,29 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	cu.Release()
 
 	return subcommands.ExitSuccess
+}
+
+// pathList is a flag holding a list of paths, given by repeating the flag, by
+// separating them with commas, or both. Set(String()) is idempotent.
+type pathList []string
+
+// String implements flag.Value.String.
+func (p *pathList) String() string {
+	return strings.Join(*p, ",")
+}
+
+// Get implements flag.Value.Get.
+func (p *pathList) Get() any {
+	return p
+}
+
+// Set implements flag.Value.Set.
+func (p *pathList) Set(v string) error {
+	for _, path := range strings.Split(v, ",") {
+		if path == "" {
+			return fmt.Errorf("empty path in %q", v)
+		}
+		*p = append(*p, path)
+	}
+	return nil
 }
