@@ -140,6 +140,7 @@ use_repo(
     "co_honnef_go_tools",
     "com_github_burntsushi_toml",
     "com_github_cenkalti_backoff",
+    "com_github_cespare_xxhash_v2",
     "com_github_cilium_ebpf",
     "com_github_containerd_cgroups_v3",
     "com_github_containerd_console",

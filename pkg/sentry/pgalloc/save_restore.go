@@ -17,16 +17,15 @@ package pgalloc
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
-	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bitmap"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -38,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/state"
@@ -68,7 +68,7 @@ func (f *MemoryFile) ResourceID() checkpoint.ResourceID {
 
 func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 	pb := &pgallocpb.MemoryFileMetadataProto{
-		Version:     1,
+		Version:     checkpointimage.MemoryFileMetadataVersion,
 		Subreleased: make(map[uint64]uint64, len(f.subreleased)),
 	}
 	for k, v := range f.subreleased {
@@ -122,9 +122,13 @@ func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 	return pb
 }
 
+// importMetadataProto imports pb into f.
+//
+// Preconditions: pb has passed checkpointimage.ValidateMemoryFile.
 func (f *MemoryFile) importMetadataProto(pb *pgallocpb.MemoryFileMetadataProto) error {
-	if pb.Version != 1 {
-		return fmt.Errorf("unsupported MemoryFileMetadataProto version %d", pb.Version)
+	fileSize := uint64(len(pb.Chunks)) * chunkSize
+	if n := len(pb.MemAcct); n != 0 && pb.MemAcct[n-1].End > fileSize {
+		return fmt.Errorf("memory accounting range %#x-%#x is beyond the end of the %d chunks", pb.MemAcct[n-1].Start, pb.MemAcct[n-1].End, len(pb.Chunks))
 	}
 	f.subreleased = make(map[uint64]uint64, len(pb.Subreleased))
 	for k, v := range pb.Subreleased {
@@ -182,9 +186,41 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If Base is not nil, SaveTo saves f as a delta of Base, f's part of an
+	// image saved earlier: pages whose contents are unchanged since Base was
+	// saved refer to Base's data instead of being written to PagesFile. Pages
+	// for which Clean returns true are unchanged by definition (their hash is
+	// Base's, and they are not read); others are unchanged if their hash is
+	// Base's. (Page hashes are not cryptographic: an application that writes
+	// a page colliding with its Base page gets the Base page back on restore,
+	// contents that were its own memory when Base was saved.) Base's layer i
+	// is layer BaseLayers[i] of the image being saved. Base requires
+	// PagesFile and PageHashes.
+	Base       *checkpointimage.MemoryFileImage
+	BaseLayers []uint32
+
+	// If Clean is not nil, Clean(off) returns true if the page at MemoryFile
+	// offset off is known not to have changed since Base was saved. Clean is
+	// called in increasing offset order.
+	Clean func(off uint64) bool
+
+	// If PageHashes is true, SaveTo records the page hash (XXH64) of every
+	// known-committed page in its record, for an image whose
+	// ImageProto.page_hash is checkpointimage.PageHashXXH64:
+	// checkpointimage.Writer moves them to the page hashes section of the
+	// pages metadata file. Records that are not written through a
+	// checkpointimage.Writer, such as a filesystem checkpoint's, have none.
+	// PageHashes requires PagesFile.
+	PageHashes bool
 }
 
 // SaveTo writes f's state to the given stream.
+//
+// If opts.PagesFile is not nil, SaveTo writes f's metadata to w as a
+// checkpointimage record, with the extents of its pages in the image's layers
+// (layer 0 is opts.PagesFile) and, if opts.PageHashes, their page hashes.
+// Otherwise, it writes the metadata followed by the pages.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
@@ -202,6 +238,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// Ensure that there are no pending evictions.
 	if len(f.evictable) != 0 {
 		panic(fmt.Sprintf("evictions still pending for %d users; call StartEvictions and WaitForEvictions before SaveTo", len(f.evictable)))
+	}
+
+	if opts.Base != nil && opts.PagesFile == nil {
+		return fmt.Errorf("saving a delta requires a pages file")
+	}
+	if opts.Base != nil && !opts.PageHashes {
+		return fmt.Errorf("saving a delta requires page hashes")
+	}
+	if opts.PageHashes && opts.PagesFile == nil {
+		return fmt.Errorf("page hashes require a pages file")
 	}
 
 	// Register this MemoryFile with async page saving if a pages file has been
@@ -247,18 +293,25 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newUncommittedBytes     uint64
 		hostHoleBytes           uint64
 	)
-	asyncWritePages := func(fr memmap.FileRange) {}
+	// If saving to a pages file, img decides where each known-committed page's
+	// data is: written to the pages file, in Base, or nowhere (zero).
+	var img *imageSaver
 	if amfs != nil {
-		asyncWritePages = func(fr memmap.FileRange) {
-			amount := fr.Length()
+		var err error
+		img, err = newImageSaver(f, opts, func(fr memmap.FileRange) uint64 {
 			amfs.pf.mu.Lock()
+			off := amfs.pf.saveOff
 			amfs.pf.unsaved.PushBack(apsRange{
 				amfs:      amfs,
 				FileRange: fr,
 			})
-			amfs.pf.saveOff += amount
+			amfs.pf.saveOff += fr.Length()
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
+			return off
+		})
+		if err != nil {
+			return err
 		}
 	}
 
@@ -343,8 +396,8 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}
 			maseg = f.memAcct.Unisolate(maseg)
 		}
-		if nowCommitted {
-			asyncWritePages(fr)
+		if nowCommitted && img != nil {
+			img.emit(fr)
 		}
 		return maseg
 	}
@@ -375,7 +428,6 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	dataSeeker := f.newHostFileDataSeeker()
-	zeroPage := make([]byte, hostarch.PageSize)
 	// f.mu is unlocked below, allowing concurrent calls to f.UpdateUsage() to
 	// observe pages that we transiently commit (for comparisons to zero) or
 	// leave committed (if opts.ExcludeCommittedZeroPages is true). Set
@@ -400,7 +452,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
 				pg := bs[pgoff : pgoff+hostarch.PageSize]
 				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
+				isZeroed := bytes.Equal(pg, zeroPageBytes[:])
 				if isZeroed {
 					if !wasCommitted {
 						alreadyUncommittedBytes += hostarch.PageSize
@@ -512,16 +564,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	pb := f.exportMetadataProto()
-	data, err := proto.Marshal(pb)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
+	if img != nil {
+		img.finish(pb)
+		log.Infof("MemoryFile(%p): %d bytes written to the pages file, %d bytes in the base image (+ %d bytes found unchanged by hash), %d bytes zero; %d extents; hashed in %s",
+			f, img.writtenBytes, img.baseBytes, img.refinedBytes, img.zeroBytes, len(pb.Extents), time.Duration(gohacks.Nanotime()-timeMetadataStart))
 	}
-	var lengthBuf [8]byte
-	binary.LittleEndian.PutUint64(lengthBuf[:], uint64(len(data)))
-	if _, err := w.Write(lengthBuf[:]); err != nil {
-		return fmt.Errorf("failed to write metadata length: %w", err)
-	}
-	if _, err := w.Write(data); err != nil {
+	if err := checkpointimage.WriteRecord(w, pb); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
@@ -1074,20 +1122,19 @@ func (apfs *AsyncPagesFileSave) main() {
 
 // LoadOpts provides options to MemoryFile.LoadFrom().
 type LoadOpts struct {
-	// If PagesFile is not nil, then page contents will be read from PagesFile,
-	// starting at offset PagesFileOffset, rather than from r. After LoadFrom
-	// returns, PagesFileOffset will be updated to the offset of the first byte
-	// in PagesFile after this MemoryFile's contents.
+	// Image is the image-level metadata of the image being loaded.
+	Image *pgallocpb.ImageProto
+
+	// If PagesFiles is not empty, page contents will be read from the pages
+	// files of the image's layers, PagesFiles[i] being layer i's, rather than
+	// from r.
 	//
-	// Reading from PagesFile may continue after LoadFrom returns. If
+	// Reading from PagesFiles may continue after LoadFrom returns. If
 	// DoneCallback is not nil, it will be called when reading for this
 	// MemoryFile completes. DoneCallback will be called whether or not
 	// LoadFrom returns a non-nil error.
-	//
-	// Invariant: PagesFileOffset must be page-aligned.
-	PagesFile       *AsyncPagesFileLoad
-	PagesFileOffset uint64
-	DoneCallback    func(error)
+	PagesFiles   []*AsyncPagesFileLoad
+	DoneCallback func(error)
 
 	// Optional timeline for the restore process.
 	// If async page loading is enabled, a forked timeline will be created, so
@@ -1101,26 +1148,27 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	mfTimeline := opts.Timeline.Fork(fmt.Sprintf("mf:%p", f)).Lease()
 	defer mfTimeline.End()
 
+	// doneCallback is called when LoadFrom returns, unless async page loading
+	// takes it over.
+	doneCallback := opts.DoneCallback
 	defer func() {
-		if opts.DoneCallback != nil {
-			opts.DoneCallback(err)
+		if doneCallback != nil {
+			doneCallback(err)
 		}
 	}()
 
 	// Load metadata.
 	timeMetadataStart := gohacks.Nanotime()
-	var lengthBuf [8]byte
-	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
-		return fmt.Errorf("failed to read metadata length: %w", err)
-	}
-	length := binary.LittleEndian.Uint64(lengthBuf[:])
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return fmt.Errorf("failed to read metadata: %w", err)
+	inline := len(opts.PagesFiles) == 0
+	if !inline && len(opts.PagesFiles) != len(opts.Image.GetLayers()) {
+		return fmt.Errorf("%d pages files for an image of %d layers", len(opts.PagesFiles), len(opts.Image.GetLayers()))
 	}
 	var pb pgallocpb.MemoryFileMetadataProto
-	if err := proto.Unmarshal(data, &pb); err != nil {
-		return fmt.Errorf("failed to unmarshal metadata: %w", err)
+	if err := checkpointimage.ReadRecord(r, &pb, checkpointimage.MaxBodySize); err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+	if err := checkpointimage.ValidateMemoryFile(&pb, opts.Image, inline); err != nil {
+		return err
 	}
 	if err := f.importMetadataProto(&pb); err != nil {
 		return fmt.Errorf("failed to import metadata: %w", err)
@@ -1172,88 +1220,36 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}()
 	}
 	defer madviseWG.Wait()
-
-	// Register this MemoryFile with async page loading if a pages file has
-	// been provided.
-	var amfl *asyncMemoryFileLoad
-	if opts.PagesFile != nil {
-		var df stateio.DestinationFile
-		if opts.PagesFile.ar.NeedRegisterDestinationFD() {
-			var err error
-			df, err = opts.PagesFile.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
-			if err != nil {
-				return fmt.Errorf("failed to register MemoryFile with pages file: %w", err)
-			}
-		}
-		amfl = &asyncMemoryFileLoad{
-			f:            f,
-			pf:           opts.PagesFile,
-			df:           df,
-			doneCallback: opts.DoneCallback,
-			timeline:     mfTimeline.Transfer(),
-		}
-		amfl.pf.amflsMu.Lock()
-		if err := amfl.pf.err(); err != nil {
-			amfl.pf.amflsMu.Unlock()
-			return err
-		}
-		amfl.pf.amfls.PushBack(amfl)
-		amfl.pf.amflsMu.Unlock()
-		f.asyncPageLoad.Store(amfl)
-		opts.DoneCallback = nil
-		defer func() {
-			amfl.pf.amflsMu.Lock()
-			defer amfl.pf.amflsMu.Unlock()
-			amfl.pf.mu.Lock()
-			defer amfl.pf.mu.Unlock()
-			amfl.lfDone = true
-			if amfl.unloaded.IsEmpty() {
-				// The async page loader goroutine does this when it
-				// transitions amfl.unloaded from non-empty to empty with
-				// amfl.lfDone == true, but since amfl.unloaded is already
-				// empty (async page loading for this MemoryFile finished
-				// before we got here, possibly because the MemoryFile was
-				// empty), we have to do so instead.
-				amfl.minUnloaded.Store(math.MaxUint64)
-				amfl.pf.amfls.Remove(amfl)
-				amfl.f.asyncPageLoad.Store(nil)
-				amfl.timeline.End()
-				if amfl.doneCallback != nil {
-					amfl.doneCallback(nil)
-					amfl.doneCallback = nil
-				}
-			}
-		}()
-	}
-
-	// Load committed pages and reconstruct memory accounting state.
-	wr := wire.Reader{Reader: r}
-	timePagesStart := gohacks.Nanotime()
-	minUnloadedInit := false
-	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
-		if !maseg.ValuePtr().knownCommitted {
-			continue
-		}
-		maFR := maseg.Range()
-		amount := maFR.Length()
-		// Wait for all chunks spanned by this segment to be madvised.
-		for madviseEnd.Load() < maFR.End {
+	// Wait for all chunks spanned by fr to be madvised.
+	awaitMadvise := func(fr memmap.FileRange) {
+		for madviseEnd.Load() < fr.End {
 			<-madviseChan
 		}
-		if amfl != nil {
-			// Record where to read data.
-			if !minUnloadedInit {
-				minUnloadedInit = true
-				amfl.minUnloaded.Store(maFR.Start)
+	}
+
+	// Account for restored pages. We need to do this here since these
+	// segments are marked as "known committed", and will be skipped over on
+	// accounting scans.
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		if ma := maseg.ValuePtr(); ma.knownCommitted {
+			amount := maseg.Range().Length()
+			f.knownCommittedBytes += amount
+			if !f.opts.DisableMemoryAccounting {
+				usage.MemoryAccounting.Inc(amount, ma.kind, ma.memCgID)
 			}
-			amfl.pf.mu.Lock()
-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
-			})
-			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
-			amfl.pf.lfStatus.Notify(aplLFPending)
-		} else {
+		}
+	}
+
+	timePagesStart := gohacks.Nanotime()
+	if inline {
+		// Load committed pages.
+		wr := wire.Reader{Reader: r}
+		for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+			if !maseg.ValuePtr().knownCommitted {
+				continue
+			}
+			maFR := maseg.Range()
+			awaitMadvise(maFR)
 			// Verify header.
 			length, object, err := state.ReadHeader(&wr)
 			if err != nil {
@@ -1263,9 +1259,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				// Not expected.
 				return fmt.Errorf("unexpected object")
 			}
-			if length != amount {
+			if length != maFR.Length() {
 				// Size mismatch.
-				return fmt.Errorf("mismatched segment: expected %d, got %d", amount, length)
+				return fmt.Errorf("mismatched segment: expected %d, got %d", maFR.Length(), length)
 			}
 			// Read data.
 			var ioErr error
@@ -1279,22 +1275,45 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				return fmt.Errorf("failed to read pages: %w", ioErr)
 			}
 		}
+		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
+		log.Infof("MemoryFile(%p): loaded pages in %s (%d bytes, %.3f MB/s)", f, durPages, f.knownCommittedBytes, float64(f.knownCommittedBytes)*1e-6/durPages.Seconds())
+		return nil
+	}
 
-		// Update accounting for restored pages. We need to do this here since
-		// these segments are marked as "known committed", and will be skipped
-		// over on accounting scans.
-		f.knownCommittedBytes += amount
-		if !f.opts.DisableMemoryAccounting {
-			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
+	// Register this MemoryFile with async page loading from the pages file of
+	// each layer that holds some of its pages.
+	loads, err := f.startAsyncLoads(&pb, opts.PagesFiles, fileSize, doneCallback, mfTimeline.Transfer())
+	if err != nil {
+		return err
+	}
+	doneCallback = nil
+	defer loads.lfDone()
+
+	// Record where to read data. Data is read into the MemoryFile only after
+	// its chunks have been madvised.
+	minUnloadedInit := make([]bool, len(loads.amfls))
+	for _, e := range pb.Extents {
+		fr := memmap.FileRange{Start: e.Start, End: e.End}
+		awaitMadvise(fr)
+		amfl := loads.amfls[e.Layer]
+		amfl.pf.mu.Lock()
+		if !minUnloadedInit[e.Layer] {
+			minUnloadedInit[e.Layer] = true
+			amfl.minUnloaded.Store(fr.Start)
+		}
+		amfl.unloaded.InsertRange(fr, aplUnloadedInfo{
+			off: e.Offset,
+		})
+		amfl.pf.mu.Unlock()
+	}
+	// Let each layer's loader read the pages it holds in pages file order.
+	for _, amfl := range loads.amfls {
+		if amfl != nil {
+			amfl.startSweep(pb.Extents)
 		}
 	}
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
-	if amfl != nil {
-		log.Infof("MemoryFile(%p): loaded page file offsets in %s; async loading %d bytes", f, durPages, f.knownCommittedBytes)
-	} else {
-		log.Infof("MemoryFile(%p): loaded pages in %s (%d bytes, %.3f MB/s)", f, durPages, f.knownCommittedBytes, float64(f.knownCommittedBytes)*1e-6/durPages.Seconds())
-	}
-
+	log.Infof("MemoryFile(%p): loaded %d extents in %s; async loading %d bytes from %d layers", f, len(pb.Extents), durPages, f.knownCommittedBytes, loads.layers())
 	return nil
 }
 
@@ -1399,14 +1418,39 @@ func (apfl *AsyncPagesFileLoad) err() error {
 	return nil
 }
 
-// asyncMemoryFileLoad holds async page loading state for a single MemoryFile.
+// asyncMemoryFileLoads holds async page loading state for a single
+// MemoryFile, which loads from the pages file of one or more layers.
+type asyncMemoryFileLoads struct {
+	// Immutable fields:
+	f        *MemoryFile
+	timeline *timing.Timeline
+
+	// amfls holds the state of loading from each layer: amfls[i] loads from
+	// layer i's pages file, or is nil if no page of f is in layer i. amfls is
+	// immutable.
+	amfls []*asyncMemoryFileLoad
+
+	// mu protects the following fields.
+	mu sync.Mutex
+
+	// remaining is the number of entries of amfls that have not completed.
+	remaining int
+
+	// err is the first error that terminated loading from a layer.
+	err error
+
+	// doneCallback is called when loading from every layer has completed.
+	doneCallback func(error)
+}
+
+// asyncMemoryFileLoad holds async page loading state for a single MemoryFile
+// and a single pages file.
 type asyncMemoryFileLoad struct {
 	// Immutable fields:
-	f            *MemoryFile
-	pf           *AsyncPagesFileLoad
-	df           stateio.DestinationFile
-	doneCallback func(error)
-	timeline     *timing.Timeline
+	f     *MemoryFile
+	pf    *AsyncPagesFileLoad
+	df    stateio.DestinationFile
+	loads *asyncMemoryFileLoads
 
 	// minUnloaded is the MemoryFile offset of the first unloaded byte.
 	minUnloaded atomicbitops.Uint64
@@ -1419,6 +1463,17 @@ type asyncMemoryFileLoad struct {
 	// unloaded. lfDone is protected by pf.mu.
 	lfDone bool
 
+	// done is true if completion of loading from pf has been reported to
+	// loads. done is protected by pf.mu.
+	done bool
+
+	// sweep holds the extents of the MemoryFile in this pages file, merged
+	// and sorted by pages file offset. The async page loader reads pages
+	// that are not awaited in this order, so that the pages file is read
+	// sequentially. sweep is set once, by MemoryFile.LoadFrom() after it has
+	// inserted every extent into unloaded; it is protected by pf.mu.
+	sweep []aplExtent
+
 	// asyncMemoryFileLoadEntry links into pf.amfls. asyncMemoryFileLoadEntry
 	// is protected by pf.amflsMu.
 	asyncMemoryFileLoadEntry
@@ -1426,9 +1481,204 @@ type asyncMemoryFileLoad struct {
 	// Padding before state exclusive to the async page loader goroutine:
 	_ [hostarch.CacheLineSize]byte
 
-	// minUnstarted is the lowest offset that may map to a segment in unloaded
-	// for which aplUnloadedInfo.started == false.
-	minUnstarted uint64
+	// sweepIndex is the index in sweep of the extent that the loader is
+	// sweeping, and sweepNext is the MemoryFile offset in that extent from
+	// which it continues.
+	sweepIndex int
+	sweepNext  uint64
+}
+
+// aplExtent is a range of MemoryFile offsets and the pages file offset of its
+// data.
+type aplExtent struct {
+	memmap.FileRange
+	off uint64
+}
+
+// startAsyncLoads registers f for async page loading from pagesFiles, one per
+// layer, of the pages of the layers that hold some of f's pages per pb.
+func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, pagesFiles []*AsyncPagesFileLoad, fileSize uint64, doneCallback func(error), timeline *timing.Timeline) (*asyncMemoryFileLoads, error) {
+	loads := &asyncMemoryFileLoads{
+		f:            f,
+		timeline:     timeline,
+		amfls:        make([]*asyncMemoryFileLoad, len(pagesFiles)),
+		doneCallback: doneCallback,
+	}
+	for _, e := range pb.Extents {
+		if loads.amfls[e.Layer] == nil {
+			loads.amfls[e.Layer] = &asyncMemoryFileLoad{
+				f:     f,
+				pf:    pagesFiles[e.Layer],
+				loads: loads,
+			}
+			loads.remaining++
+		}
+	}
+	// Every layer's loader may report completion as soon as its
+	// asyncMemoryFileLoad is registered, so loads.remaining must count all of
+	// them first.
+	for i, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		if amfl.pf.ar.NeedRegisterDestinationFD() {
+			var err error
+			amfl.df, err = amfl.pf.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
+			if err != nil {
+				loads.unregister(i)
+				return nil, fmt.Errorf("failed to register MemoryFile with the pages file of layer %d: %w", i, err)
+			}
+		}
+		amfl.pf.amflsMu.Lock()
+		if err := amfl.pf.err(); err != nil {
+			amfl.pf.amflsMu.Unlock()
+			loads.unregister(i)
+			return nil, err
+		}
+		amfl.pf.amfls.PushBack(amfl)
+		amfl.pf.amflsMu.Unlock()
+	}
+	f.asyncPageLoad.Store(loads)
+	return loads, nil
+}
+
+// unregister undoes startAsyncLoads after a failure to register the
+// asyncMemoryFileLoad of layer n, before any page was recorded as unloaded:
+// the loaders of the layers registered before it must neither load nor report
+// anything.
+func (loads *asyncMemoryFileLoads) unregister(n int) {
+	for _, amfl := range loads.amfls[:n] {
+		if amfl == nil {
+			continue
+		}
+		amfl.pf.amflsMu.Lock()
+		amfl.pf.mu.Lock()
+		amfl.done = true
+		amfl.pf.amfls.Remove(amfl)
+		amfl.pf.mu.Unlock()
+		amfl.pf.amflsMu.Unlock()
+	}
+	loads.timeline.End()
+}
+
+// layers returns the number of layers that loads loads from.
+func (loads *asyncMemoryFileLoads) layers() int {
+	n := 0
+	for _, amfl := range loads.amfls {
+		if amfl != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// lfDone is called when MemoryFile.LoadFrom() has finished recording what to
+// load.
+func (loads *asyncMemoryFileLoads) lfDone() {
+	if loads.layers() == 0 {
+		// There is nothing to load.
+		loads.f.asyncPageLoad.Store(nil)
+		loads.timeline.End()
+		if loads.doneCallback != nil {
+			loads.doneCallback(nil)
+		}
+		return
+	}
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		pf := amfl.pf
+		pf.amflsMu.Lock()
+		pf.mu.Lock()
+		amfl.lfDone = true
+		if amfl.unloaded.IsEmpty() {
+			// The async page loader goroutine does this when it transitions
+			// amfl.unloaded from non-empty to empty with amfl.lfDone == true,
+			// but since amfl.unloaded is already empty (async page loading
+			// from this pages file finished before we got here), we have to
+			// do so instead.
+			amfl.completeLocked()
+		}
+		pf.mu.Unlock()
+		pf.amflsMu.Unlock()
+	}
+}
+
+// completeLocked is called when all pages of amfl have been loaded.
+//
+// Preconditions:
+//   - amfl.pf.amflsMu and amfl.pf.mu must be locked.
+//   - amfl.lfDone == true.
+//   - amfl.unloaded.IsEmpty() == true.
+func (amfl *asyncMemoryFileLoad) completeLocked() {
+	amfl.minUnloaded.Store(math.MaxUint64)
+	amfl.pf.amfls.Remove(amfl)
+	amfl.doneLocked(nil)
+}
+
+// doneLocked reports that loading from amfl's pages file has completed,
+// successfully if err is nil. Only its first call has an effect.
+//
+// Preconditions: amfl.pf.mu must be locked.
+func (amfl *asyncMemoryFileLoad) doneLocked(err error) {
+	if amfl.done {
+		return
+	}
+	amfl.done = true
+	amfl.loads.amflDone(err)
+}
+
+// amflDone is called when loading from one of loads.amfls has completed,
+// successfully if err is nil.
+func (loads *asyncMemoryFileLoads) amflDone(err error) {
+	loads.mu.Lock()
+	if loads.err == nil {
+		loads.err = err
+	}
+	loads.remaining--
+	done := loads.remaining == 0
+	err = loads.err
+	loads.mu.Unlock()
+	if !done {
+		return
+	}
+	if err == nil {
+		// Leave f.asyncPageLoad set after a failure, so that loads.awaitLoad()
+		// reports the failure for pages that will never be loaded.
+		loads.f.asyncPageLoad.Store(nil)
+	}
+	loads.timeline.End()
+	if loads.doneCallback != nil {
+		loads.doneCallback(err)
+	}
+}
+
+// startSweep sets amfl.sweep to the extents in amfl's pages file among
+// extents.
+func (amfl *asyncMemoryFileLoad) startSweep(extents []*pgallocpb.ExtentProto) {
+	var sweep []aplExtent
+	for _, e := range extents {
+		if amfl.loads.amfls[e.Layer] != amfl {
+			continue
+		}
+		sweep = append(sweep, aplExtent{memmap.FileRange{Start: e.Start, End: e.End}, e.Offset})
+	}
+	sort.Slice(sweep, func(i, j int) bool { return sweep[i].off < sweep[j].off })
+	// Merge extents that are contiguous in both the MemoryFile and the pages
+	// file, as amfl.unloaded merges their segments.
+	merged := sweep[:0]
+	for _, e := range sweep {
+		if n := len(merged); n != 0 && merged[n-1].End == e.Start && merged[n-1].off+merged[n-1].Length() == e.off {
+			merged[n-1].End = e.End
+			continue
+		}
+		merged = append(merged, e)
+	}
+	amfl.pf.mu.Lock()
+	amfl.sweep = merged
+	amfl.pf.mu.Unlock()
+	amfl.pf.lfStatus.Notify(aplLFPending)
 }
 
 // aplUnloadedInfo is the value type of asyncMemoryFileLoad.unloaded.
@@ -1547,8 +1797,8 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 // AwaitLoadAll blocks until async page loading has completed. If async page
 // loading is not in progress, AwaitLoadAll returns immediately.
 func (f *MemoryFile) AwaitLoadAll() error {
-	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		return amfl.awaitLoad(memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))})
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		return loads.awaitLoad(memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))})
 	}
 	return nil
 }
@@ -1557,12 +1807,49 @@ func (f *MemoryFile) AwaitLoadAll() error {
 //
 // Preconditions: At least one reference must be held on all unloaded pages in
 // fr.
-func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
-	// Lockless fast path:
-	if fr.End <= amfl.minUnloaded.Load() {
-		return nil
+func (loads *asyncMemoryFileLoads) awaitLoad(fr memmap.FileRange) error {
+	// Register a waiter with the loader of every layer that has unloaded
+	// pages in fr, so that all of their reads are prioritized, then wait for
+	// each.
+	var (
+		waitersBuf [4]aplAwait
+		waiters    = waitersBuf[:0]
+		err        error
+	)
+	for _, amfl := range loads.amfls {
+		// Lockless fast path:
+		if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
+			continue
+		}
+		w, werr := amfl.startAwait(fr)
+		if werr != nil && err == nil {
+			err = werr
+		}
+		if w != nil {
+			waiters = append(waiters, aplAwait{amfl, w})
+		}
 	}
+	for _, aw := range waiters {
+		if werr := aw.amfl.finishAwait(aw.w); werr != nil && err == nil {
+			err = werr
+		}
+	}
+	return err
+}
 
+// aplAwait is a waiter registered with the loader of one layer.
+type aplAwait struct {
+	amfl *asyncMemoryFileLoad
+	w    *aplWaiter
+}
+
+// startAwait prioritizes loading of the unloaded pages of fr in amfl. If any
+// remain to be loaded, it returns a waiter that must be passed to
+// amfl.finishAwait(). It returns an error if pages of fr will never be loaded.
+//
+// Preconditions: At least one reference must be held on all unloaded pages in
+// fr.
+func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, error) {
 	// fr might not be page-aligned; everything else involved in async page
 	// loading requires page-aligned FileRanges.
 	fr.Start = hostarch.PageRoundDown(fr.Start)
@@ -1570,20 +1857,19 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 
 	apfl := amfl.pf
 	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
 	if err := apfl.err(); err != nil {
 		if amfl.unloaded.IsEmptyRange(fr) {
 			// fr is already loaded.
-			apfl.mu.Unlock()
-			return nil
+			return nil, nil
 		}
 		// A previous error means that fr will never be loaded.
-		apfl.mu.Unlock()
-		return err
+		return nil, err
 	}
 	w := aplWaiterPool.Get().(*aplWaiter)
-	defer aplWaiterPool.Put(w)
 	w.fr = fr
 	w.pending = 0
+	prioritized := false
 	amfl.unloaded.MutateRange(fr, func(ulseg aplUnloadedIterator) bool {
 		ul := ulseg.ValuePtr()
 		ulFR := ulseg.Range()
@@ -1592,6 +1878,7 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			apfl.bytesWaited += ullen
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+				prioritized = true
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1601,31 +1888,41 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		w.pending += ullen
 		return true
 	})
-	pending := w.pending != 0
-	if pending {
-		w.timeStart = gohacks.Nanotime()
-		if apfl.numWaiters == 0 {
-			apfl.timeStartWaiters = w.timeStart
-		}
-		apfl.numWaiters++
-		apfl.totalWaiters++
+	if w.pending == 0 {
+		aplWaiterPool.Put(w)
+		return nil, nil
 	}
-	apfl.mu.Unlock()
-	if pending {
-		if logAwaitedLoads {
-			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
-		}
-		w.wakeup.WaitAndAckAll()
-		if logAwaitedLoads {
-			waitNS := gohacks.Nanotime() - w.timeStart
-			log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), fr, fr.Length())
-		}
+	if prioritized {
+		// The loader may be idle, with no read in flight to complete.
+		apfl.lfStatus.Notify(aplLFPending)
 	}
-	if err := apfl.err(); err != nil {
-		// As above, pages loaded before the failure are usable.
-		apfl.mu.Lock()
+	w.timeStart = gohacks.Nanotime()
+	if apfl.numWaiters == 0 {
+		apfl.timeStartWaiters = w.timeStart
+	}
+	apfl.numWaiters++
+	apfl.totalWaiters++
+	return w, nil
+}
+
+// finishAwait blocks until all pages awaited by w, returned by
+// amfl.startAwait(), have been loaded.
+func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
+	if logAwaitedLoads {
+		log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), w.fr, w.fr.Length())
+	}
+	w.wakeup.WaitAndAckAll()
+	if logAwaitedLoads {
+		waitNS := gohacks.Nanotime() - w.timeStart
+		log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), w.fr, w.fr.Length())
+	}
+	fr := w.fr
+	aplWaiterPool.Put(w)
+	if err := amfl.pf.err(); err != nil {
+		// Pages loaded before the failure are usable.
+		amfl.pf.mu.Lock()
 		loaded := amfl.unloaded.IsEmptyRange(fr)
-		apfl.mu.Unlock()
+		amfl.pf.mu.Unlock()
 		if !loaded {
 			return err
 		}
@@ -1804,10 +2101,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				ul.started = false
 				ul.waiters = nil
 			}
-			if amfl.doneCallback != nil {
-				amfl.doneCallback(apfl.err())
-				amfl.doneCallback = nil
-			}
+			amfl.doneLocked(apfl.err())
 		}
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
@@ -1941,42 +2235,50 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// significantly lower than disk latency, so applications are
 			// likely to be more sensitive to elevated memory latency due to
 			// awaited loads vs. elevated disk latency.
-		amflsLoop:
 			for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
 				amfl.f.mu.Lock()
 				apfl.mu.Lock()
-				ulseg := amfl.unloaded.LowerBoundSegment(amfl.minUnstarted)
-				for ulseg.Ok() {
-					ul := ulseg.ValuePtr()
-					ulFR := ulseg.Range()
-					if ul.started {
-						amfl.minUnstarted = ulFR.End
+				full := false
+				for !full && amfl.sweepIndex < len(amfl.sweep) {
+					e := &amfl.sweep[amfl.sweepIndex]
+					ulseg := amfl.unloaded.LowerBoundSegment(max(e.Start, amfl.sweepNext))
+					for ulseg.Ok() && ulseg.Start() < e.End {
+						ul := ulseg.ValuePtr()
+						ulFR := ulseg.Range()
+						if ul.started {
+							amfl.sweepNext = ulFR.End
+							ulseg = ulseg.NextSegment()
+							continue
+						}
+						// We need to take page references during reading to
+						// prevent pages from becoming waste due to concurrent
+						// dropping of the last reference.
+						n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+						if n == 0 {
+							full = true
+							break
+						}
+						ulFR.End = ulFR.Start + n
+						ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
+						ulseg.ValuePtr().started = true
+						amfl.sweepNext = ulFR.End
+						amfl.f.incRefLocked(ulFR)
+						if !apfl.canEnqueue() {
+							full = true
+							break
+						}
 						ulseg = ulseg.NextSegment()
-						continue
 					}
-					// We need to take page references during reading to
-					// prevent pages from becoming waste due to concurrent
-					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
-					if n == 0 {
-						apfl.mu.Unlock()
-						amfl.f.mu.Unlock()
-						break amflsLoop
+					if !full {
+						amfl.sweepIndex++
+						amfl.sweepNext = 0
 					}
-					ulFR.End = ulFR.Start + n
-					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
-					ulseg.ValuePtr().started = true
-					amfl.minUnstarted = ulFR.End
-					amfl.f.incRefLocked(ulFR)
-					if !apfl.canEnqueue() {
-						apfl.mu.Unlock()
-						amfl.f.mu.Unlock()
-						break amflsLoop
-					}
-					ulseg = ulseg.NextSegment()
 				}
 				apfl.mu.Unlock()
 				amfl.f.mu.Unlock()
+				if full {
+					break
+				}
 			}
 			apfl.amflsMu.Unlock()
 		}
@@ -2090,14 +2392,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// accurately if insertions into amfl.unloaded are complete.
 			if amfl.lfDone {
 				if amfl.unloaded.IsEmpty() {
-					amfl.minUnloaded.Store(math.MaxUint64)
-					apfl.amfls.Remove(amfl)
-					amfl.f.asyncPageLoad.Store(nil)
-					amfl.timeline.End()
-					if amfl.doneCallback != nil {
-						amfl.doneCallback(nil)
-						amfl.doneCallback = nil
-					}
+					amfl.completeLocked()
 				} else {
 					amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
 				}
@@ -2113,6 +2408,19 @@ func (apfl *AsyncPagesFileLoad) main() {
 			return
 		}
 		dropDelayedDecRefs()
+	}
+}
+
+// cancelWasteLoad cancels loading of pages in fr.
+//
+// Preconditions:
+// - All pages in fr must be becoming waste pages.
+// - fr must be page-aligned.
+func (loads *asyncMemoryFileLoads) cancelWasteLoad(fr memmap.FileRange) {
+	for _, amfl := range loads.amfls {
+		if amfl != nil {
+			amfl.cancelWasteLoad(fr)
+		}
 	}
 }
 

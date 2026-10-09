@@ -201,7 +201,7 @@ type MemoryFile struct {
 
 	// If asyncPageLoad is non-nil, it tracks the state of in-progress or
 	// failed async page loading.
-	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
+	asyncPageLoad atomic.Pointer[asyncMemoryFileLoads]
 
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
@@ -1280,8 +1280,8 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 					return true
 				})
 				// Cancel any pending async load on waste pages.
-				if apl := f.asyncPageLoad.Load(); apl != nil {
-					apl.cancelWasteLoad(wasteFR)
+				if loads := f.asyncPageLoad.Load(); loads != nil {
+					loads.cancelWasteLoad(wasteFR)
 				}
 			}
 			return true
@@ -1482,8 +1482,8 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		return safemem.BlockSeq{}, linuxerr.EACCES
 	}
 
-	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		if err := amfl.awaitLoad(fr); err != nil {
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		if err := loads.awaitLoad(fr); err != nil {
 			return safemem.BlockSeq{}, err
 		}
 	}
@@ -1846,8 +1846,8 @@ func (f *MemoryFile) File() *os.File {
 
 // DataFD implements memmap.File.DataFD.
 func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
-	if amfl := f.asyncPageLoad.Load(); amfl != nil {
-		if err := amfl.awaitLoad(fr); err != nil {
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		if err := loads.awaitLoad(fr); err != nil {
 			return -1, err
 		}
 	}

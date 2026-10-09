@@ -36,6 +36,7 @@ import (
 	fspb "gvisor.dev/gvisor/pkg/sentry/fscheckpoint/fscheckpoint_proto_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
@@ -267,6 +268,7 @@ type fsRestore struct {
 	// immutable after wg.Wait()
 	manifestErr error
 	apfl        *pgalloc.AsyncPagesFileLoad
+	image       *pgallocpb.ImageProto
 	mfs         map[checkpoint.ResourceID]*fscheckpoint.MemoryFile
 	tmpfs       map[checkpoint.ResourceID]*fscheckpoint.Tmpfs
 
@@ -479,6 +481,11 @@ func startFSRestore(opts *fsRestoreOpts) (*fsRestore, error) {
 				return fmt.Errorf("failed to start async page loading: %w", err)
 			}
 			fsr.apfl = apfl
+			// The pages of the filesystem checkpoint's MemoryFiles are all in
+			// its pages file, and are not hashed.
+			fsr.image = &pgallocpb.ImageProto{
+				Layers: []*pgallocpb.LayerProto{{PagesSize: manifest.PagesSize}},
+			}
 			for i := range manifest.MemoryFiles {
 				mmf := &manifest.MemoryFiles[i]
 				fsr.mfs[mmf.ResourceID] = mmf
@@ -551,14 +558,14 @@ func findByResourceID[T any](m map[checkpoint.ResourceID]T, id checkpoint.Resour
 	return zero, false, nil
 }
 
-func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (io.Reader, uint64, func(error), error) {
+func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (io.Reader, *pgalloc.LoadOpts, error) {
 	if fsr == nil {
-		return nil, 0, func(error) {}, nil
+		return nil, nil, nil
 	}
 
 	fsr.wg.Wait()
 	if fsr.manifestErr != nil {
-		return nil, 0, nil, fsr.manifestErr
+		return nil, nil, fsr.manifestErr
 	}
 	mmf, ok, err := findByResourceID(fsr.mfs, id, func(m *fscheckpoint.MemoryFile) checkpoint.ResourceID {
 		return m.ResourceID
@@ -567,10 +574,10 @@ func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (
 		fsr.waitMu.Lock()
 		defer fsr.waitMu.Unlock()
 		c := fsr.ensureContainer(cid)
-		return nil, 0, nil, c.setError(err)
+		return nil, nil, c.setError(err)
 	}
 	if !ok {
-		return nil, 0, func(error) {}, nil
+		return nil, nil, nil
 	}
 	pagesMetadata, err := fsr.getPagesMetadata()
 
@@ -578,16 +585,13 @@ func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (
 	defer fsr.waitMu.Unlock()
 	c := fsr.ensureContainer(cid)
 	if err != nil {
-		return nil, 0, nil, c.setError(fmt.Errorf("failed to read pages metadata: %w", err))
+		return nil, nil, c.setError(fmt.Errorf("failed to read pages metadata: %w", err))
 	}
 	if mmf.PagesMetadataStart > mmf.PagesMetadataEnd || mmf.PagesMetadataEnd > uint64(len(pagesMetadata)) {
-		return nil, 0, nil, c.setError(fmt.Errorf("MemoryFile %q has invalid pages metadata range [%d, %d) for file size %d", mmf.ResourceID, mmf.PagesMetadataStart, mmf.PagesMetadataEnd, len(pagesMetadata)))
-	}
-	if mmf.PagesStart%hostarch.PageSize != 0 {
-		return nil, 0, nil, c.setError(fmt.Errorf("MemoryFile %q pages offset %d is not page-aligned (page size %d)", mmf.ResourceID, mmf.PagesStart, hostarch.PageSize))
+		return nil, nil, c.setError(fmt.Errorf("MemoryFile %q has invalid pages metadata range [%d, %d) for file size %d", mmf.ResourceID, mmf.PagesMetadataStart, mmf.PagesMetadataEnd, len(pagesMetadata)))
 	}
 	c.asyncLoads++
-	return bytes.NewReader(pagesMetadata[mmf.PagesMetadataStart:mmf.PagesMetadataEnd]), mmf.PagesStart, func(err error) {
+	onLoadEnd := func(err error) {
 		fsr.waitMu.Lock()
 		defer fsr.waitMu.Unlock()
 		c.asyncLoads--
@@ -600,6 +604,11 @@ func (fsr *fsRestore) memoryFileLoadArgs(id checkpoint.ResourceID, cid string) (
 		case c.asyncLoads == 0:
 			c.cond.Broadcast()
 		}
+	}
+	return bytes.NewReader(pagesMetadata[mmf.PagesMetadataStart:mmf.PagesMetadataEnd]), &pgalloc.LoadOpts{
+		Image:        fsr.image,
+		PagesFiles:   []*pgalloc.AsyncPagesFileLoad{fsr.apfl},
+		DoneCallback: onLoadEnd,
 	}, nil
 }
 

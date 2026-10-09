@@ -32,6 +32,8 @@ import (
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -284,27 +286,32 @@ func checkInvariants(t *testing.T, f *MemoryFile) {
 	})
 }
 
-// testImage is a saved MemoryFile image: the pages metadata and the pages
-// file, as written to pages_meta.img and pages.img.
+// testImage is a saved image: its pages metadata file and pages file, as
+// written to pages_meta.img and pages.img, and the pages files of its layers.
 type testImage struct {
 	meta  []byte
 	pages []byte
+	img   *checkpointimage.Image
+	// layers holds the pages file of each layer, layers[0] being pages.
+	layers [][]byte
 }
 
 // saveImage saves the MemoryFiles fs, in order, to a new image, as
-// kernel.Kernel.saveMemoryFiles saves the application MemoryFile and private
-// MemoryFiles to one pages file. opts.PagesFile is set by saveImage.
+// kernel.Kernel.saveMemoryFiles saves the application MemoryFile (fs[0]) and
+// private MemoryFiles to one pages file. opts.PagesFile is set by saveImage.
 func saveImage(t *testing.T, opts SaveOpts, fs ...*MemoryFile) *testImage {
 	t.Helper()
 	var meta, pages bytes.Buffer
-	if err := saveImageTo(&meta, stateio.NewIOWriter(&pages, 256<<10, 64, 4), opts, fs...); err != nil {
+	img, err := saveImageTo(&meta, stateio.NewIOWriter(&pages, 256<<10, 64, 4), opts, fs...)
+	if err != nil {
 		t.Fatalf("saving image: %v", err)
 	}
-	return &testImage{meta: meta.Bytes(), pages: pages.Bytes()}
+	return &testImage{meta: meta.Bytes(), pages: pages.Bytes(), img: img, layers: [][]byte{pages.Bytes()}}
 }
 
-// saveImageTo saves fs to meta and pages, returning the first error.
-func saveImageTo(meta io.Writer, pages stateio.AsyncWriter, opts SaveOpts, fs ...*MemoryFile) error {
+// saveImageTo saves fs to meta and pages as an image without layers,
+// returning the first error.
+func saveImageTo(meta io.Writer, pages stateio.AsyncWriter, opts SaveOpts, fs ...*MemoryFile) (*checkpointimage.Image, error) {
 	var (
 		wg      sync.WaitGroup
 		pageErr error
@@ -315,21 +322,34 @@ func saveImageTo(meta io.Writer, pages stateio.AsyncWriter, opts SaveOpts, fs ..
 		wg.Done()
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	opts.PagesFile = apfs
+	opts.PageHashes = true
+	ip := &pgallocpb.ImageProto{
+		Layers:   []*pgallocpb.LayerProto{{}},
+		PageHash: checkpointimage.PageHashXXH64,
+	}
+	// fs[1:] are private MemoryFiles; LoadFrom ignores their owners.
+	for i := range fs[1:] {
+		ip.PrivateMemoryFiles = append(ip.PrivateMemoryFiles, &pgallocpb.ResourceIDProto{Path: fmt.Sprintf("/private/%d", i)})
+	}
+	w := checkpointimage.NewWriter(meta, ip)
 	var saveErr error
 	for _, f := range fs {
-		if saveErr = f.SaveTo(context.Background(), meta, &opts); saveErr != nil {
+		if saveErr = f.SaveTo(context.Background(), w, &opts); saveErr != nil {
 			break
 		}
 	}
 	apfs.MemoryFilesDone()
 	wg.Wait()
 	if saveErr != nil {
-		return saveErr
+		return nil, saveErr
 	}
-	return pageErr
+	if pageErr != nil {
+		return nil, pageErr
+	}
+	return w.Finish(apfs.PagesFileOffset())
 }
 
 // testLoad is an image being loaded into MemoryFiles with async page
@@ -346,8 +366,8 @@ type testLoad struct {
 	mfErrs chan error
 }
 
-// startLoad loads img into fs, in the order in which they were saved, reading
-// pages through ar. It returns once every MemoryFile's metadata is loaded;
+// startLoad loads img, an image without layers, into fs, in the order in
+// which they were saved, reading pages through ar. It returns once every MemoryFile's metadata is loaded;
 // pages load asynchronously. The test must release fs's pages before it ends.
 func startLoad(t *testing.T, img *testImage, ar stateio.AsyncReader, fs ...*MemoryFile) *testLoad {
 	t.Helper()
@@ -374,8 +394,8 @@ func startLoad(t *testing.T, img *testImage, ar stateio.AsyncReader, fs ...*Memo
 			t.Errorf("timed out after %v waiting for async page loading to stop", testWaitTimeout)
 		}
 	})
-	r := bytes.NewReader(img.meta)
-	opts := LoadOpts{PagesFile: apfl}
+	r := img.img.MemoryFileRecords()
+	opts := LoadOpts{Image: img.img.Proto, PagesFiles: []*AsyncPagesFileLoad{apfl}}
 	for _, f := range fs {
 		opts.DoneCallback = func(err error) { l.mfErrs <- err }
 		if err := f.LoadFrom(context.Background(), r, &opts); err != nil {
@@ -385,9 +405,6 @@ func startLoad(t *testing.T, img *testImage, ar stateio.AsyncReader, fs ...*Memo
 	apfl.MemoryFilesDone()
 	if r.Len() != 0 {
 		t.Fatalf("LoadFrom left %d bytes of pages metadata unread", r.Len())
-	}
-	if opts.PagesFileOffset != uint64(len(img.pages)) {
-		t.Fatalf("LoadFrom accounted for %d bytes of the pages file, which has %d", opts.PagesFileOffset, len(img.pages))
 	}
 	return l
 }
