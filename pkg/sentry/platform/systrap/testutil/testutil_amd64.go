@@ -24,3 +24,12 @@ var UserCode = []byte{
 	0x0f, 0x05, // syscall
 	0xeb, 0xf5, // jmp back to movq
 }
+
+// StoreCode is the user program: for (;;) { p = getpid(); *p = p; }. A test
+// emulating the getpid syscall makes it store to the address it returns.
+var StoreCode = []byte{
+	0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // movq $SYS_getpid, %rax
+	0x0f, 0x05, // syscall
+	0x48, 0x89, 0x00, // movq %rax, (%rax)
+	0xeb, 0xf2, // jmp back to movq $SYS_getpid
+}
