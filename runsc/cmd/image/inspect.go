@@ -207,7 +207,7 @@ func (info *imageInfo) print(w io.Writer) {
 	}
 	fmt.Fprintf(tw, "Image:\t%s\n", info.Digest)
 	fmt.Fprintf(tw, "Format:\t%d.%d\n", info.Format.Major, info.Format.Minor)
-	for _, k := range []string{boot.VersionKey, checkpointimage.FormatMetadataKey, boot.PlatformKey, boot.CPUFeaturesKey, "timestamp"} {
+	for _, k := range []string{boot.VersionKey, checkpointimage.FormatMetadataKey, checkpointimage.ParentMetadataKey, boot.PlatformKey, boot.CPUFeaturesKey, "timestamp"} {
 		if v, ok := info.State.Metadata[k]; ok {
 			fmt.Fprintf(tw, "%s:\t%s\n", k, v)
 		}
