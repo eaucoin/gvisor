@@ -1,0 +1,285 @@
+# Tier 1 of the fork's CI: the series checks, gVisor's lint and license header
+# checks, the documentation's relative links, a Bazel build of the release binaries with the tests of every
+# package the changes since the base affect (nogo included), and the go
+# branch build. It runs on every push to main, and on a series branch when
+# fork-integrate.yml (or anyone) dispatches it; the result is posted as the
+# "fork-ci" commit status of the commit tested.
+name: Fork CI
+
+"on":
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to test (main or a series/ branch)
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  REF: ${{ inputs.ref || github.ref_name }}
+  # Bazel's disk cache, inside the directory tools/bazel.mk shares with its
+  # build container.
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+  # Test results stay out of the disk cache, so that each comes from a run.
+  TEST_OPTIONS: --modify_execution_info=TestRunner=+no-cache
+
+jobs:
+  resolve:
+    name: Resolve the commit to test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      base: ${{ steps.resolve.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sha="$(git rev-parse --verify "refs/remotes/origin/${REF}^{commit}")"
+          echo "sha=${sha}" >>"${GITHUB_OUTPUT}"
+          echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${sha}" -f state=pending \
+            -f context=fork-ci -f description="Tier 1 running" -f target_url="${RUN_URL}" >/dev/null
+          echo "Testing ${REF} at ${sha}" >>"${GITHUB_STEP_SUMMARY}"
+
+  checks:
+    name: Series, lint and license headers
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Series
+        working-directory: fork
+        run: |
+          # main is made of series that each passed this check alone, at the
+          # tips fork-integrate built it from; those tips may have moved since.
+          if [[ "${REF}" != main ]]; then
+            tools/fork/series.sh check "${REF}"
+          fi
+      - name: License headers
+        working-directory: src
+        run: tools/check_license_headers.sh "${{ needs.resolve.outputs.base }}"
+      - name: Documentation links
+        working-directory: src
+        run: ../fork/tools/fork/check_links.sh "${{ needs.resolve.outputs.base }}"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: Lint
+        working-directory: src
+        run: make lint
+
+  bazel:
+    name: Bazel build and affected tests
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
+        # themselves in one, as on upstream's test hosts.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ needs.resolve.outputs.base }}-${{ needs.resolve.outputs.sha }}
+          restore-keys: bazel-${{ needs.resolve.outputs.base }}-
+      - name: Build the release binaries
+        working-directory: src
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          ls -lR "${RUNNER_TEMP}/release"
+          "${RUNNER_TEMP}/release/runsc" --version
+      - name: Smoke test
+        run: fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
+      - name: Build runsc/container's tests
+        # Tier 2 runs them; building them here catches a change elsewhere that
+        # breaks them, such as a new argument to a function they call.
+        working-directory: src
+        run: make build TARGETS=//runsc/container:container_test
+      - name: Affected tests
+        working-directory: src
+        run: |
+          ../fork/tools/fork/affected_tests.sh "${{ needs.resolve.outputs.base }}" >/tmp/affected.query
+          if [[ ! -s /tmp/affected.query ]]; then
+            echo "No Bazel package changed." | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # Bazel in the build container, as upstream's Makefile runs it, given
+          # the query as a file (in /tmp, shared with the container), so that
+          # no shell expands it. The first make may print the container's ID.
+          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
+          "${bazel[@]}" query --query_file=/tmp/affected.query | sort >"${RUNNER_TEMP}/tests"
+          if [[ ! -s "${RUNNER_TEMP}/tests" ]]; then
+            echo "::error::Packages changed, but the query found no test: $(cat /tmp/affected.query)"
+            exit 1
+          fi
+          {
+            echo "### $(wc -l <"${RUNNER_TEMP}/tests") affected tests"
+            sed 's/^/- /' "${RUNNER_TEMP}/tests"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          make test OPTIONS="${TEST_OPTIONS} --test_tag_filters=-requires-kvm,-manual --build_tag_filters=-network_plugins --test_env=CGROUPV2=true" \
+            TARGETS="$(tr '\n' ' ' <"${RUNNER_TEMP}/tests")"
+      - name: Test logs
+        if: failure()
+        working-directory: src
+        run: |
+          # The logs and outputs (runsc's own logs among them) of the tests
+          # that failed, kept as an artifact.
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always() && env.REF == 'main'
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ needs.resolve.outputs.base }}-${{ needs.resolve.outputs.sha }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ needs.resolve.outputs.sha }}
+          path: ${{ runner.temp }}/release
+          retention-days: 7
+
+  go:
+    name: Go branch build
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          # Complete: go_branch.sh clones it, which a partial clone cannot be.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ needs.resolve.outputs.base }}-${{ needs.resolve.outputs.sha }}
+          restore-keys: bazel-${{ needs.resolve.outputs.base }}-
+      - name: Generate the go branch
+        run: |
+          git config --global user.name "gVisor bot"
+          git config --global user.email "gvisor-bot@google.com"
+          tools/go_branch.sh
+          git checkout go
+          git clean -xffd
+      - name: go build ./...
+        run: go build ./...
+      - name: Build runsc and its Sentry twice, and compare
+        run: |
+          # The go branch keeps the Sentry's library but not its main package.
+          mkdir -p fork-cmd/gvisor_sentry
+          git show "${{ needs.resolve.outputs.sha }}:runsc/cmd/sentry/sentry_main.go" \
+            >fork-cmd/gvisor_sentry/main.go
+          version="$(git describe --always --tags --abbrev=12 "${{ needs.resolve.outputs.sha }}")"
+          for n in 1 2; do
+            go clean -cache
+            go build -trimpath -o "${RUNNER_TEMP}/build-${n}/" \
+              -ldflags "-s -w -X gvisor.dev/gvisor/runsc/version.version=${version}" \
+              ./runsc ./fork-cmd/gvisor_sentry
+            (cd "${RUNNER_TEMP}/build-${n}" && sha256sum runsc gvisor_sentry)
+          done
+          diff <(cd "${RUNNER_TEMP}/build-1" && sha256sum runsc gvisor_sentry) \
+            <(cd "${RUNNER_TEMP}/build-2" && sha256sum runsc gvisor_sentry)
+          echo "go branch build of ${version}: reproducible" >>"${GITHUB_STEP_SUMMARY}"
+
+  report:
+    name: Report
+    needs: [resolve, checks, bazel, go]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          RESULTS: ${{ needs.checks.result }} ${{ needs.bazel.result }} ${{ needs.go.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "${RESULTS}" in
+            "success success success") state=success description="Tier 1 passed" ;;
+            *cancelled*)
+              # A newer run for the commit (fork-integrate's or a dispatch's,
+              # which cancelled this one) owns the status: an "error" over its
+              # "pending" would have fork-integrate start yet another, which
+              # would cancel that newer run in turn.
+              owner="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/statuses" \
+                --jq '[.[] | select(.context == "fork-ci")][0].target_url // ""')"
+              if [[ "${owner}" != "${RUN_URL}" ]]; then
+                exit 0
+              fi
+              state=error description="Tier 1 cancelled"
+              ;;
+            *) state=failure description="Tier 1 failed (checks, bazel, go: ${RESULTS})" ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" -f state="${state}" \
+            -f context=fork-ci -f description="${description}" -f target_url="${RUN_URL}" >/dev/null
