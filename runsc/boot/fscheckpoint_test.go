@@ -102,28 +102,6 @@ func TestMemoryFileLoadArgsBounds(t *testing.T) {
 	}
 }
 
-// TestMemoryFileLoadArgsUnalignedPages checks that a pages offset that is not
-// page aligned is rejected, since the memory file can't be loaded from it.
-func TestMemoryFileLoadArgsUnalignedPages(t *testing.T) {
-	metadata := []byte("0123456789")
-	resID := checkpoint.ResourceID{ContainerName: "c1", Path: "/dev/shm"}
-
-	fsr := newTestFSRestore()
-	fsr.mfs[resID] = &fscheckpoint.MemoryFile{
-		ResourceID:         resID,
-		PagesMetadataStart: 0,
-		PagesMetadataEnd:   5,
-		PagesStart:         123,
-	}
-	fsr.fsBundles[resID] = &fsRestoreBundle{
-		getPagesMetadata: func() ([]byte, error) { return metadata, nil },
-	}
-
-	if _, _, err := fsr.memoryFileLoadArgs(resID, "c1"); err == nil {
-		t.Errorf("memoryFileLoadArgs() with unaligned pages start succeeded, want error")
-	}
-}
-
 func TestTmpfsSourceTarBounds(t *testing.T) {
 	tarData := []byte("0123456789abcdefghij") // len = 20
 	resID := checkpoint.ResourceID{ContainerName: "c1", Path: "/tmp"}

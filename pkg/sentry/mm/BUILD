@@ -196,6 +196,7 @@ go_test(
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/platform",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
