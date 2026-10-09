@@ -398,6 +398,7 @@ func (r *restorer) restore(l *Loader) error {
 	l.k = &kernel.Kernel{
 		Platform: p,
 	}
+	configureDirtyTracking(l.k, l.root.conf)
 	l.k.SetMemoryFile(r.mainMF)
 
 	if l.root.conf.ProfileEnable {
