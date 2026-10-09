@@ -2086,6 +2086,11 @@ type CheckpointOpts struct {
 	// StateEngine, when non-nil, overrides the sandbox's boot-time state
 	// serialization engine for this checkpoint.
 	StateEngine *config.StateEnginePolicy
+
+	// If ParentImagePath is not empty, the checkpoint is incremental, of the
+	// image in that directory, which must be the image the sandbox was last
+	// saved to or restored from.
+	ParentImagePath string
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2126,6 +2131,13 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			useGraph := cliEngine == config.StateEngineGraph
 			opt.GraphEngine = &useGraph
 		}
+	}
+	if opts.ParentImagePath != "" {
+		d, err := checkpointimage.FileDigest(filepath.Join(opts.ParentImagePath, checkpointfiles.PagesMetadataFileName))
+		if err != nil {
+			return fmt.Errorf("parent image: %w", err)
+		}
+		opt.ParentImageDigest = d.String()
 	}
 	defer opt.FilePayload.Close()
 	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
