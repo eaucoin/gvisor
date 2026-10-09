@@ -49,6 +49,7 @@ type Checkpoint struct {
 	precopy                   string
 	precopyBudget             time.Duration
 	precopyMaxRounds          int
+	precopyThrottle           string
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -88,6 +89,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.precopy, "precopy", "off", "write memory while the container runs, in rounds over the memory written meanwhile, before pausing it to write the rest: off, on, or auto (on unless the write speed last measured, by a checkpoint or a round of this container, says that the pause would write memory within --precopy-budget anyway; the first round measures it). Requires --dirty-tracking and an uncompressed image; --direct is recommended.")
 	f.DurationVar(&c.precopyBudget, "precopy-budget", 100*time.Millisecond, "with --precopy, stop the rounds when the memory written during the last one would take at most this long to write in the pause.")
 	f.IntVar(&c.precopyMaxRounds, "precopy-max-rounds", 8, "with --precopy, the maximum number of rounds. Rounds also stop when one does not halve the memory left to write.")
+	f.StringVar(&c.precopyThrottle, "precopy-throttle", "off", "with --precopy, when a round does not halve the memory left to write: off (default) stops the rounds; on limits instead, until the checkpoint completes, the rate at which each process dirties memory to a quarter of the measured write speed, delaying only the processes that write faster, and goes on (requires --dirty-tracking=wp).")
 	// Must match the default prefix applied by sandbox.Sandbox.Checkpoint.
 	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
 	f.Var(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", `[<prefix>=][<container>:]<path> target to include in the filesystem checkpoint (can be repeated). <prefix> defaults to "fs". The files are written to --image-path as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. For capturing all of tmpfs, the path should be "all-tmpfs".`)
@@ -151,6 +153,13 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		opts.Precopy = c.precopy
 	default:
 		util.Fatalf("invalid --precopy %q: want off, on or auto", c.precopy)
+	}
+	switch c.precopyThrottle {
+	case "off":
+	case "on":
+		opts.PrecopyThrottle = true
+	default:
+		util.Fatalf("invalid --precopy-throttle %q: want off or on", c.precopyThrottle)
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {
