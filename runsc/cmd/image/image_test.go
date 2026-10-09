@@ -232,6 +232,36 @@ func TestInspectText(t *testing.T) {
 	}
 }
 
+// TestInspectParent checks that inspect shows the parent that an incremental
+// checkpoint's state file names.
+func TestInspectParent(t *testing.T) {
+	root, template, _ := testImages(t)
+	deltaDir := filepath.Join(root, "delta")
+	writeStateFile(t, filepath.Join(deltaDir, checkpointfiles.StateFileName), map[string]string{
+		boot.VersionKey:                   version.Version(),
+		checkpointimage.FormatMetadataKey: checkpointimage.FormatVersion(),
+		checkpointimage.ParentMetadataKey: template.Digest.String(),
+	})
+	status, out := run(t, new(inspect), deltaDir)
+	if status != subcommands.ExitSuccess {
+		t.Fatalf("inspect: %v", status)
+	}
+	if want := "parent_id:      " + template.Digest.String() + "\n"; !strings.Contains(out, want) {
+		t.Errorf("inspect printed:\n%s\nwhich lacks %q", out, want)
+	}
+	status, out = run(t, new(inspect), "--json", deltaDir)
+	if status != subcommands.ExitSuccess {
+		t.Fatalf("inspect --json: %v", status)
+	}
+	var info imageInfo
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		t.Fatalf("inspect --json printed %q: %v", out, err)
+	}
+	if got, want := info.State.Metadata[checkpointimage.ParentMetadataKey], template.Digest.String(); got != want {
+		t.Errorf("inspect --json: parent %q, want %q", got, want)
+	}
+}
+
 func TestVerify(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
