@@ -336,11 +336,12 @@ type privateMFsInfo struct {
 // NewAsyncMFLoader creates a new AsyncMFLoader of the MemoryFiles of image,
 // whose layers' pages files are pagesFiles. It takes ownership of pagesFiles.
 // It creates a background goroutine that will load all the MemoryFiles. The
-// background goroutine immediately starts loading the main MemoryFile.
+// background goroutine immediately starts loading the main MemoryFile, with
+// its working set as prefetch decides.
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
 		image:          image,
 		privateMFsChan: make(chan privateMFsInfo, 1),
@@ -348,11 +349,11 @@ func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncRe
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(image, pagesFiles, mainMF, timeline)
+	go mfl.backgroundGoroutine(image, pagesFiles, mainMF, prefetch, timeline)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
+func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline) {
 	defer timeline.End()
 	cu := cleanup.Make(func() {
 		mfl.metadataWg.Done()
@@ -366,6 +367,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, page
 		PagesFiles: make([]*pgalloc.AsyncPagesFileLoad, len(pagesFiles)),
 		Timeline:   timeline,
 		WorkingSet: true,
+		Prefetch:   prefetch,
 	}
 	for i, pagesFile := range pagesFiles {
 		mfl.loadWg.Add(1)
