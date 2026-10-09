@@ -135,6 +135,11 @@ type SaveOpts struct {
 
 	// PrecopyMaxRounds is the maximum number of pre-copy rounds.
 	PrecopyMaxRounds int `json:"precopy_max_rounds"`
+
+	// PrecopyThrottle makes pre-copy throttle the tasks that dirty memory
+	// fast rather than stop when a round does not halve the memory left to
+	// write. See kernel.PrecopyOpts.Throttle.
+	PrecopyThrottle bool `json:"precopy_throttle"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
@@ -180,6 +185,7 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 			Budget:    o.PrecopyBudget,
 			MaxRounds: o.PrecopyMaxRounds,
 			Auto:      o.Precopy == "auto",
+			Throttle:  o.PrecopyThrottle,
 		}
 	default:
 		return nil, fmt.Errorf("invalid pre-copy mode %q", o.Precopy)

@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -29,23 +30,26 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 )
 
-// TestPrecopyStopRule drives precopyStop with experiment 06's model of
+// TestPrecopyStopRule drives precopyNext with experiment 06's model of
 // pre-copy (sim06.py): a writer dirties rate MiB/s of random pages of a
 // 256 MiB image, and a round writes the pages dirtied during the previous one
 // at 100 MiB/s, which leaves N(1 - exp(-rate t / N)) MiB dirty after t
-// seconds. The rounds are the model's, which predicted 06's measurements
-// within one round, and the 200 MiB/s writer stops by the halving rule
-// rather than after 8 rounds that write 7.3 times the image.
+// seconds; throttled, the writer dirties at most precopyThrottleLimit. The
+// rounds are the model's, which predicted 06's measurements within one round.
+// The 200 MiB/s writer stops by the halving rule rather than after 8 rounds
+// that write 7.3 times the image, and, throttled, converges.
 func TestPrecopyStopRule(t *testing.T) {
 	const (
 		imageMiB = 256
 		bwMiB    = 100
 		cost     = time.Second / bwMiB
 	)
+	limitMiB := float64(precopyThrottleLimit(cost)) / (1 << 20)
 	for _, test := range []struct {
 		rateMiB   float64
 		budget    time.Duration
 		maxRounds int
+		throttle  bool
 		rounds    int
 		stop      string
 	}{
@@ -55,19 +59,28 @@ func TestPrecopyStopRule(t *testing.T) {
 		{rateMiB: 50, budget: 100 * time.Millisecond, maxRounds: 8, rounds: 5, stop: "converged"},
 		{rateMiB: 50, budget: 300 * time.Millisecond, maxRounds: 8, rounds: 3, stop: "converged"},
 		{rateMiB: 50, budget: 30 * time.Millisecond, maxRounds: 4, rounds: 4, stop: "round cap reached"},
+		{rateMiB: 50, budget: 100 * time.Millisecond, maxRounds: 8, throttle: true, rounds: 5, stop: "converged"},
 		{rateMiB: 200, budget: 100 * time.Millisecond, maxRounds: 8, rounds: 1, stop: "pending bytes not halved"},
+		{rateMiB: 200, budget: 100 * time.Millisecond, maxRounds: 8, throttle: true, rounds: 4, stop: "converged"},
+		{rateMiB: 400, budget: 100 * time.Millisecond, maxRounds: 8, throttle: true, rounds: 4, stop: "converged"},
 	} {
-		opts := PrecopyOpts{Budget: test.budget, MaxRounds: test.maxRounds}
+		opts := PrecopyOpts{Budget: test.budget, MaxRounds: test.maxRounds, Throttle: test.throttle}
 		pending := float64(imageMiB)
-		rounds, stop := 0, ""
+		rounds, stop, throttling := 0, "", false
 		for round := 0; stop == ""; round++ {
 			written := pending
-			pending = imageMiB * (1 - math.Exp(-test.rateMiB*(written/bwMiB)/imageMiB))
+			rate := test.rateMiB
+			if throttling {
+				rate = min(rate, limitMiB)
+			}
+			pending = imageMiB * (1 - math.Exp(-rate*(written/bwMiB)/imageMiB))
 			rounds++
-			stop = precopyStop(round, uint64(written*(1<<20)), uint64(pending*(1<<20)), cost, opts)
+			var throttle bool
+			stop, throttle = precopyNext(round, uint64(written*(1<<20)), uint64(pending*(1<<20)), cost, opts, throttling)
+			throttling = throttling || throttle
 		}
 		if rounds != test.rounds || stop != test.stop {
-			t.Errorf("%v MiB/s, budget %v, at most %d rounds: %d rounds, stopped by %q; want %d rounds, stopped by %q", test.rateMiB, test.budget, test.maxRounds, rounds, stop, test.rounds, test.stop)
+			t.Errorf("%v MiB/s, budget %v, at most %d rounds, throttle %t: %d rounds, stopped by %q; want %d rounds, stopped by %q", test.rateMiB, test.budget, test.maxRounds, test.throttle, rounds, stop, test.rounds, test.stop)
 		}
 	}
 }
@@ -195,5 +208,57 @@ func TestPrecopyFailureKeepsDirtyPages(t *testing.T) {
 	want[4], want[6] = delta.Digest, delta.Digest
 	if got := pageImages(t, delta, fr); !slices.Equal(got, want) {
 		t.Errorf("images of the delta's pages: got %v, want %v", got, want)
+	}
+}
+
+// TestPrecopyThrottle checks that a round that does not halve the bytes left
+// to write throttles dirtying, if the pre-copy may, instead of stopping the
+// rounds, and that the save lifts the limit.
+func TestPrecopyThrottle(t *testing.T) {
+	for _, throttle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("throttle=%t", throttle), func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			k, src, fr := dirtyTestKernel(t, ctx, false /* verify */)
+			full, err := saveImage(t, ctx, k, nil, false)
+			if err != nil {
+				t.Fatalf("full save: %v", err)
+			}
+			// Each harvest finds 3 pages written since the previous one, as
+			// many as round 0 copies, so round 0 does not halve them.
+			var (
+				next   uint64
+				limits []uint64
+			)
+			src.onHarvest = func() {
+				limits = append(limits, k.dirtyLimit.Load())
+				for range 3 {
+					src.write(t, fr, next%16, byte(next))
+					next++
+				}
+			}
+			if _, _, err := saveImageOpts(t, ctx, k, testSaveOpts{
+				parent:  &full.Digest,
+				precopy: &PrecopyOpts{Budget: 0, MaxRounds: 3, Throttle: throttle},
+			}); err != nil {
+				t.Fatalf("save with pre-copy: %v", err)
+			}
+			src.onHarvest = nil
+			// Harvests: round 0's epoch, after round 0, then, if the rounds
+			// go on, round 1's epoch, after round 1, round 2's epoch and
+			// after round 2; and the save's epoch.
+			wantHarvests := 3
+			if throttle {
+				wantHarvests = 7
+			}
+			if len(limits) != wantHarvests {
+				t.Fatalf("sources harvested %d times, want %d", len(limits), wantHarvests)
+			}
+			if throttle && limits[2] == 0 {
+				t.Errorf("dirtying was not limited in round 1")
+			}
+			if got := k.dirtyLimit.Load(); got != 0 {
+				t.Errorf("dirtying limited to %d bytes/s after the save, want no limit", got)
+			}
+		})
 	}
 }

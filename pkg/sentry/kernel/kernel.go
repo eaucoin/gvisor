@@ -180,6 +180,13 @@ type Kernel struct {
 	// estimates the cost of the next save's page writes.
 	pagesWriteCost time.Duration `state:"nosave"`
 
+	// dirtyLimit is the rate in bytes per second at which each
+	// MemoryManager's tasks may dirty memory, or 0 if there is no limit;
+	// dirtyLimitSession identifies the period during which it applies. See
+	// PrecopyOpts.Throttle.
+	dirtyLimit        atomicbitops.Uint64 `state:"nosave"`
+	dirtyLimitSession atomicbitops.Uint64 `state:"nosave"`
+
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
 	timekeeper           *Timekeeper
