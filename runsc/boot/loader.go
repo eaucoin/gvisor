@@ -765,6 +765,7 @@ func New(args Args) (*Loader, error) {
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
 	}
+	configureDirtyTracking(l.k, args.Conf)
 
 	// Create memory file.
 	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
@@ -1188,6 +1189,25 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
 	}
 	return mf, nil
+}
+
+// configureDirtyTracking configures the dirty tracking of k, a new Kernel, as
+// conf requests.
+func configureDirtyTracking(k *kernel.Kernel, conf *config.Config) {
+	var sources []kernel.DirtySource
+	switch conf.DirtyTracking {
+	case config.DirtyTrackingOff:
+		return
+	case config.DirtyTrackingAuto, config.DirtyTrackingWriteProtect:
+		sources = append(sources, kernel.NewWriteProtectDirtySource(k, conf.DirtyTrackingUnit))
+	default:
+		panic(fmt.Sprintf("unknown dirty tracking mode %v", conf.DirtyTracking))
+	}
+	log.Infof("Dirty tracking: %v, unit %d bytes, verification %v", conf.DirtyTracking, conf.DirtyTrackingUnit, conf.DirtyTrackingVerify)
+	k.SetDirtyTracking(kernel.DirtyTrackingOpts{
+		Sources: sources,
+		Verify:  conf.DirtyTrackingVerify == config.DirtyTrackingVerifyHash,
+	})
 }
 
 // installSeccompFilters installs sandbox seccomp filters with the host.

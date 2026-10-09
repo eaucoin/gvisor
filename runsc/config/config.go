@@ -363,6 +363,18 @@ type Config struct {
 	// AppHugePages enables support for application huge pages.
 	AppHugePages bool `flag:"app-huge-pages"`
 
+	// DirtyTracking selects how the Sentry tracks the application memory
+	// pages written between checkpoints.
+	DirtyTracking DirtyTrackingMode `flag:"dirty-tracking"`
+
+	// DirtyTrackingUnit is the size in bytes of the units of application
+	// memory in which DirtyTrackingWriteProtect records first writes.
+	DirtyTrackingUnit uint64 `flag:"dirty-tracking-unit"`
+
+	// DirtyTrackingVerify tells whether every checkpoint checks that dirty
+	// tracking missed no write, and fails if it did.
+	DirtyTrackingVerify DirtyTrackingVerifyMode `flag:"dirty-tracking-verify"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
@@ -544,6 +556,13 @@ func (c *Config) Validate() error {
 	if c.FSGoferHostUDS && c.HostUDS != HostUDSNone {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("fsgofer-host-uds has been replaced with host-uds flag")
+	}
+	if c.DirtyTracking == DirtyTrackingOff {
+		if c.DirtyTrackingVerify != DirtyTrackingVerifyOff {
+			return fmt.Errorf("dirty-tracking-verify requires dirty tracking")
+		}
+	} else if u := c.DirtyTrackingUnit; u < 4096 || u&(u-1) != 0 {
+		return fmt.Errorf("dirty-tracking-unit must be a power of 2 of at least 4096, got: %d", u)
 	}
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
@@ -743,6 +762,107 @@ func (f FileAccessType) String() string {
 		return "exclusive"
 	}
 	panic(fmt.Sprintf("Invalid file access type %d", f))
+}
+
+// DirtyTrackingMode tells how the Sentry tracks the application memory pages
+// written between checkpoints.
+type DirtyTrackingMode int
+
+const (
+	// DirtyTrackingOff disables dirty tracking.
+	DirtyTrackingOff DirtyTrackingMode = iota
+
+	// DirtyTrackingAuto selects the best dirty source available.
+	DirtyTrackingAuto
+
+	// DirtyTrackingWriteProtect write-protects application memory in the
+	// Sentry, so that the first write to each tracking unit faults into the
+	// Sentry, which records it. It works on every platform and host kernel.
+	DirtyTrackingWriteProtect
+)
+
+func dirtyTrackingModePtr(v DirtyTrackingMode) *DirtyTrackingMode {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (d *DirtyTrackingMode) Set(v string) error {
+	switch v {
+	case "off":
+		*d = DirtyTrackingOff
+	case "auto":
+		*d = DirtyTrackingAuto
+	case "wp":
+		*d = DirtyTrackingWriteProtect
+	default:
+		return fmt.Errorf("invalid dirty tracking mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (d *DirtyTrackingMode) Get() any {
+	return *d
+}
+
+// String implements flag.Value.
+func (d DirtyTrackingMode) String() string {
+	switch d {
+	case DirtyTrackingOff:
+		return "off"
+	case DirtyTrackingAuto:
+		return "auto"
+	case DirtyTrackingWriteProtect:
+		return "wp"
+	}
+	panic(fmt.Sprintf("Invalid dirty tracking mode %d", d))
+}
+
+// DirtyTrackingVerifyMode tells whether checkpoints verify that dirty tracking
+// missed no write.
+type DirtyTrackingVerifyMode int
+
+const (
+	// DirtyTrackingVerifyOff does not verify dirty tracking.
+	DirtyTrackingVerifyOff DirtyTrackingVerifyMode = iota
+
+	// DirtyTrackingVerifyHash makes every checkpoint hash every page and fail
+	// if one changed since the previous checkpoint or restore without being
+	// reported dirty. Restores wait for every page to be loaded.
+	DirtyTrackingVerifyHash
+)
+
+func dirtyTrackingVerifyModePtr(v DirtyTrackingVerifyMode) *DirtyTrackingVerifyMode {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (d *DirtyTrackingVerifyMode) Set(v string) error {
+	switch v {
+	case "off":
+		*d = DirtyTrackingVerifyOff
+	case "hash":
+		*d = DirtyTrackingVerifyHash
+	default:
+		return fmt.Errorf("invalid dirty tracking verification mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (d *DirtyTrackingVerifyMode) Get() any {
+	return *d
+}
+
+// String implements flag.Value.
+func (d DirtyTrackingVerifyMode) String() string {
+	switch d {
+	case DirtyTrackingVerifyOff:
+		return "off"
+	case DirtyTrackingVerifyHash:
+		return "hash"
+	}
+	panic(fmt.Sprintf("Invalid dirty tracking verification mode %d", d))
 }
 
 // NetworkType tells which network stack to use.
