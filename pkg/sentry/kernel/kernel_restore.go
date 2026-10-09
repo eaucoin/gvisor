@@ -308,6 +308,9 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 //   - Wait for various events to occur before proceeding.
 //   - Report errors as they occur.
 type AsyncMFLoader struct {
+	// image is the image being loaded. image is immutable.
+	image *checkpointimage.Image
+
 	// privateMFsChan is used to tell the background goroutine about private
 	// MemoryFiles, once they are known. This channel is written to exactly once.
 	privateMFsChan chan privateMFsInfo
@@ -337,6 +340,7 @@ type privateMFsInfo struct {
 // pages.
 func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
+		image:          image,
 		privateMFsChan: make(chan privateMFsInfo, 1),
 	}
 	mfl.mainMFStartWg.Add(1)
@@ -429,6 +433,11 @@ func (mfl *AsyncMFLoader) setLoadErr(err error) {
 	if mfl.loadErr == nil {
 		mfl.loadErr = err
 	}
+}
+
+// Image returns the image being loaded.
+func (mfl *AsyncMFLoader) Image() *checkpointimage.Image {
+	return mfl.image
 }
 
 // KickoffPrivate notifies the background goroutine of the private MemoryFiles.
