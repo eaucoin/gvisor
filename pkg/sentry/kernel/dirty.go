@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 )
 
 // Dirty tracking.
@@ -77,6 +78,11 @@ type dirtyTracking struct {
 	// mfs is only mutated with the Kernel paused, during saves and
 	// restores.
 	mfs []*pgalloc.MemoryFile
+
+	// last is the image that the Kernel was last saved to or restored from,
+	// if it has a pages file: the parent of the next incremental save. last
+	// is only mutated with the Kernel paused, during saves and restores.
+	last *checkpointimage.Image
 }
 
 var dirtyEscapes = metric.MustCreateNewUint64Metric("/checkpoint/dirty_tracking_escapes", metric.Uint64Metadata{
@@ -93,6 +99,16 @@ func (k *Kernel) SetDirtyTracking(opts DirtyTrackingOpts) {
 // DirtyTrackingEnabled returns true if dirty tracking is enabled.
 func (k *Kernel) DirtyTrackingEnabled() bool {
 	return len(k.dirty.Sources) != 0
+}
+
+// LastImageDigest returns the digest of the image that k was last saved to or
+// restored from, which an incremental save may have as its parent, and true;
+// or false if there is none.
+func (k *Kernel) LastImageDigest() (checkpointimage.Digest, bool) {
+	if k.dirty.last == nil {
+		return checkpointimage.Digest{}, false
+	}
+	return k.dirty.last.Digest, true
 }
 
 // DirtyEpochResult holds the pages dirtied during a dirty tracking epoch.
@@ -202,15 +218,17 @@ func (k *Kernel) beginDirtySave(ctx context.Context) (*DirtyEpochResult, error) 
 }
 
 // endDirtySave ends a save that began with beginDirtySave, which returned e.
-// If the save succeeded (err is nil), saved holds the MemoryFiles it saved:
-// with verification, every page of saved that changed during e's epoch must
-// be in e, else endDirtySave fails the save; then tracking continues with
-// saved. If the save failed, e's pages are returned to the dirty sets, so
-// that the next save writes them. endDirtySave returns err, or the error that
-// fails the save.
+// If the save succeeded (err is nil), saved holds the MemoryFiles it saved and
+// image is the image it wrote, if it has a pages file: with verification,
+// every page of saved that changed during e's epoch must be in e, else
+// endDirtySave fails the save; then tracking continues with saved, and image
+// becomes the parent of the next incremental save. If the save failed, e's
+// pages are returned to the dirty sets, so that the next save writes them,
+// and the parent of the next incremental save is unchanged. endDirtySave
+// returns err, or the error that fails the save.
 //
 // Preconditions: The Kernel is paused.
-func (k *Kernel) endDirtySave(ctx context.Context, e *DirtyEpochResult, saved []*pgalloc.MemoryFile, err error) error {
+func (k *Kernel) endDirtySave(ctx context.Context, e *DirtyEpochResult, saved []*pgalloc.MemoryFile, image *checkpointimage.Image, err error) error {
 	if err == nil && e != nil && k.dirty.Verify {
 		err = verifyDirty(e, saved)
 	}
@@ -223,6 +241,7 @@ func (k *Kernel) endDirtySave(ctx context.Context, e *DirtyEpochResult, saved []
 		}
 		return err
 	}
+	k.dirty.last = image
 	return k.trackDirty(ctx, saved)
 }
 
