@@ -18,6 +18,7 @@ go_library(
         "//runsc/cli",
         "//runsc/cmd",
         "//runsc/cmd/alias",
+        "//runsc/cmd/image",
         "//runsc/cmd/profile",
         "//runsc/cmd/trace",
         "//runsc/cmd/util",
