@@ -87,6 +87,7 @@ go_library(
         "timer.go",
         "tty.go",
         "uio.go",
+        "userfaultfd.go",
         "utsname.go",
         "vfio.go",
         "wait.go",
@@ -111,6 +112,7 @@ go_test(
     size = "small",
     srcs = [
         "netfilter_test.go",
+        "userfaultfd_test.go",
     ],
     library = ":linux",
 )
