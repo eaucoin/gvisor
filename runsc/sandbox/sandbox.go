@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -606,7 +608,7 @@ func (d DirectIO) String() string {
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, directIO DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, layerPaths []string, directIO DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
 	waitRegisteredMetrics := s.fetchRegisteredMetrics()
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
@@ -637,7 +639,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if directIO == DirectIOAuto && !specutils.NVProxyEnabled(spec, conf) {
 		directIO = DirectIOOff
 	}
-	if err := s.setRestoreOpts(conf, imagePath, directIO, &opt); err != nil {
+	if err := s.setRestoreOpts(conf, imagePath, layerPaths, directIO, &opt); err != nil {
 		return err
 	}
 
@@ -699,13 +701,17 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	return s.applyAppCPULimit(cpuPhaseLifecycle)
 }
 
-func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, directIO DirectIO, opt *sentryapi.RestoreOpts) error {
+func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, layerPaths []string, directIO DirectIO, opt *sentryapi.RestoreOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-reads")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, directIO, opt)
+		return s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, layerPaths, directIO, opt)
+	}
+	if len(layerPaths) != 0 {
+		clientSockFile.Close()
+		return fmt.Errorf("layer paths %q cannot be used with a checkpoint gofer, which finds layers in the image's %q directory", layerPaths, checkpointimage.LayersDir)
 	}
 	log.Infof("Restoring from GCS via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
@@ -777,7 +783,7 @@ func openPagesFile(dirFD int, imagePath string, directIO DirectIO) (*os.File, er
 	return openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesFileName, unix.O_RDONLY)
 }
 
-func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, directIO DirectIO, opt *sentryapi.RestoreOpts) error {
+func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, layerPaths []string, directIO DirectIO, opt *sentryapi.RestoreOpts) error {
 	dirFD, err := openRestoreDir(imagePath)
 	if err != nil {
 		return fmt.Errorf("opening checkpoint directory %q failed: %w", imagePath, err)
@@ -791,20 +797,56 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 	opt.FilePayload.Files = append(opt.FilePayload.Files, sf)
 
 	// If either the pages metadata file or pages file exist, both must exist,
-	// and we must pass them in.
-	if pmf, err := openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesMetadataFileName, unix.O_RDONLY); err == nil {
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf)
-		pf, err := openPagesFile(dirFD, imagePath, directIO)
+	// and we must pass them in, followed by the pages files of the image's
+	// layers.
+	pagesMetadataFileName := path.Join(imagePath, checkpointfiles.PagesMetadataFileName)
+	pmf, err := openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesMetadataFileName, unix.O_RDONLY)
+	if errors.Is(err, unix.ENOENT) {
+		if len(layerPaths) != 0 {
+			return fmt.Errorf("layer paths %q given for an image without pages files", layerPaths)
+		}
+		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("opening pages metadata file %q failed: %w", pagesMetadataFileName, err)
+	}
+	opt.FilePayload.Files = append(opt.FilePayload.Files, pmf)
+	image, err := checkpointimage.ReadMetadata(bufio.NewReader(pmf))
+	if err != nil {
+		return fmt.Errorf("reading pages metadata file %q failed: %w", pagesMetadataFileName, err)
+	}
+	if _, err := pmf.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	layerDirs, err := checkpointimage.FindLayers(image, imagePath, layerPaths)
+	if err != nil {
+		return err
+	}
+	pf, err := openPagesFile(dirFD, imagePath, directIO)
+	if err != nil {
+		return fmt.Errorf("opening pages file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesFileName), err)
+	}
+	opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+	// A layer may be outside imagePath (checkpointimage.FindLayers): its
+	// pages file is opened through a read-only tree of its own.
+	for _, dir := range layerDirs {
+		layerFD, err := openRestoreDir(dir)
 		if err != nil {
-			return fmt.Errorf("opening pages file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesFileName), err)
+			return fmt.Errorf("opening layer directory %q failed: %w", dir, err)
+		}
+		pf, err := openPagesFile(layerFD, dir, directIO)
+		unix.Close(layerFD)
+		if err != nil {
+			return fmt.Errorf("opening pages file %q failed: %w", path.Join(dir, checkpointfiles.PagesFileName), err)
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
-		opt.HavePagesFile = true
-	} else if !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("opening pages metadata file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesMetadataFileName), err)
-	} else {
-		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
+	if len(layerDirs) != 0 {
+		log.Infof("Restoring image %v with layers %q", image.Digest, layerDirs)
+	}
+	opt.HavePagesFile = true
+	opt.LayerFiles = len(layerDirs)
 	return nil
 }
 
