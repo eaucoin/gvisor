@@ -25,7 +25,8 @@ message MemoryFile {
   ResourceID resource_id = 1;
   uint64 pages_metadata_start = 2;
   uint64 pages_metadata_end = 3;
-  uint64 pages_start = 4;
+  // The offsets of a MemoryFile's pages are in its metadata's extents.
+  reserved 4;
 }
 
 message Tmpfs {
@@ -44,4 +45,6 @@ message Manifest {
   string endian = 4;
   repeated MemoryFile memory_files = 5;
   repeated Tmpfs tmpfs = 6;
+  // The size of the pages file in bytes.
+  uint64 pages_size = 7;
 }
