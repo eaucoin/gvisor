@@ -274,13 +274,15 @@ The JSON metadata at the start of `checkpoint.img` holds, among others:
 | --------------- | ------------------------------------------------------------------------ |
 | `runsc_version` | the version of runsc that saved the checkpoint                           |
 | `image_format`  | the version of the pages metadata format, e.g. `2.0`; absent for compressed checkpoints, which have no pages metadata file |
+| `parent_id`     | the identity of the image an incremental checkpoint was saved as a delta of; absent for full checkpoints. It records how the checkpoint was made: the images it needs are the layers in `pages_meta.img`, which rewriting the image changes, while the tools copy `checkpoint.img` as it is |
 | `platform`      | the platform the sandbox ran on                                          |
 | `cpu_features`  | the CPU features the sandbox exposed, by name, comma-separated            |
 
-The image's identity and the size of its pages file are not in the state file's
-metadata: the metadata is written before the object graph, and the pages
-metadata file, whose SHA-256 is the identity and which holds that size, is
-completed after both, once every page is written. Tools read them from
+The image's own identity and the size of its pages file are not in the state
+file's metadata (its parent's identity, known before the save starts, is): the
+metadata is written before the object graph, and the pages metadata file, whose
+SHA-256 is the identity and which holds that size, is completed after both,
+once every page is written. Tools read them from
 `pages_meta.img`, whose header, body and trailer they read in a few
 microseconds.
 
