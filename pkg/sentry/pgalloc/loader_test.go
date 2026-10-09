@@ -360,6 +360,38 @@ func TestAsyncLoadErrorIsSticky(t *testing.T) {
 	}
 }
 
+// TestAsyncLoadErrorWakesLoadedWaiters checks that when a read fails, the
+// waiters for pages loaded by reads completed in the same batch are woken.
+func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 2*hostarch.PageSize)
+	// Both reads complete at the same virtual time, so that the loader gets
+	// both completions from one Wait: first page 0's, then page 1's, which
+	// fails.
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	r.failAt(hostarch.PageSize)
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	r.waitInflight(2)
+	page0 := memmap.FileRange{fr.Start, fr.Start + hostarch.PageSize}
+	loaded := awaitAsync(restored, page0)
+	waitForWaiters(t, l.apfl, 1)
+
+	r.finish()
+	if err := receive(t, loaded, "the waiter for the loaded page"); err != nil {
+		t.Errorf("waiter for the loaded page: got %v, want success", err)
+	}
+	if err := l.wait(t); err != linuxerr.EIO {
+		t.Errorf("async page loading: got %v, want EIO", err)
+	}
+	gens.checkPages(t, restored, page0)
+}
+
 // TestSaveDuringAsyncLoad checks that saving a MemoryFile whose pages are
 // still loading waits for them and saves them all.
 func TestSaveDuringAsyncLoad(t *testing.T) {
