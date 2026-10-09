@@ -202,6 +202,41 @@ func (i *inode) updateMetadataLocked(ctx context.Context, h handle) error {
 	}
 }
 
+// remoteSizeAndMtime returns the size and modification time of the remote
+// file.
+//
+// Preconditions: !i.isSynthetic().
+func (i *inode) remoteSizeAndMtime(ctx context.Context) (uint64, int64, error) {
+	switch it := i.impl.(type) {
+	case *lisafsInode:
+		var stat lisafs.Statx
+		if err := it.controlFD.StatTo(ctx, &stat); err != nil {
+			return 0, 0, err
+		}
+		return stat.Size, dentryTimestamp(stat.Mtime), nil
+	case *directfsInode:
+		var stat unix.Statx_t
+		if err := unix.Statx(it.controlFD, "", unix.AT_EMPTY_PATH, unix.STATX_SIZE|unix.STATX_MTIME, &stat); err != nil {
+			return 0, 0, err
+		}
+		return stat.Size, dentryTimestampFromUnix(stat.Mtime), nil
+	default:
+		panic("unknown inode implementation")
+	}
+}
+
+// savedRemoteSizeAndMtime returns the size and modification time that the
+// remote file had when i was saved.
+//
+// Preconditions: i.isRegularFile().
+func (i *inode) savedRemoteSizeAndMtime() (uint64, int64) {
+	if i.cachedMetadataAuthoritative() {
+		return i.savedHostSize, i.savedHostMtime
+	}
+	// i's metadata was updated from the remote file's before saving.
+	return i.size.RacyLoad(), i.mtime.RacyLoad()
+}
+
 // Preconditions:
 //   - !d.isSynthetic().
 //   - fs.renameMu is locked.
