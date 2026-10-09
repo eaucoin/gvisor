@@ -83,6 +83,7 @@ def _syscall_test(
         save_resume = False,
         netstack_sr = False,
         dirty_tracking_verify = False,
+        save_incremental = False,
         nftables = False,
         kvm_use_cpu_nums = True,
         in_sandbox_cgroup = "v1",
@@ -112,6 +113,8 @@ def _syscall_test(
         name += "_netstack_save"
     if dirty_tracking_verify:
         name += "_verify"
+    if save_incremental:
+        name += "_incremental"
     if nftables:
         name += "_nftables"
 
@@ -127,7 +130,9 @@ def _syscall_test(
     if save or save_resume:
         tags.append("allsave")
         if platform in save_restore_platforms:
-            if dirty_tracking_verify:
+            if save_incremental:
+                tags.append("save_incremental")
+            elif dirty_tracking_verify:
                 tags.append("save_verify")
             elif save:
                 tags.append("save_restore")
@@ -190,6 +195,7 @@ def _syscall_test(
         "--save-resume=" + str(save_resume),
         "--netstack-sr=" + str(netstack_sr),
         "--dirty-tracking-verify=" + str(dirty_tracking_verify),
+        "--save-incremental=" + str(save_incremental),
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
@@ -640,6 +646,37 @@ def syscall_test(
                 leak_check = leak_check,
                 save = True,
                 dirty_tracking_verify = True,
+                size = "large",
+                timeout = "long",
+                nftables = nftables,
+                kvm_use_cpu_nums = kvm_use_cpu_nums,
+                in_sandbox_cgroup = in_sandbox_cgroup,
+                **kwargs
+            )
+
+        # Add a save variant on every platform in which every save but the
+        # first is incremental, of the image the sandbox was restored from,
+        # and restores read the chain of images; saves verify tracking too, so
+        # that a write that escaped it fails the save rather than the test.
+        for platform, platform_tags in all_platforms():
+            _syscall_test(
+                test = test,
+                platform = platform,
+                use_tmpfs = use_tmpfs,
+                add_host_uds = add_host_uds,
+                add_host_connector = add_host_connector,
+                add_host_fifo = add_host_fifo,
+                add_host_tty = add_host_tty,
+                tags = platform_tags + tags,
+                iouring = iouring,
+                directfs = add_directfs and platform == default_platform,
+                debug = debug,
+                container = container,
+                one_sandbox = one_sandbox,
+                leak_check = leak_check,
+                save = True,
+                dirty_tracking_verify = True,
+                save_incremental = True,
                 size = "large",
                 timeout = "long",
                 nftables = nftables,

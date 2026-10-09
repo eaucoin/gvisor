@@ -199,6 +199,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
 	flagSet.String("TESTONLY-autosave-compression", "flate-best-speed", "TEST ONLY; compression level of auto saves for syscall tests: none|flate-best-speed.")
+	flagSet.Var(autosaveKindPtr(AutosaveFull), "TESTONLY-autosave-kind", "TEST ONLY; what the auto saves of syscall tests save: full (default), or incremental, of the image the sandbox was restored from (requires --dirty-tracking).")
 
 	RegisterDeprecatedFlags(flagSet)
 }

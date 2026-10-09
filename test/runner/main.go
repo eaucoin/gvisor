@@ -79,6 +79,7 @@ var (
 	saveResume       = flag.Bool("save-resume", false, "enables save resume")
 	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
 	dirtyVerify      = flag.Bool("dirty-tracking-verify", false, "enables dirty tracking, verified at every save: saves fail if a page changed without being tracked")
+	saveIncremental  = flag.Bool("save-incremental", false, "with -save, makes every save after the first incremental, of the image the sandbox was restored from, and restores from the chain of images")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
 	inSandboxCgroup  = flag.String("in-sandbox-cgroup", "v1", "cgroup setup to use inside the sandbox (v1 or v2)")
@@ -335,9 +336,10 @@ func prepareSave(args []string, undeclaredOutputsDir string, index int) ([]strin
 	}
 	// Pass the directory path of the state file to the sandbox.
 	args = append(args, "-TESTONLY-autosave-image-path", dir)
-	if *saveBackground {
+	if *saveBackground || *saveIncremental {
 		// runsc restore --background loads only a separate pages file
-		// lazily.
+		// lazily, and incremental saves refer to the pages files of
+		// their parents.
 		args = append(args, "-TESTONLY-autosave-compression=none")
 	}
 	return args, dir, nil
@@ -454,8 +456,14 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	if *inSandboxCgroup != "" {
 		args = append(args, "-in-sandbox-cgroup="+*inSandboxCgroup)
 	}
+	if *dirtyVerify || *saveIncremental {
+		args = append(args, "-dirty-tracking=wp")
+	}
 	if *dirtyVerify {
-		args = append(args, "-dirty-tracking=wp", "-dirty-tracking-verify=hash")
+		args = append(args, "-dirty-tracking-verify=hash")
+	}
+	if *saveIncremental {
+		args = append(args, "-TESTONLY-autosave-kind=incremental")
 	}
 
 	testLogDir := ""
@@ -644,6 +652,15 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			return fmt.Errorf("run error: %v", err)
 		}
 
+		// With -save-incremental, the images the sandbox was restored from
+		// are the layers of the next one.
+		var layerDirs []string
+		defer func() {
+			for _, dir := range layerDirs {
+				os.RemoveAll(dir)
+			}
+		}()
+
 		// Restore the sandbox with the previous state file.
 		for i := 1; ; i++ {
 			if signalled.Load() {
@@ -679,6 +696,9 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			if *saveBackground {
 				restoreArgs = append(restoreArgs, "--background")
 			}
+			for _, dir := range layerDirs {
+				restoreArgs = append(restoreArgs, "--layer-path", dir)
+			}
 			restoreArgs = append(restoreArgs, id)
 			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
 			restoreCmd := exec.Command(specutils.ExePath, restoreArgs...)
@@ -695,6 +715,10 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 				os.RemoveAll(currentRestoreDir)
 				os.RemoveAll(currentSaveDir)
 				return fmt.Errorf("after restore error: %v", err)
+			}
+			if *saveIncremental {
+				layerDirs = append(layerDirs, currentRestoreDir)
+				continue
 			}
 			// After the restore is successful, we can delete the checkpoint we restored from.
 			os.RemoveAll(currentRestoreDir)
