@@ -74,8 +74,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
@@ -711,23 +713,10 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	return f()
 }
 
-// +stateify savable
-type privateMemoryFileMetadata struct {
-	owners []checkpoint.ResourceID
-}
-
-func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, mfOpts *pgalloc.SaveOpts) error {
-	var meta privateMemoryFileMetadata
-	// Generate the order in which private memory files are saved.
-	for fsID := range mfsToSave {
-		meta.owners = append(meta.owners, fsID)
-	}
-	// Save the metadata.
-	if _, err := state.Save(ctx, w, &meta); err != nil {
-		return err
-	}
-	// Followed by the private memory files in order.
-	for _, fsID := range meta.owners {
+// savePrivateMFs saves the private MemoryFiles in mfsToSave, in the order of
+// owners.
+func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.ResourceID, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, mfOpts *pgalloc.SaveOpts) error {
+	for _, fsID := range owners {
 		if err := mfsToSave[fsID].SaveTo(ctx, w, mfOpts); err != nil {
 			return err
 		}
@@ -907,16 +896,38 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
 	memoryStart := time.Now()
 
+	// Private MemoryFiles are saved after the application MemoryFile, in the
+	// order the image records.
+	image := &pgallocpb.ImageProto{
+		Layers: []*pgallocpb.LayerProto{{}},
+	}
+	owners := make([]checkpoint.ResourceID, 0, len(mfsToSave))
+	for fsID := range mfsToSave {
+		owners = append(owners, fsID)
+		image.PrivateMemoryFiles = append(image.PrivateMemoryFiles, &pgallocpb.ResourceIDProto{
+			ContainerName: fsID.ContainerName,
+			Path:          fsID.Path,
+		})
+	}
+
 	pmw := w
-	var pmwCleanup cleanup.Cleanup
+	var (
+		imageWriter *checkpointimage.Writer
+		pmwCleanup  cleanup.Cleanup
+	)
 	if pagesMetadata != nil {
-		pmw = pagesMetadata
+		image.PageHash = checkpointimage.PageHashXXH64
+		imageWriter = checkpointimage.NewWriter(pagesMetadata, image)
+		pmw = imageWriter
 		pmwCleanup.Add(func() { pagesMetadata.Close() })
+	} else if err := checkpointimage.WriteRecord(w, image); err != nil {
+		return fmt.Errorf("failed to write image metadata: %w", err)
 	}
 	defer pmwCleanup.Clean()
 
 	mfOpts := pgalloc.SaveOpts{
 		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
+		PageHashes:                image.PageHash != 0,
 	}
 	var (
 		asyncPageSaveWg      sync.WaitGroup
@@ -946,13 +957,18 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
 	// usage behavior, but not necessarily usage of private MemoryFiles.
 	mfOpts.ExcludeCommittedZeroPages = false
-	if err := savePrivateMFs(ctx, pmw, mfsToSave, &mfOpts); err != nil {
+	if err := savePrivateMFs(ctx, pmw, owners, mfsToSave, &mfOpts); err != nil {
 		return err
 	}
 	if pagesMetadata != nil {
+		img, err := imageWriter.Finish(mfOpts.PagesFile.PagesFileOffset())
+		if err != nil {
+			return fmt.Errorf("failed to write pages metadata file: %w", err)
+		}
+		log.Infof("Saved image %v: %d layers, %d bytes of pages", img.Digest, len(img.Proto.Layers), img.Proto.Layers[0].PagesSize)
 		// Close pagesMetadata while async MemoryFile saving is in progress to
 		// overlap their latencies.
-		err := pagesMetadata.Close()
+		err = pagesMetadata.Close()
 		pmwCleanup.Release()
 		if err != nil {
 			return fmt.Errorf("failed to close pages metadata file: %w", err)
