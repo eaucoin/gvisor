@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/ringdeque"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -1317,6 +1318,24 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	return nil
 }
 
+// Metrics of async page loading, so that its users can tell how long their
+// applications waited for pages, as QEMU reports postcopy "blocktime". They
+// are updated when loading from a pages file ends.
+var (
+	asyncLoadWaits = metric.MustCreateNewUint64Metric("/checkpoint/async_load_waits", metric.Uint64Metadata{
+		Cumulative:  true,
+		Description: "Number of times application threads or the sentry waited for pages that a background restore had not loaded yet.",
+	})
+	asyncLoadWaitBytes = metric.MustCreateNewUint64Metric("/checkpoint/async_load_wait_bytes", metric.Uint64Metadata{
+		Cumulative:  true,
+		Description: "Bytes of pages that application threads or the sentry waited for while a background restore loaded them.",
+	})
+	asyncLoadWaitNanoseconds = metric.MustCreateNewUint64Metric("/checkpoint/async_load_wait_nanoseconds", metric.Uint64Metadata{
+		Cumulative:  true,
+		Description: "Total time that application threads or the sentry waited for pages that a background restore loaded, summed over the waits.",
+	})
+)
+
 // AsyncPagesFileLoad holds async page loading state for a single pages file.
 type AsyncPagesFileLoad struct {
 	mu apflMutex
@@ -2149,6 +2168,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 			amfl.doneLocked(apfl.err())
 		}
+		asyncLoadWaits.IncrementBy(uint64(apfl.totalWaiters))
+		asyncLoadWaitBytes.IncrementBy(apfl.bytesWaited)
+		asyncLoadWaitNanoseconds.IncrementBy(uint64(apfl.durWaitedTotal.Nanoseconds()))
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
 		if apfl.doneCallback != nil {
