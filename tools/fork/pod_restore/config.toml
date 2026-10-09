@@ -1,0 +1,4 @@
+# The shim's global options, at /etc/containerd/runsc/config.toml in
+# pod_restore_test.sh's node (pkg/shim/v1/runsc/options.go): one shim per pod,
+# keyed by its sandbox ID.
+grouping = true
