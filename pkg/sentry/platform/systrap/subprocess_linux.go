@@ -48,6 +48,16 @@ func createStub() (*thread, error) {
 //
 // Precondition: the runtime OS thread must be locked.
 func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error) {
+	instrs, err := stubSeccompFilter(defaultAction, writeTrackingEnabled())
+	if err != nil {
+		return nil, err
+	}
+	return forkStub(flags, instrs)
+}
+
+// stubSeccompFilter returns the seccomp filter of stubs, which trackWrites
+// widens for write tracking, and whose default action is defaultAction.
+func stubSeccompFilter(defaultAction seccomp.Action, trackWrites bool) ([]bpf.Instruction, error) {
 	// Create a BPF program that allows only the system calls needed by the
 	// stub and all its children. This is used to create child stubs
 	// (below), so we must include the ability to fork, but otherwise lock
@@ -136,6 +146,9 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 			}),
 			Action: seccomp.Allow,
 		}
+		if trackWrites {
+			ruleSet.Rules.Merge(stubWriteTrackingRules())
+		}
 		rules = append(rules, ruleSet)
 		rules = appendArchSeccompRules(rules)
 	}
@@ -147,11 +160,7 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 		},
 	}
 	instrs, _, err := program.Build()
-	if err != nil {
-		return nil, err
-	}
-
-	return forkStub(flags, instrs)
+	return instrs, err
 }
 
 // In the child, this function must not acquire any locks, because they might
