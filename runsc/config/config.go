@@ -774,13 +774,20 @@ const (
 	// DirtyTrackingOff disables dirty tracking.
 	DirtyTrackingOff DirtyTrackingMode = iota
 
-	// DirtyTrackingAuto selects the best dirty source available.
+	// DirtyTrackingAuto selects DirtyTrackingUFFD on kvm, where it only
+	// allows the Sentry its ioctls, if the host supports it and application
+	// huge pages are disabled, and DirtyTrackingWriteProtect otherwise.
 	DirtyTrackingAuto
 
 	// DirtyTrackingWriteProtect write-protects application memory in the
 	// Sentry, so that the first write to each tracking unit faults into the
 	// Sentry, which records it. It works on every platform and host kernel.
 	DirtyTrackingWriteProtect
+
+	// DirtyTrackingUFFD has the host kernel record the application's writes
+	// with userfaultfd write-protection in asynchronous mode, read with
+	// PAGEMAP_SCAN (Linux 6.7 and later), on the kvm and systrap platforms.
+	DirtyTrackingUFFD
 )
 
 func dirtyTrackingModePtr(v DirtyTrackingMode) *DirtyTrackingMode {
@@ -796,6 +803,8 @@ func (d *DirtyTrackingMode) Set(v string) error {
 		*d = DirtyTrackingAuto
 	case "wp":
 		*d = DirtyTrackingWriteProtect
+	case "uffd":
+		*d = DirtyTrackingUFFD
 	default:
 		return fmt.Errorf("invalid dirty tracking mode %q", v)
 	}
@@ -816,6 +825,8 @@ func (d DirtyTrackingMode) String() string {
 		return "auto"
 	case DirtyTrackingWriteProtect:
 		return "wp"
+	case DirtyTrackingUFFD:
+		return "uffd"
 	}
 	panic(fmt.Sprintf("Invalid dirty tracking mode %d", d))
 }

@@ -131,7 +131,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
-	flagSet.Var(dirtyTrackingModePtr(DirtyTrackingOff), "dirty-tracking", "track the application memory pages written between checkpoints, from the first checkpoint or restore on: off (default); wp (write-protect application memory in the Sentry; works on every platform and host kernel); auto (the best available, currently wp).")
+	flagSet.Var(dirtyTrackingModePtr(DirtyTrackingOff), "dirty-tracking", "track the application memory pages written between checkpoints, from the first checkpoint or restore on: off (default); wp (write-protect application memory in the Sentry; works on every platform and host kernel); uffd (the host kernel records writes with userfaultfd write-protection, Linux 6.7 and later, on kvm and systrap; on systrap it lets the Sentry make stub processes create userfaultfds and open files in procfs); auto (uffd on kvm where available and without --app-huge-pages, else wp).")
 	flagSet.Uint64("dirty-tracking-unit", 64<<10, "size in bytes, a power of 2 of at least 4096, of the units of application memory in which --dirty-tracking=wp records first writes; larger units fault less often and record more pages. Huge pages are tracked whole.")
 	flagSet.Var(dirtyTrackingVerifyModePtr(DirtyTrackingVerifyOff), "dirty-tracking-verify", "whether checkpoints verify that dirty tracking missed no write: off (default), or hash: every checkpoint checks it by hashing every page, and fails if it did; restores wait for every page to be loaded (for tests and debugging).")
 

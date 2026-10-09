@@ -83,6 +83,7 @@ def _syscall_test(
         save_resume = False,
         netstack_sr = False,
         dirty_tracking_verify = False,
+        dirty_tracking = "wp",
         save_incremental = False,
         nftables = False,
         kvm_use_cpu_nums = True,
@@ -113,6 +114,8 @@ def _syscall_test(
         name += "_netstack_save"
     if dirty_tracking_verify:
         name += "_verify"
+    if (dirty_tracking_verify or save_incremental) and dirty_tracking != "wp":
+        name += "_" + dirty_tracking
     if save_incremental:
         name += "_incremental"
     if nftables:
@@ -196,6 +199,7 @@ def _syscall_test(
         "--netstack-sr=" + str(netstack_sr),
         "--dirty-tracking-verify=" + str(dirty_tracking_verify),
         "--save-incremental=" + str(save_incremental),
+        "--dirty-tracking=" + dirty_tracking,
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
@@ -215,6 +219,12 @@ def _syscall_test(
         tags = tags,
         **kwargs
     )
+
+def dirty_sources(platform):
+    """Returns the dirty sources that the save variants of platform track with."""
+    if platform in ["kvm", "systrap"]:
+        return ["wp", "uffd"]
+    return ["wp"]
 
 def all_platforms():
     """All platforms returns a list of all platforms."""
@@ -625,65 +635,70 @@ def syscall_test(
             **kwargs
         )
 
-        # Add a save variant on every platform in which the sandbox tracks
-        # the pages written between saves and every save verifies that no
-        # write escaped tracking.
+        # Add a save variant on every platform, and dirty source it supports,
+        # in which the sandbox tracks the pages written between saves and
+        # every save verifies that no write escaped tracking.
         for platform, platform_tags in all_platforms():
-            _syscall_test(
-                test = test,
-                platform = platform,
-                use_tmpfs = use_tmpfs,
-                add_host_uds = add_host_uds,
-                add_host_connector = add_host_connector,
-                add_host_fifo = add_host_fifo,
-                add_host_tty = add_host_tty,
-                tags = platform_tags + tags,
-                iouring = iouring,
-                directfs = add_directfs and platform == default_platform,
-                debug = debug,
-                container = container,
-                one_sandbox = one_sandbox,
-                leak_check = leak_check,
-                save = True,
-                dirty_tracking_verify = True,
-                size = "large",
-                timeout = "long",
-                nftables = nftables,
-                kvm_use_cpu_nums = kvm_use_cpu_nums,
-                in_sandbox_cgroup = in_sandbox_cgroup,
-                **kwargs
-            )
+            for dirty_tracking in dirty_sources(platform):
+                _syscall_test(
+                    test = test,
+                    platform = platform,
+                    use_tmpfs = use_tmpfs,
+                    add_host_uds = add_host_uds,
+                    add_host_connector = add_host_connector,
+                    add_host_fifo = add_host_fifo,
+                    add_host_tty = add_host_tty,
+                    tags = platform_tags + tags,
+                    iouring = iouring,
+                    directfs = add_directfs and platform == default_platform,
+                    debug = debug,
+                    container = container,
+                    one_sandbox = one_sandbox,
+                    leak_check = leak_check,
+                    save = True,
+                    dirty_tracking_verify = True,
+                    dirty_tracking = dirty_tracking,
+                    size = "large",
+                    timeout = "long",
+                    nftables = nftables,
+                    kvm_use_cpu_nums = kvm_use_cpu_nums,
+                    in_sandbox_cgroup = in_sandbox_cgroup,
+                    **kwargs
+                )
 
-        # Add a save variant on every platform in which every save but the
-        # first is incremental, of the image the sandbox was restored from,
-        # and restores read the chain of images; saves verify tracking too, so
-        # that a write that escaped it fails the save rather than the test.
+        # Add a save variant on every platform, and dirty source it supports,
+        # in which every save but the first is incremental, of the image the
+        # sandbox was restored from, and restores read the chain of images;
+        # saves verify tracking too, so that a write that escaped it fails the
+        # save rather than the test.
         for platform, platform_tags in all_platforms():
-            _syscall_test(
-                test = test,
-                platform = platform,
-                use_tmpfs = use_tmpfs,
-                add_host_uds = add_host_uds,
-                add_host_connector = add_host_connector,
-                add_host_fifo = add_host_fifo,
-                add_host_tty = add_host_tty,
-                tags = platform_tags + tags,
-                iouring = iouring,
-                directfs = add_directfs and platform == default_platform,
-                debug = debug,
-                container = container,
-                one_sandbox = one_sandbox,
-                leak_check = leak_check,
-                save = True,
-                dirty_tracking_verify = True,
-                save_incremental = True,
-                size = "large",
-                timeout = "long",
-                nftables = nftables,
-                kvm_use_cpu_nums = kvm_use_cpu_nums,
-                in_sandbox_cgroup = in_sandbox_cgroup,
-                **kwargs
-            )
+            for dirty_tracking in dirty_sources(platform):
+                _syscall_test(
+                    test = test,
+                    platform = platform,
+                    use_tmpfs = use_tmpfs,
+                    add_host_uds = add_host_uds,
+                    add_host_connector = add_host_connector,
+                    add_host_fifo = add_host_fifo,
+                    add_host_tty = add_host_tty,
+                    tags = platform_tags + tags,
+                    iouring = iouring,
+                    directfs = add_directfs and platform == default_platform,
+                    debug = debug,
+                    container = container,
+                    one_sandbox = one_sandbox,
+                    leak_check = leak_check,
+                    save = True,
+                    dirty_tracking_verify = True,
+                    dirty_tracking = dirty_tracking,
+                    save_incremental = True,
+                    size = "large",
+                    timeout = "long",
+                    nftables = nftables,
+                    kvm_use_cpu_nums = kvm_use_cpu_nums,
+                    in_sandbox_cgroup = in_sandbox_cgroup,
+                    **kwargs
+                )
 
         # Add save resume variant to all other variants generated above.
         syscall_test_variants(

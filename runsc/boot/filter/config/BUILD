@@ -35,6 +35,7 @@ go_library(
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/devices/rdmaproxy",
         "//pkg/sentry/devices/tpuproxy",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/platforms",
         "//pkg/sentry/socket/hostinet",

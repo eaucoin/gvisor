@@ -85,6 +85,7 @@ go_test(
         "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/fscheckpoint:fscheckpoint_proto_go_proto",
         "//pkg/sentry/fsimpl/erofs",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/limits",

@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,5 +261,25 @@ func TestPrecopyThrottle(t *testing.T) {
 				t.Errorf("dirtying limited to %d bytes/s after the save, want no limit", got)
 			}
 		})
+	}
+}
+
+// TestPrecopyThrottleUffd checks that a pre-copy that may throttle dirtying is
+// refused when writes are tracked with userfaultfd, which never delays the
+// tasks that write, rather than run unthrottled.
+func TestPrecopyThrottleUffd(t *testing.T) {
+	ctx := contexttest.Context(t)
+	k, _, _ := dirtyTestKernel(t, ctx, false /* verify */)
+	full, err := saveImage(t, ctx, k, nil, false)
+	if err != nil {
+		t.Fatalf("full save: %v", err)
+	}
+	k.dirty.Sources = []DirtySource{&uffdDirtySource{k: k}}
+	_, _, err = saveImageOpts(t, ctx, k, testSaveOpts{
+		parent:  &full.Digest,
+		precopy: &PrecopyOpts{Budget: 0, MaxRounds: 3, Throttle: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "--dirty-tracking=wp") {
+		t.Errorf("save with throttled pre-copy under uffd tracking: got error %v, want one asking for --dirty-tracking=wp", err)
 	}
 }
