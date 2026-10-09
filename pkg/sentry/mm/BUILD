@@ -182,19 +182,27 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "address_space_test.go",
+        "mm_test.go",
+    ],
     library = ":mm",
     deps = [
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/memutil",
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/platform",
+        "//pkg/sentry/state/checkpointimage",
+        "//pkg/sentry/state/stateio",
+        "//pkg/sentry/usage",
         "//pkg/usermem",
     ],
 )
