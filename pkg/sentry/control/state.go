@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -116,6 +117,11 @@ type SaveOpts struct {
 
 	// RunscVersion is the runsc binary version.
 	RunscVersion string `json:"runsc_version"`
+
+	// ParentImageDigest, if not empty, makes the save incremental: it is the
+	// digest (checkpointimage.Digest.String) of the image the sandbox was last
+	// saved to or restored from, of which the save writes only the changes.
+	ParentImageDigest string `json:"parent_image_digest"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
@@ -143,6 +149,13 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 		Resume:                         o.Resume,
 		CudaCheckpointPath:             o.CudaCheckpointPath,
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
+	}
+	if o.ParentImageDigest != "" {
+		d, err := checkpointimage.ParseDigest(o.ParentImageDigest)
+		if err != nil {
+			return nil, fmt.Errorf("parent image digest: %w", err)
+		}
+		saveOpts.Parent = &d
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
