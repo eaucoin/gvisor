@@ -262,7 +262,10 @@ func verifyDirty(e *DirtyEpochResult, saved []*pgalloc.MemoryFile) error {
 			// mf was not tracked during the epoch.
 			continue
 		}
-		v := mf.VerifyDirty(s)
+		v, err := mf.VerifyDirty(s)
+		if err != nil {
+			return fmt.Errorf("dirty tracking verification: MemoryFile %p: %w", mf, err)
+		}
 		if v.Escapes != 0 {
 			log.Warningf("Dirty tracking verification: MemoryFile %p: %d pages changed without being dirty, starting with %v", mf, v.Escapes, v.First)
 			escapes += v.Escapes

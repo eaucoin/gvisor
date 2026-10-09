@@ -375,6 +375,30 @@ func TestSwapDirtyConcurrentMarks(t *testing.T) {
 	}
 }
 
+// TestVerifyDirtyPossiblyCommitted checks that verification hashes the pages
+// that hold data without being known to be committed, as when tracking starts
+// while tasks run, before any save: saving them, which makes them
+// known-committed, does not change them.
+func TestVerifyDirtyPossiblyCommitted(t *testing.T) {
+	f := newTestMemoryFile(t, testMemoryFileOpts{})
+	fr := allocate(t, f, 4*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	patternPage(f.pageSlice(fr.Start+hostarch.PageSize), fr.Start+hostarch.PageSize, 1)
+	f.EnableDirtyTracking()
+	if err := f.RecordPageHashes(); err != nil {
+		t.Fatalf("RecordPageHashes: %v", err)
+	}
+	if err := f.SaveTo(context.Background(), io.Discard, &SaveOpts{}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	v, err := f.VerifyDirty(f.SwapDirty(true))
+	if err != nil {
+		t.Fatalf("VerifyDirty: %v", err)
+	}
+	if v.Escapes != 0 {
+		t.Errorf("%d escapes %v, want none", v.Escapes, v.First)
+	}
+}
+
 func TestVerifyDirty(t *testing.T) {
 	f, fr := newTrackedMemoryFile(t)
 	writePattern(t, f, fr, 1)
@@ -383,7 +407,10 @@ func TestVerifyDirty(t *testing.T) {
 		if err := f.SaveTo(context.Background(), io.Discard, &SaveOpts{}); err != nil {
 			t.Fatalf("SaveTo: %v", err)
 		}
-		v := f.VerifyDirty(f.SwapDirty(true))
+		v, err := f.VerifyDirty(f.SwapDirty(true))
+		if err != nil {
+			t.Fatalf("VerifyDirty: %v", err)
+		}
 		var got []uint64
 		for _, e := range v.First {
 			got = append(got, e.Offset)

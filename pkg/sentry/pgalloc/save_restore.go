@@ -17,6 +17,7 @@ package pgalloc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -202,11 +203,11 @@ type SaveOpts struct {
 	BaseLayers []uint32
 
 	// If Clean is not nil, Clean(off) returns true if the page at MemoryFile
-	// offset off is known not to have changed since Base was saved. SaveTo
-	// neither reads clean pages nor waits for them to be loaded: if f is still
-	// loading pages asynchronously from Base or an image that Base refers to
-	// for them, the pages not yet loaded are clean, and SaveTo saves while
-	// loading continues.
+	// offset off is known not to have changed since Base was saved, or since
+	// its last copy by Precopy. SaveTo neither reads clean pages nor waits for
+	// them to be loaded: if f is still loading pages asynchronously from Base
+	// or an image that Base refers to for them, the pages not yet loaded are
+	// clean, and SaveTo saves while loading continues.
 	Clean func(off uint64) bool
 
 	// If PageHashes is true, SaveTo records the page hash (XXH64) of every
@@ -217,6 +218,11 @@ type SaveOpts struct {
 	// checkpointimage.Writer, such as a filesystem checkpoint's, have none.
 	// PageHashes requires PagesFile.
 	PageHashes bool
+
+	// If Precopy is not nil, it is a pre-copy of f to PagesFile, which SaveTo
+	// completes: clean pages that Precopy copied refer to their last copy.
+	// Pages that Precopy neither copied nor knows to be zero refer to Base.
+	Precopy *Precopy
 }
 
 // SaveTo writes f's state to the given stream.
@@ -249,8 +255,8 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		panic(fmt.Sprintf("evictions still pending for %d users; call StartEvictions and WaitForEvictions before SaveTo", len(f.evictable)))
 	}
 
-	if opts.Base != nil && opts.PagesFile == nil {
-		return fmt.Errorf("saving a delta requires a pages file")
+	if (opts.Base != nil || opts.Precopy != nil) && opts.PagesFile == nil {
+		return fmt.Errorf("saving a delta or completing a pre-copy requires a pages file")
 	}
 	if opts.Base != nil && !opts.PageHashes {
 		return fmt.Errorf("saving a delta requires page hashes")
@@ -462,12 +468,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 				pg := bs[pgoff : pgoff+hostarch.PageSize]
 				off := chunkFR.Start + uint64(pgoff)
 				var isZeroed bool
-				if opts.Clean != nil && opts.Clean(off) {
-					// The page is unchanged since Base was saved: a page
-					// committed then is still committed, and a page that is
-					// not known to be committed was not in Base (it was freed
-					// or decommitted since, which dirtied it) and is zero.
-					isZeroed = !wasCommitted
+				if img != nil && img.isClean(off) {
+					// The page is unchanged since Base was saved or since
+					// its last copy by Precopy, so it is zero if neither
+					// holds data for it. (A clean page that is still loading
+					// reads as zeroes.)
+					isZeroed = !img.cleanHasData(off)
 				} else {
 					isZeroed = bytes.Equal(pg, zeroPageBytes[:])
 				}
@@ -584,8 +590,8 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	pb := f.exportMetadataProto()
 	if img != nil {
 		img.finish(pb)
-		log.Infof("MemoryFile(%p): %d bytes written to the pages file, %d bytes in the base image (+ %d bytes found unchanged by hash), %d bytes zero; %d extents; hashed in %s",
-			f, img.writtenBytes, img.baseBytes, img.refinedBytes, img.zeroBytes, len(pb.Extents), time.Duration(gohacks.Nanotime()-timeMetadataStart))
+		log.Infof("MemoryFile(%p): %d bytes written to the pages file, %d bytes in the base image (+ %d bytes found unchanged by hash), %d bytes pre-copied, %d bytes zero; %d extents; hashed in %s",
+			f, img.writtenBytes, img.baseBytes, img.refinedBytes, img.precopyBytes, img.zeroBytes, len(pb.Extents), time.Duration(gohacks.Nanotime()-timeMetadataStart))
 	}
 	if err := checkpointimage.WriteRecord(w, pb); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
@@ -683,6 +689,15 @@ type AsyncPagesFileSave struct {
 	// unsaved tracks pages that have not been saved. unsaved is protected by mu.
 	unsaved ringdeque.Deque[apsRange]
 
+	// flushes are the calls to Flush waiting for pages to be written.
+	// flushes is protected by mu.
+	flushes []apsFlush
+
+	// If exited is true, the async page saver goroutine has exited, with
+	// error exitErr. exited and exitErr are protected by mu.
+	exited  bool
+	exitErr error
+
 	// stStatus communicates state from MemoryFile.SaveTo() and its callers to
 	// the goroutine.
 	stStatus syncevent.Waiter
@@ -751,7 +766,15 @@ type AsyncPagesFileSave struct {
 const (
 	apsSTPending syncevent.Set = 1 << iota
 	apsSTDone
+	apsSTFlush
 )
+
+// apsFlush is a call to Flush, waiting for the first target bytes of the
+// pages file to be written.
+type apsFlush struct {
+	target uint64
+	done   chan error
+}
 
 // asyncMemoryFileSave holds state for async page saving from a single
 // MemoryFile.
@@ -829,6 +852,51 @@ func (apfs *AsyncPagesFileSave) MemoryFilesDone() {
 // be written.
 func (apfs *AsyncPagesFileSave) PagesFileOffset() uint64 {
 	return apfs.saveOff
+}
+
+// Flush waits until every page enqueued so far is written, and returns the
+// error that terminated async page saving, if any.
+func (apfs *AsyncPagesFileSave) Flush() error {
+	apfs.mu.Lock()
+	if apfs.exited {
+		err := apfs.exitErr
+		if err == nil && apfs.bytesSaved < apfs.saveOff {
+			err = errAPFSCompleted
+		}
+		apfs.mu.Unlock()
+		return err
+	}
+	if apfs.bytesSaved >= apfs.saveOff {
+		apfs.mu.Unlock()
+		return nil
+	}
+	done := make(chan error, 1)
+	apfs.flushes = append(apfs.flushes, apsFlush{target: apfs.saveOff, done: done})
+	apfs.mu.Unlock()
+	apfs.stStatus.Notify(apsSTFlush)
+	return <-done
+}
+
+// errAPFSCompleted is returned by Flush when async page saving completed,
+// after MemoryFilesDone, before writing the pages it waits for.
+var errAPFSCompleted = errors.New("async page saving completed before all pages were written")
+
+// completeFlushesLocked completes the calls to Flush whose pages are written,
+// or all of them with err if err is not nil.
+//
+// Preconditions: apfs.mu must be locked.
+func (apfs *AsyncPagesFileSave) completeFlushesLocked(err error) {
+	waiting := apfs.flushes[:0]
+	for _, fl := range apfs.flushes {
+		if err != nil {
+			fl.done <- err
+		} else if apfs.bytesSaved >= fl.target {
+			fl.done <- nil
+		} else {
+			waiting = append(waiting, fl)
+		}
+	}
+	apfs.flushes = waiting
 }
 
 func (apfs *AsyncPagesFileSave) canEnqueue() bool {
@@ -962,6 +1030,15 @@ func (apfs *AsyncPagesFileSave) main() {
 		if apfs.err != nil {
 			log.Warningf("Async page saving failed: %v", apfs.err)
 		}
+		apfs.mu.Lock()
+		apfs.exited = true
+		apfs.exitErr = apfs.err
+		if apfs.err != nil {
+			apfs.completeFlushesLocked(apfs.err)
+		} else {
+			apfs.completeFlushesLocked(errAPFSCompleted)
+		}
+		apfs.mu.Unlock()
 		if err := apfs.aw.Close(); err != nil {
 			// Saving success is independent of err, so log it rather than
 			// propagating it.
@@ -1057,12 +1134,13 @@ func (apfs *AsyncPagesFileSave) main() {
 			apfs.timeFullStart = math.MaxInt64
 		}
 		prevFull = full
+		flushing := len(apfs.flushes) != 0
 		apfs.mu.Unlock()
-		// Don't flush pending op unless it's the last one; this differs from
-		// async page loading since writers are likely to be more sensitive to
-		// write size than readers are to read size, and saving is less
-		// latency-sensitive that loading.
-		if apfs.curOp != nil && apfs.stStatus.Pending()&apsSTDone != 0 {
+		// Don't flush pending op unless it's the last one, or a call to Flush
+		// waits for it; this differs from async page loading since writers
+		// are likely to be more sensitive to write size than readers are to
+		// read size, and saving is less latency-sensitive that loading.
+		if apfs.curOp != nil && (flushing || apfs.stStatus.Pending()&apsSTDone != 0) {
 			apfs.enqueueCurOp()
 		}
 
@@ -1073,6 +1151,11 @@ func (apfs *AsyncPagesFileSave) main() {
 				// We may have raced with MemoryFile.SaveTo() inserting into
 				// apfs.unsaved.
 				apfs.stStatus.Ack(apsSTPending)
+				continue
+			}
+			if ev&apsSTFlush != 0 {
+				// A call to Flush may wait for the pending op.
+				apfs.stStatus.Ack(apsSTFlush)
 				continue
 			}
 			if ev&apsSTDone != 0 {
@@ -1134,6 +1217,7 @@ func (apfs *AsyncPagesFileSave) main() {
 				apfs.bytesFull += op.total
 			}
 		}
+		apfs.completeFlushesLocked(nil)
 		apfs.mu.Unlock()
 	}
 }
