@@ -525,6 +525,23 @@ func (AddressSpaceIOUnavailable) Error() string {
 	return "platform.AddressSpaceIO currently unavailable"
 }
 
+// WriteTracker is implemented by platforms that track the application's
+// writes through their mappings of MemoryFiles that track dirty pages
+// (platformdesc.WriteTrackingPlatform). A mapping is write-tracked if its
+// MemoryFile tracks dirty pages when it is mapped, or from the next call to
+// ArmWrites. The writes through a mapping are reported, by marking the pages
+// written dirty (pgalloc.MemoryFile.MarkDirty), when HarvestWrites is called
+// and before the mapping is unmapped or replaced.
+type WriteTracker interface {
+	// ArmWrites write-tracks the mappings of MemoryFiles that track dirty
+	// pages that are not write-tracked yet.
+	ArmWrites() error
+
+	// HarvestWrites reports the writes through every write-tracked mapping
+	// since it was armed or last harvested, and keeps tracking it.
+	HarvestWrites() error
+}
+
 // SeccompInfo represents seccomp-bpf data for a given platform.
 type SeccompInfo interface {
 	// Variables returns a map from named variables to the value they should
@@ -639,6 +656,13 @@ type Options struct {
 
 	// TSCOffset is an offset to apply to the guest TSC counter (currently KVM only).
 	TSCOffset uint64
+
+	// If WriteTrackingProcFS is not nil, a platform whose
+	// platformdesc.Requirements.WriteTracking is WriteTrackingPlatform tracks
+	// writes; see WriteTracker. WriteTrackingProcFS is a directory FD of the
+	// procfs of the Sentry's PID namespace, which the platform uses for as
+	// long as it runs. Other platforms ignore it.
+	WriteTrackingProcFS *fd.FD
 }
 
 // Constructor represents a platform type.

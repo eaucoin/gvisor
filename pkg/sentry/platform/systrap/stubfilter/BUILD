@@ -15,8 +15,10 @@ go_library(
     visibility = ["//pkg/sentry/platform/systrap:__pkg__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/hostarch",
         "//pkg/seccomp",
         "//pkg/seccomp/precompiledseccomp",
+        "//pkg/sentry/hostmm",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
