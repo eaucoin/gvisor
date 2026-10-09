@@ -160,6 +160,7 @@ analyzers:
         - codes/codes.go # go.opentelemetry.io/otel
         - yaml.go # github.com/go-openapi/swag/yamlutils
         - staticcheck/sa1030/sa1030.go # staticcheck
+        - com_github_aws_aws_sdk_go_v2_config/env_config.go # github.com/aws/aws-sdk-go-v2/config
         # Starting in 1.27, printf reports misuse of %d with pointers.
         - route.go # github.com/vishvananda/netlink
   shift:
