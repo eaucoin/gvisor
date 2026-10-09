@@ -69,6 +69,13 @@ The image commands work on uncompressed checkpoint images (directories written
 by "runsc checkpoint --image-path") without a sandbox. They never modify an
 image: commands that rewrite one write a new image directory.
 
+inspect, verify and layers also read the checkpoint archives that container
+engines (containerd, CRI-O, Podman) make of runsc containers, as checkpointctl
+does: tar files, uncompressed or compressed with gzip or zstd, whose
+checkpoint/ directory is the image. Installed as checkpointctl-runsc (a link to
+runsc named so) in PATH, runsc is a checkpointctl plugin: "checkpointctl runsc
+inspect ARCHIVE" runs "runsc image inspect ARCHIVE".
+
 Exit status: 0 on success, 2 on a usage error, 3 if the image is invalid or
 corrupt, 4 if a layer of the image is missing, 5 if this runsc cannot restore
 the image on this host (verify --host), 1 on any other error.
