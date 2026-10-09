@@ -30,6 +30,7 @@ import (
 	"google.golang.org/api/option"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -249,9 +250,15 @@ func (s *FileServer) Destroy() {
 
 // OpenRead implements stateipc.AsyncFileServerImpl.OpenRead.
 func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	// The layers of an image (see checkpointimage.LayerPath) are read as its
+	// pages metadata and pages files are.
+	name := path
+	if _, layerFile, ok := checkpointimage.ParseLayerPath(path); ok && (layerFile == checkpointfiles.PagesMetadataFileName || layerFile == checkpointfiles.PagesFileName) {
+		name = layerFile
+	}
 	// Files other than the pages file are read using stateio.BufReader, which
 	// doesn't use MaxRanges > 1.
-	switch path {
+	switch name {
 	case checkpointfiles.StateFileName:
 		if !s.allowCheckpointReads {
 			log.Warningf("gcs.FileServer.OpenRead: attempted to open %q with allowCheckpointReads disabled", path)
