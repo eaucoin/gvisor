@@ -12,6 +12,9 @@ they may need extra setup in the test machine and extra configuration to run.
     setup as integration tests.
 -   **root:** tests that require to be run as root. These require the same setup
     as integration tests.
+-   **hostmm:** tests of the host kernel's behaviour that the sandbox relies
+    on, such as the write tracking of `--dirty-tracking=uffd`. They run on the
+    host, not in gVisor, and do not require additional configuration.
 -   **util:** utilities library to support the tests.
 
 For the above noted cases, the relevant runtime must be installed via `runsc
