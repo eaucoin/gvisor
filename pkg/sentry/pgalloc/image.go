@@ -50,6 +50,10 @@ type imageSaver struct {
 	baseLayers []uint32
 	dirty      *DirtySet
 
+	// If precopy is not nil, clean pages, unchanged since their last copy by
+	// precopy, refer to the copy, in layer 0.
+	precopy *Precopy
+
 	// extents are the extents of the pages emitted so far.
 	extents []*pgallocpb.ExtentProto
 
@@ -66,6 +70,7 @@ type imageSaver struct {
 	writtenBytes uint64
 	baseBytes    uint64
 	refinedBytes uint64
+	precopyBytes uint64
 	zeroBytes    uint64
 }
 
@@ -92,25 +97,73 @@ func newImageSaver(f *MemoryFile, opts *SaveOpts, write func(memmap.FileRange) u
 		s.base = opts.Base
 		s.baseCursor = opts.Base.Cursor()
 		s.baseLayers = opts.BaseLayers
+	}
+	if opts.Precopy != nil {
+		if opts.Precopy.amfs.pf != opts.PagesFile {
+			return nil, fmt.Errorf("pre-copy is to another pages file")
+		}
+		s.precopy = opts.Precopy
+	}
+	if s.base != nil || s.precopy != nil {
 		s.dirty = opts.Dirty
 	}
 	return s, nil
 }
 
-// isClean returns true if the page at off is unchanged since base was saved.
+// isClean returns true if the page at off is unchanged since base was saved,
+// or since its last copy by precopy, and its contents are in either.
 func (s *imageSaver) isClean(off uint64) bool {
-	return s.dirty != nil && !s.dirty.Contains(off)
+	if s.dirty == nil || s.dirty.Contains(off) {
+		return false
+	}
+	if s.precopy != nil {
+		// A page dirtied when it was not allocated has contents that the
+		// pre-copy does not know.
+		_, _, _, known := s.precopy.lookup(off)
+		return known
+	}
+	return true
 }
 
-// forEachUnclean calls fn on each maximal range of pages of fr that are not
-// clean, intersected with fr, in increasing order.
+// cleanHasData returns true if the clean page at off has data in precopy or
+// base; it is zero otherwise.
+//
+// Preconditions: s.isClean(off).
+func (s *imageSaver) cleanHasData(off uint64) bool {
+	if s.precopy != nil {
+		if _, _, hasCopy, _ := s.precopy.lookup(off); hasCopy {
+			return true
+		}
+	}
+	if s.base != nil {
+		_, hasExtent := s.base.ExtentAt(off)
+		return hasExtent
+	}
+	return false
+}
+
+// forEachUnclean calls fn on each range of pages of fr that are not clean,
+// intersected with fr, in increasing order; ranges may abut.
 //
 // Preconditions: s.dirty != nil.
 func (s *imageSaver) forEachUnclean(fr memmap.FileRange, fn func(memmap.FileRange)) {
+	if s.precopy == nil {
+		s.dirty.ForEachRange(fr, func(dfr memmap.FileRange) bool {
+			fn(dfr)
+			return true
+		})
+		return
+	}
+	// Pages that are not dirty are not clean either if the pre-copy does not
+	// know their contents.
+	start := fr.Start
 	s.dirty.ForEachRange(fr, func(dfr memmap.FileRange) bool {
+		s.precopy.forEachUnknown(memmap.FileRange{Start: start, End: dfr.Start}, fn)
 		fn(dfr)
+		start = dfr.End
 		return true
 	})
+	s.precopy.forEachUnknown(memmap.FileRange{Start: start, End: fr.End}, fn)
 }
 
 // emit records that the known-committed pages in fr are saved.
@@ -119,13 +172,13 @@ func (s *imageSaver) forEachUnclean(fr memmap.FileRange, fn func(memmap.FileRang
 //   - fr is page-aligned and non-empty.
 //   - Successive calls are in increasing offset order and do not overlap.
 func (s *imageSaver) emit(fr memmap.FileRange) {
-	if s.base == nil {
+	if s.base == nil && s.precopy == nil {
 		s.emitWrite(fr, nil)
 		return
 	}
-	// Each page is written to the pages file, refers to base, or is zero (has
-	// no extent). Pages to be written are written in runs, whose hashes are
-	// collected in run.
+	// Each page is written to the pages file, refers to its copy by precopy
+	// or to base, or is zero (has no extent). Pages to be written are written
+	// in runs, whose hashes are collected in run.
 	var run []byte
 	runStart := fr.Start
 	flushRun := func(end uint64) {
@@ -136,9 +189,25 @@ func (s *imageSaver) emit(fr memmap.FileRange) {
 		runStart = end + hostarch.PageSize
 	}
 	for off := fr.Start; off < fr.End; off += hostarch.PageSize {
-		e, hasExtent, hash, hasHash := s.baseCursor.Lookup(off)
+		var (
+			e         checkpointimage.Extent
+			hasExtent bool
+			hash      uint64
+			hasHash   bool
+		)
+		if s.base != nil {
+			e, hasExtent, hash, hasHash = s.baseCursor.Lookup(off)
+		}
 		if s.isClean(off) {
 			flushRun(off)
+			if s.precopy != nil {
+				if pagesOff, h, hasCopy, _ := s.precopy.lookup(off); hasCopy {
+					s.appendHash(h)
+					s.appendExtent(memmap.FileRange{Start: off, End: off + hostarch.PageSize}, 0, pagesOff)
+					s.precopyBytes += hostarch.PageSize
+					continue
+				}
+			}
 			if !hasHash {
 				// Not committed in base, hence zero then and now.
 				hash = zeroPageXXH64
