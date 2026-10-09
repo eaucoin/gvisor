@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 )
@@ -48,6 +49,11 @@ type Options struct {
 	CgoEnabled            bool
 	PluginNetwork         bool
 	VendorSyscalls        precompiledseccomp.VarSyscallNumbers
+
+	// InternalWriteTracking is true if the Sentry tracks the writes through
+	// its internal mappings of MemoryFiles
+	// (pgalloc.EnableInternalWriteTracking).
+	InternalWriteTracking bool
 }
 
 // vendorSyscalls is the set of vendor-specific syscalls that the Sentry may
@@ -92,6 +98,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
 	fmt.Fprintf(&sb, "PluginNetwork=%t ", opt.PluginNetwork)
 	fmt.Fprintf(&sb, "VendorSyscalls=%q ", opt.VendorSyscalls.Key())
+	fmt.Fprintf(&sb, "InternalWriteTracking=%t ", opt.InternalWriteTracking)
 	return strings.TrimSpace(sb.String())
 }
 
@@ -187,6 +194,9 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	}
 	if opt.PluginNetwork {
 		s.Merge(plugin.SeccompFilters())
+	}
+	if opt.InternalWriteTracking {
+		s.Merge(hostmm.WriteTrackingSyscallRules())
 	}
 
 	s.Merge(opt.Platform.SyscallFilters(vars))
