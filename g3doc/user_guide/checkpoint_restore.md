@@ -364,6 +364,25 @@ runsc --dirty-tracking=wp run <container id>
 runsc checkpoint --image-path=<path> --precopy=on --direct <container id>
 ```
 
+A container that writes memory faster than half the checkpoint's write speed
+keeps the rounds from converging. With `--precopy-throttle=on`, the first round
+that does not halve the memory left to write does not stop the rounds: from
+then on until the checkpoint completes, each process may dirty memory at most
+at a quarter of the write speed measured, and the processes that write faster
+are delayed after the page faults that record their first writes, as QEMU's
+dirty-limit does for vCPUs. The rounds then converge, at the cost of slowing
+those processes during the checkpoint. Throttling requires
+`--dirty-tracking=wp`.
+
+`--dirty-tracking=wp` records first writes to huge pages whole, a write
+dirtying 2 MiB (see `--dirty-tracking-unit`). Where the application's memory
+is backed by huge pages (`--app-huge-pages`, the default, on a host whose
+transparent huge pages back shared memory), scattered writes therefore leave
+far more memory to write after each round than they wrote, and the rounds
+converge only when the container writes rarely or close together;
+`--app-huge-pages=false` lets them converge as with small pages, without huge
+pages' faster memory accesses.
+
 The rounds write the memory of the container's processes and of its
 memory-backed filesystems, and the files that a checkpoint saves with it from
 filesystems backed by a file on disk: overlays with the `self` medium (the
@@ -401,9 +420,11 @@ These metrics (see [observability](observability.md)) describe pre-copies:
     checkpoints that completed a pre-copy.
 -   `/checkpoint/precopy_longest_stall`: a distribution, over pre-copies, of
     the longest time that a pre-copy kept tasks from running while the
-    container ran: to start dirty tracking, at the first checkpoint, or to
+    container ran: to start dirty tracking, at the first checkpoint, to
     re-arm it for a round, which `--dirty-tracking=wp` does with tasks
-    stopped.
+    stopped, or to throttle a task's dirtying.
+-   `/checkpoint/precopy_throttled_ns`: the time that throttling delayed
+    tasks.
 
 [Incremental checkpoints](../proposals/incremental_checkpoints.md#pre-copy)
 describes the design and its measurements.
