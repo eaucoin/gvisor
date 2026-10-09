@@ -270,6 +270,10 @@ type Systrap struct {
 	// the Sentry. Since memoryFile is platform-private, it is never restored,
 	// so it is safe to call memoryFile.FD() rather than memoryFile.DataFD().
 	memoryFile *pgalloc.MemoryFile
+
+	// trackWrites is true if the platform tracks writes; see
+	// write_tracking.go.
+	trackWrites bool
 }
 
 // MinUserAddress implements platform.MinUserAddress.
@@ -291,6 +295,17 @@ func New(opts platform.Options) (*Systrap, error) {
 		maxSysmsgThreads = runtime.GOMAXPROCS(0)
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
+	}
+
+	if opts.WriteTrackingProcFS != nil && !writeTrackingEnabled() {
+		// The stub seccomp filter allows userfaultfd only with write
+		// tracking, and every stub inherits the filter of the first.
+		if globalPool.source != nil {
+			return nil, fmt.Errorf("write tracking must be enabled before the first stub is created")
+		}
+		if err := enableWriteTracking(opts.WriteTrackingProcFS.FD()); err != nil {
+			return nil, fmt.Errorf("enabling write tracking: %w", err)
+		}
 	}
 
 	mf, err := createMemoryFile()
@@ -328,6 +343,18 @@ func New(opts platform.Options) (*Systrap, error) {
 		// The source subprocess is never released explicitly by a MM.
 		source.DecRef(nil)
 
+		if writeTrackingEnabled() {
+			// Check that stubs can track writes now rather than at the
+			// application's first mapping.
+			source.writes.mu.Lock()
+			err := source.setUpWriteTrackingLocked()
+			source.writes.mu.Unlock()
+			if err != nil {
+				stubErr = fmt.Errorf("initialize systrap write tracking: %w", err)
+				return
+			}
+		}
+
 		globalPool.source = source
 
 		initSysmsgThreadPriority()
@@ -351,6 +378,7 @@ func New(opts platform.Options) (*Systrap, error) {
 	return &Systrap{
 		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: memBarrier},
 		memoryFile:                 mf,
+		trackWrites:                writeTrackingEnabled(),
 	}, nil
 }
 
@@ -405,6 +433,7 @@ func (*constructor) Requirements() platform.Requirements {
 	return platform.Requirements{
 		RequiresCapSysPtrace:      true,
 		FrequentHostThreadWakeups: true,
+		WriteTracking:             platform.WriteTrackingPlatform,
 	}
 }
 

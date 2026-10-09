@@ -186,6 +186,9 @@ type subprocess struct {
 
 	// dead indicates whether the subprocess is alive or not.
 	dead atomicbitops.Bool
+
+	// writes is the stub's write tracking state; see write_tracking.go.
+	writes stubWriteTracking
 }
 
 var seccompNotifyIsSupported = false
@@ -368,6 +371,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 		threadContextPool: pool.Pool{Start: 0, Limit: maxGuestContexts},
 		memoryFile:        memoryFile,
 		sysmsgThreads:     make(map[uint32]*sysmsgThread),
+		writes:            stubWriteTracking{uffd: -1, pagemap: -1},
 	}
 	sp.subprocessRefs.InitRefs()
 	runtime.LockOSThread()
@@ -516,6 +520,9 @@ func (s *subprocess) release() {
 	if s.alive() {
 		globalPool.markAvailable(s)
 		return
+	}
+	if writeTrackingEnabled() {
+		s.releaseWriteTracking()
 	}
 	if s.syscallThread != nil {
 		if s.syscallThread.seccompNotify != nil {
@@ -1058,6 +1065,14 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	if writeTrackingEnabled() {
+		return s.mapFileTracked(addr, f, fr, at, precommit)
+	}
+	return s.mapFile(addr, f, fr, at, precommit)
+}
+
+// mapFile maps fr of f at addr in the stub.
+func (s *subprocess) mapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	fd, err := f.DataFD(fr)
 	if err != nil {
 		return err
@@ -1079,6 +1094,15 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
+	if writeTrackingEnabled() {
+		s.unmapTracked(addr, length)
+		return
+	}
+	s.munmap(addr, length)
+}
+
+// munmap unmaps [addr, addr+length) in the stub.
+func (s *subprocess) munmap(addr hostarch.Addr, length uint64) {
 	_, err := s.syscall(
 		unix.SYS_MUNMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},

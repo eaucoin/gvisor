@@ -250,7 +250,11 @@ func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
 
 // Flags implements platform.Constructor.Flags().
 func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{}
+	return platform.Requirements{
+		// Guest-physical memory is the Sentry's address space: the
+		// application writes to MemoryFiles through the Sentry's mappings.
+		WriteTracking: platform.WriteTrackingInternalMappings,
+	}
 }
 
 func init() {

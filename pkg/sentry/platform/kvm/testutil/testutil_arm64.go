@@ -40,6 +40,11 @@ func SetTestTarget(regs *arch.Registers, fn uintptr) {
 	regs.Pc = uint64(fn)
 }
 
+// SetStoreTarget sets the address that the store function stores to.
+func SetStoreTarget(regs *arch.Registers, addr uintptr) {
+	regs.Regs[8] = uint64(addr)
+}
+
 // SetTouchTarget sets rax appropriately.
 func SetTouchTarget(regs *arch.Registers, target *uintptr) {
 	if target != nil {
