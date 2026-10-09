@@ -522,6 +522,21 @@ Gateway and others), the file is `s3_opts.json`:
     cannot, so configure the bucket to delete incomplete multipart uploads
     after a day, as stores allow with a lifecycle rule.
 
+## Working sets
+
+After a restore, gVisor records which memory the application touches, in the
+order it touches it, for `--working-set-window` (3 seconds by default, ended
+early by a checkpoint; 0 disables recording), in units of `--working-set-unit`
+(`64K` by default, or `4K`, which records no memory that was not touched at the
+cost of a page fault for every page touched while recording). The next
+checkpoint saves this working set in its image; a checkpoint of a sandbox that
+was not restored since keeps the set it was restored with.
+
+The restore's log reports how much of what the application touched the
+restored image's working set held, and how much of it was not touched; the
+metrics `/checkpoint/working_set_hit_bytes`, `/checkpoint/working_set_miss_bytes`
+and `/checkpoint/working_set_unused_bytes` count the same.
+
 ## Networking
 
 Checkpoint/restore is supported with `--network=sandbox` (default),

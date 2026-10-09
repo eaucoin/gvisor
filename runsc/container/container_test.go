@@ -2249,6 +2249,95 @@ func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePat
 	}
 }
 
+// TestCheckpointRestoreWorkingSet checks that the working set recorded after a
+// restore is saved in the next image, which a background restore loads first,
+// and that an image of a sandbox never restored has none.
+func TestCheckpointRestoreWorkingSet(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			outputPath := filepath.Join(dir, "output")
+			script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.1; done`, 4<<20, outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			// checkpoint runs the container, started or, if from is not
+			// empty, restored from the image in from, until its output file
+			// is not empty, and checkpoints it to a new image directory,
+			// which it returns with the image.
+			checkpoint := func(from string) (string, *checkpointimage.Image) {
+				t.Helper()
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+				defer outputFile.Close()
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if from == "" {
+					err = cont.Start(conf)
+				} else {
+					err = cont.Restore(conf, from, nil /* layerPaths */, false /* direct */, true /* background */, nil /* networkArgs */)
+				}
+				if err != nil {
+					t.Fatalf("error starting or restoring container: %v", err)
+				}
+				if err := waitForFileNotEmpty(outputFile); err != nil {
+					t.Fatalf("Failed to wait for output file: %v", err)
+				}
+				imagePath, err := os.MkdirTemp(dir, "image")
+				if err != nil {
+					t.Fatalf("os.MkdirTemp failed: %v", err)
+				}
+				if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				if err := os.Remove(outputPath); err != nil {
+					t.Fatalf("error removing file: %v", err)
+				}
+				img, err := checkpointimage.ReadMetadataFile(filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName))
+				if err != nil {
+					t.Fatalf("error reading the image's metadata: %v", err)
+				}
+				return imagePath, img
+			}
+
+			parent, img := checkpoint("")
+			if ws := img.Proto.GetWorkingSet(); ws != nil {
+				t.Errorf("image of a sandbox never restored has a working set of %d extents", len(ws.GetExtents()))
+			}
+			child, img := checkpoint(parent)
+			ws := img.Proto.GetWorkingSet()
+			if len(ws.GetExtents()) == 0 {
+				t.Fatalf("image of a restored sandbox has no working set")
+			}
+			if unit := ws.GetUnit(); unit != uint64(conf.WorkingSetUnit) {
+				t.Errorf("working set unit = %d, want %d", unit, conf.WorkingSetUnit)
+			}
+			// child, whose image has a working set, restores.
+			checkpoint(child)
+		})
+	}
+}
+
 // firstLine returns the first complete line of the file at path.
 func firstLine(path string) (string, error) {
 	data, err := os.ReadFile(path)

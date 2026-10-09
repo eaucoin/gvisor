@@ -976,9 +976,12 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	memoryStart := time.Now()
 
 	// Private MemoryFiles are saved after the application MemoryFile, in the
-	// order the image records.
+	// order the image records. The image carries the application MemoryFile's
+	// working set; a checkpoint ends its recording.
+	k.mf.StopWorkingSetRecording()
 	image := &pgallocpb.ImageProto{
-		Layers: []*pgallocpb.LayerProto{{}},
+		Layers:     []*pgallocpb.LayerProto{{}},
+		WorkingSet: k.mf.WorkingSet(),
 	}
 	if delta != nil {
 		image.Layers = append(image.Layers, delta.layers()...)
