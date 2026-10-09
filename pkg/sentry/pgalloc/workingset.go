@@ -30,10 +30,12 @@ import (
 
 // After a restore, a MemoryFile can record the pages that its users touch
 // first, in the order that they touch them: its working set. A checkpoint
-// saves the latest working set in the image (ImageProto.working_set).
-// MemoryFile offsets are saved state, so the set recorded after restoring an
-// image is what a restore of the next image that the sandbox saves touches
-// first.
+// saves the latest working set in the image (ImageProto.working_set), and a
+// background restore of that image reads it before the rest of the pages
+// file (see asyncMemoryFileLoad.prefetch), as REAP does for snapshots of
+// functions (Ustiugov et al., ASPLOS 2021). MemoryFile offsets are saved
+// state, so the set recorded after restoring an image is what a restore of the
+// next image that the sandbox saves touches first.
 //
 // Touches are mappings of pages into application address spaces (mm calls
 // RecordTouch), which see every page that an application touches after a
@@ -47,8 +49,8 @@ import (
 const maxWorkingSetExtents = 1 << 16
 
 // Metrics of working sets, so that their value is observable per deployment:
-// the hit rate of a restored image's working set is hit / (hit + miss). They
-// are updated when recording ends.
+// REAP's hit rate is hit / (hit + miss), and unused bytes were prefetched in
+// vain. They are updated when recording ends.
 var (
 	workingSetHitBytes = metric.MustCreateNewUint64Metric("/checkpoint/working_set_hit_bytes", metric.Uint64Metadata{
 		Cumulative:  true,
