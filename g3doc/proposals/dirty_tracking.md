@@ -163,6 +163,110 @@ disabled, and none when it is enabled. Disabling costs nothing when tracking
 is off: `MapInternal` and `MarkDirtyBy` read the disabled path, one atomic
 load, only for tracked MemoryFiles.
 
+## Dirty source: Sentry write-protection
+
+The first source, `kernel.WriteProtectDirtySource` ("wp", in
+`pkg/sentry/mm/dirty.go`), needs nothing from the platform or the host: gVisor
+already intercepts every application fault in the Sentry, and `mm.Fork`
+already arms copy-on-write by withholding write permission from pmas and
+unmapping them. wp does the same to record first writes.
+
+### Arming
+
+`MemoryManager.ArmDirtyTracking(unit)`, called by the source's `Arm` for every
+MemoryManager (the kernel is paused so that it reaches those of tasks in the
+middle of `execve`), sets `pma.dirtyArmed` on every pma that maps a tracked
+MemoryFile, private and shared alike, and withholds Write from its
+`effectivePerms` and `maxPerms`. The pmas that were writable are unmapped from
+the AddressSpace once per vma, spanning the pmas between them, rather than once
+per pma: after an epoch every written unit is a pma of its own, and unmapping
+each costs a host syscall on systrap and an invalidation on kvm (one unmap per
+pma held the MemoryManager's lock for up to 286 ms at a 4 KiB unit with tens of
+thousands of written units). The pmas that the previous epoch split are merged
+back; the merge rule compares `dirtyArmed`.
+
+`dirtyArmed` is distinct from `needCOW`, whose semantics include copying, and
+is saved with the permissions it withholds: a pma restored without it would
+keep Write withheld with nothing to restore it.
+
+### First writes
+
+A write to an armed pma, by the application (a fault) or by the Sentry on its
+behalf (`CopyOut` falls off `existingPMAsLocked`'s fast path, which checks
+`effectivePerms`), reaches `getPMAsInternalLocked`. There, the pma is split
+around the *tracking units* that the write overlaps, which are marked dirty
+in the MemoryFile and made writable again from the vma's permissions; the
+write proceeds as usual. Units are aligned to the unit size, 64 KiB by
+default, and to the huge page for huge pmas.
+
+Every path that grants Write respects the flag: new pmas of a tracked
+MemoryFile are created armed (and revisited, so that the write that created
+them is recorded); copy-on-write copies are marked by `MapInternal` and start
+disarmed; taking ownership of a copy-on-write page without copying keeps the
+pma armed; `mprotect(2)` withholds Write from armed pmas; `mremap(2)` moves
+pmas with their state. mm's cached internal mappings come from
+`MapInternalUntracked`, so that obtaining them neither marks whole pmas nor
+carries them into the next epoch: the permission check tracks the writes
+through them.
+
+### Units and cost
+
+A first write on systrap costs a stub fault, a round trip to the Sentry, an
+`mmap(2)` injected into the stub, and the host faulting the unit's pages in
+again (about 1.5 µs each). Larger units fault less often per page and record
+more pages; saves that compare page hashes with the parent image's refine
+dirty units back to the pages that changed, which makes a 64 KiB unit as
+precise as a 4 KiB one in practice.
+
+Measured on systrap (4 shared vCPUs, Linux 6.8), with 256 MiB written at
+random after a checkpoint, median of 3; the prototype's numbers in
+parentheses:
+
+Unit   | First write, per page | Arming 256 MiB, all written (pause included)
+------ | --------------------- | --------------------------------------------
+4 KiB  | 26.1 µs (22–27)       | 20–21 ms
+64 KiB | 3.9 µs (3.7–4.1)      | 11–24 ms
+2 MiB  | 1.7 µs (1.7)          | —
+
+An untracked write costs 21 ns. On the prototype, a Python step building a
+dataframe (0.22 s untracked) took 0.71 s at 4 KiB and 0.31 s at 64 KiB, and a small edit
+whose content diff is 1.9 MiB recorded 3.7 MiB at 4 KiB, 21.5 MiB at 64 KiB,
+and 2.0 MiB at 64 KiB with hash refinement. A program rewriting 128 MiB/s pays
+33 ms per 12.8 MiB at 64 KiB: acceptable between checkpoints, and the reason
+for userfaultfd write-protection, a host-level source, under pre-copy.
+
+### On kvm
+
+Nothing is platform-specific: a first write is a guest page fault, the same
+`getPMAsInternalLocked` path, and a guest page table update, with no host
+`mmap(2)` and no host re-fault, so it should cost less than on systrap. kvm's
+`MapUnit` is 16 MiB, but an isolated unit's pma bounds what a fault maps.
+Arming invalidates the guest TLBs once per unmapped range, so coalescing
+unmaps matters there too. kvm's `AddressSpace.MapFile` obtains host addresses
+with `MapInternal`, so mapping a disarmed unit writable marks it again
+(harmless) and, when the epoch ends while tasks run (pre-copy), carries it
+into the next epoch.
+
+### Configuration
+
+-   `--dirty-tracking=off|auto|wp` (default `off`): `wp` selects this source;
+    `auto` selects the best available.
+-   `--dirty-tracking-unit` (default 64 KiB): the tracking unit, a power of 2
+    of at least a page.
+-   `--dirty-tracking-verify=off|hash` (default `off`): with `hash`, every
+    checkpoint verifies tracking and fails on an escape.
+-   `--TESTONLY-dirty-tracking-break=none|mapinternal|decommit|tmpfs|iouring|fault|arm`
+    disables one marking path, for container tests that check that
+    verification catches it; `fault` and `arm` are this source's first-write
+    mark and its arming.
+
+The syscall tests' `_save_verify` variants run every test, on every platform,
+with `--dirty-tracking=wp --dirty-tracking-verify=hash` and a save after
+every test, and `_save_verify_4k`, on the default platform, at a 4 KiB unit.
+An autosave that verification fails ends the sandbox with exit status 1, so
+that the test fails: the image is complete, and the test would otherwise go
+on from it.
+
 ## Alternatives considered
 
 -   **A KVM dirty log** (`KVM_MEM_LOG_DIRTY_PAGES`) sees only guest writes on

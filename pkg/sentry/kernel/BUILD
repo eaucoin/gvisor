@@ -257,6 +257,7 @@ go_library(
         "cgroup_v2_mutex.go",
         "context.go",
         "dirty.go",
+        "dirty_wp.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
