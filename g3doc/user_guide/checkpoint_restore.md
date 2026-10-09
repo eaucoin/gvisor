@@ -118,7 +118,9 @@ store that serves reads in parallel, such as an object store behind the
 checkpoint gofer, it does not wait for them at all. Loading starts with four reads in flight and grows
 until reads begin to queue, as TCP's slow start does. The log line "Async page
 loading completed" reports how many times and how long the application waited
-for pages.
+for pages, as do the metrics `/checkpoint/async_load_waits`,
+`/checkpoint/async_load_wait_bytes` and `/checkpoint/async_load_wait_nanoseconds`
+(see [observability](observability.md)).
 
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means
