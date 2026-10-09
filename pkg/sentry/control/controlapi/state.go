@@ -86,6 +86,11 @@ type SaveOpts struct {
 	// for this checkpoint operation. When nil, the sandbox's configured state
 	// engine is used.
 	GraphEngine *bool `json:"graph_engine,omitempty"`
+
+	// ParentImageDigest, if not empty, makes the save incremental: it is the
+	// digest (checkpointimage.Digest.String) of the image the sandbox was last
+	// saved to or restored from, of which the save writes only the changes.
+	ParentImageDigest string `json:"parent_image_digest"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
