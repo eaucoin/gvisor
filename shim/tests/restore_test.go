@@ -30,6 +30,7 @@ import (
 	tasktype "github.com/containerd/containerd/api/types/task"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -356,6 +357,122 @@ func TestRestoreSubcontainerBeforeRoot(t *testing.T) {
 	// The create left a sandbox running, with nothing restored into it.
 	if _, err := restoredClient.Kill(t.Context(), &task.KillRequest{ID: sandbox.ID(), Signal: 9, All: true}); err != nil {
 		t.Logf("failed to kill sandbox %s: %v", sandbox.ID(), err)
+	}
+}
+
+// TestRestoreIncremental verifies incremental checkpoints over the shim: a
+// sandbox that tracks dirty pages is checkpointed in full, then incrementally,
+// of the full checkpoint (gVisor's CheckpointRequest.parent_image_path); the
+// incremental image refers to the full one for the pages it does not hold,
+// and the sandbox is restored from it through containerd's create request,
+// whose parent checkpoint lets runsc find the full one.
+func TestRestoreIncremental(t *testing.T) {
+	rootTmp, err := os.MkdirTemp("/tmp", "runsc-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(rootTmp)
+	})
+	containerd := shimutils.NewMockContainerd(t, map[string]any{
+		"root": rootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+		"dirty-tracking": "wp",
+	})
+	markerDir, err := os.MkdirTemp(testutil.TmpDir(), "markers-")
+	if err != nil {
+		t.Fatalf("failed to create marker dir: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(markerDir)
+	})
+	marker := markerPath(markerDir, "sandbox")
+	spec := shimutils.NewSandboxSpec()
+	spec.Process.Args = markerArgs(marker)
+	runAsMappedRoot(spec)
+	sandbox, _ := setupSandboxWithSpec(t, containerd, spec)
+	if err := waitForMarker(t.Context(), marker); err != nil {
+		t.Fatalf("sandbox did not start: %v", err)
+	}
+
+	gvisorClient := containerd.GetTTRPCClient(t)
+	checkpoint := func(req *pb.CheckpointRequest) {
+		t.Helper()
+		if err := gvisorClient.Call(t.Context(), "gvisor.task.TaskService", "Checkpoint", req, &pb.CheckpointResponse{}); err != nil {
+			t.Fatalf("failed to checkpoint sandbox: %v", err)
+		}
+	}
+	parentPath, err := os.MkdirTemp(containerd.WorkingDir(), "checkpoint-full-")
+	if err != nil {
+		t.Fatalf("failed to create checkpoint dir: %v", err)
+	}
+	checkpoint(&pb.CheckpointRequest{
+		Id:           sandbox.ID(),
+		ImagePath:    parentPath,
+		LeaveRunning: true,
+		Compression:  "none",
+	})
+	imagePath, err := os.MkdirTemp(containerd.WorkingDir(), "checkpoint-incremental-")
+	if err != nil {
+		t.Fatalf("failed to create checkpoint dir: %v", err)
+	}
+	checkpoint(&pb.CheckpointRequest{
+		Id:              sandbox.ID(),
+		ImagePath:       imagePath,
+		Compression:     "none",
+		ParentImagePath: parentPath,
+	})
+	img, err := checkpointimage.ReadMetadataFile(filepath.Join(imagePath, "pages_meta.img"))
+	if err != nil {
+		t.Fatalf("failed to read the incremental image: %v", err)
+	}
+	parentDigest, err := checkpointimage.FileDigest(filepath.Join(parentPath, "pages_meta.img"))
+	if err != nil {
+		t.Fatalf("failed to read the full image: %v", err)
+	}
+	if layers := img.Layers(); len(layers) != 2 || layers[1].Digest != parentDigest {
+		t.Fatalf("incremental image's layers: got %+v, want itself and %v", layers, parentDigest)
+	}
+
+	restoredRootTmp, err := os.MkdirTemp("/tmp", "runsc-restore-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root for restore: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(restoredRootTmp)
+	})
+	restored := shimutils.NewMockContainerdWithSuffix(t, "restore", map[string]any{
+		"root": restoredRootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	if err := restored.StartShim(t, sandbox); err != nil {
+		t.Fatalf("failed to start shim for restore: %v", err)
+	}
+	restoredClient := restored.GetClient(t)
+	restoredOpts, err := restored.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options for restore: %v", err)
+	}
+	createReq := &task.CreateTaskRequest{
+		ID:               sandbox.ID(),
+		Bundle:           sandbox.Bundle(),
+		Options:          restoredOpts,
+		Checkpoint:       imagePath,
+		ParentCheckpoint: parentPath,
+	}
+	if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
+		t.Fatalf("failed to create %s from the incremental checkpoint: %v", sandbox.ID(), err)
+	}
+	if err := startAndWaitForContainer(t.Context(), restoredClient, sandbox.ID(), restored); err != nil {
+		t.Fatalf("failed to restore %s: %v", sandbox.ID(), err)
+	}
+	if err := checkMarker(marker); err != nil {
+		t.Errorf("sandbox was restarted, not restored: %v", err)
+	}
+	if err := killAndWaitForContainer(t.Context(), restoredClient, sandbox.ID(), restored); err != nil {
+		t.Fatalf("failed to kill and wait for restored sandbox: %v", err)
 	}
 }
 

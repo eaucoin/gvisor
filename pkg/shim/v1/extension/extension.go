@@ -45,6 +45,11 @@ type RestoreConfig struct {
 	ImagePath  string
 	Direct     bool
 	Background bool
+
+	// LayerPaths are directories in which runsc looks for the images that
+	// are layers of the image at ImagePath, such as the parent of an
+	// incremental checkpoint.
+	LayerPaths []string
 }
 
 // Process is the interface representing a process inside the container.

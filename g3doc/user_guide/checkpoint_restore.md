@@ -399,6 +399,23 @@ checkpoint stays `CREATED`, as CRI wants it, until the kubelet's
 `StartContainer` restores it, and the sandbox resumes once all of its
 containers are restored.
 
+### Incremental checkpoints through the shim
+
+containerd's task service carries no parent for a checkpoint, so incremental
+checkpoints (see above) go through gVisor's own task service,
+`gvisor.task.TaskService`, on the shim's socket: its `CheckpointRequest` takes
+`parent_image_path`, passed on as `runsc checkpoint --parent-image-path`, and
+`compression = "none"`, which incremental checkpoints require. The sandbox must
+run with `dirty-tracking = "wp"` in its runsc options.
+
+To restore such a checkpoint, containerd's `CreateTaskRequest.parent_checkpoint`,
+which runc passes to CRIU as the parent images of the checkpoint being
+restored, names where the images that the checkpoint refers to are: the shim
+passes it on as `runsc restore --layer-path`, so it is either the parent image
+of a checkpoint whose parent was itself a full checkpoint, or a directory of
+image directories named by their identity, which holds every image of a longer
+chain.
+
 ### Restoring a pod from its annotations
 
 On Kubernetes versions whose CRI has no `RestorePod`, the kubelet never sets
