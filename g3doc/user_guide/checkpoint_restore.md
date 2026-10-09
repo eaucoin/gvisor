@@ -342,6 +342,72 @@ of its first image, when one incremental checkpoint exceeds half of the image
 (a full checkpoint then costs about as much), or when the chain is deeper than
 16 images.
 
+## Pre-copy
+
+A checkpoint pauses the container while it writes its memory. With
+`--precopy=on` (or `auto`), `runsc checkpoint` first writes memory while the
+container runs, in rounds: the first writes all of memory (or, with
+`--parent-image-path`, the memory written since the parent), and each next
+round writes the memory written during the previous one, as VM live migration
+does. Rounds stop when the memory written during the last one would take at
+most `--precopy-budget` (100 ms by default) to write, at the speed measured
+during that round; after `--precopy-max-rounds` rounds (8); or when a round
+does not halve the memory left to write, as when the container writes memory
+at least half as fast as the checkpoint can write it, where more rounds would
+only write the same memory again. Then the container is paused, and the
+checkpoint writes only the memory written since the last round, besides the
+rest of its state. The image refers to the latest copy of every page, and is
+restored as any other.
+
+```bash
+runsc --dirty-tracking=wp run <container id>
+runsc checkpoint --image-path=<path> --precopy=on --direct <container id>
+```
+
+The rounds write the memory of the container's processes and of its
+memory-backed filesystems, and the files that a checkpoint saves with it from
+filesystems backed by a file on disk: overlays with the `self` medium (the
+root filesystem's by default) or `dir=` (`--overlay2`), and tmpfs mounts so
+backed.
+
+Pre-copy requires `--dirty-tracking` and an uncompressed image. It pays when
+writing memory takes longer than the budget, as with large containers or slow
+stores. `--precopy=auto` skips the rounds when the last write speed measured,
+by a checkpoint or a pre-copy round of the same container, says that the pause
+would write memory within the budget anyway; the first checkpoint, which has
+no such measure, runs the first round, which measures it (and stops the
+rounds after it if memory fits the budget, since the round then lasted at
+most the budget). The speed is the container's own, whatever the store: a
+container checkpointed to a fast disk and then to a slow store first skips
+pre-copy when it would have paid. A restored container measures it anew. The
+pause also includes saving the rest of the container's state, which does not
+depend on its memory size. `--direct` is recommended: writes with `O_DIRECT`
+cost a third of buffered ones per MiB.
+
+These metrics (see [observability](observability.md)) describe pre-copies:
+
+-   `/checkpoint/precopy_rounds` and `/checkpoint/precopy_bytes`: the rounds
+    run, and the bytes they wrote.
+-   `/checkpoint/precopy_round_bytes` and `/checkpoint/precopy_pending_bytes`:
+    distributions of the bytes that each round wrote, and of the bytes left to
+    write after it.
+-   `/checkpoint/pages_write_cost`: the time per MiB that the last checkpoint
+    or round that wrote at least 1 MiB took to write, which the stop rule and
+    `--precopy=auto` use.
+-   `/checkpoint/precopy_stops`: pre-copies by why their rounds stopped
+    (`reason`: `converged`, `round_cap`, `not_halved`, or `skipped` by
+    `--precopy=auto`).
+-   `/checkpoint/precopy_pause`: a distribution of the pauses of the
+    checkpoints that completed a pre-copy.
+-   `/checkpoint/precopy_longest_stall`: a distribution, over pre-copies, of
+    the longest time that a pre-copy kept tasks from running while the
+    container ran: to start dirty tracking, at the first checkpoint, or to
+    re-arm it for a round, which `--dirty-tracking=wp` does with tasks
+    stopped.
+
+[Incremental checkpoints](../proposals/incremental_checkpoints.md#pre-copy)
+describes the design and its measurements.
+
 ## How to use checkpoint/restore in Docker:
 
 Run a container:
