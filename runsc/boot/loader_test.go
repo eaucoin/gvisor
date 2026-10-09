@@ -698,8 +698,8 @@ func TestSignalUnkillablePolicyMapping(t *testing.T) {
 // --TESTONLY-dirty-tracking-break disables a path of its own.
 func TestDirtyMarkPaths(t *testing.T) {
 	seen := make(map[pgalloc.DirtyMarkPath]config.DirtyTrackingBreak)
-	// DirtyTrackingBreakArm is the last value.
-	for b := config.DirtyTrackingBreakNone; b <= config.DirtyTrackingBreakArm; b++ {
+	// DirtyTrackingBreakUffdUnmap is the last value.
+	for b := config.DirtyTrackingBreakNone; b <= config.DirtyTrackingBreakUffdUnmap; b++ {
 		p, ok := dirtyMarkPaths[b]
 		if !ok {
 			t.Errorf("--TESTONLY-dirty-tracking-break=%v disables no path", b)

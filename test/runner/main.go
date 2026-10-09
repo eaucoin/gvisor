@@ -80,6 +80,7 @@ var (
 	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
 	dirtyVerify      = flag.Bool("dirty-tracking-verify", false, "enables dirty tracking, verified at every save: saves fail if a page changed without being tracked")
 	dirtyUnit        = flag.Uint64("dirty-tracking-unit", 0, "with --dirty-tracking-verify, the size in bytes of the units in which dirty tracking records first writes; 0 for runsc's default")
+	dirtyTracking    = flag.String("dirty-tracking", "wp", "dirty source of -dirty-tracking-verify and -save-incremental")
 	saveIncremental  = flag.Bool("save-incremental", false, "with -save, makes saves incremental, of the image the sandbox was restored from, in chains of at most incrementalChainLength images that each start with a full save, and restores from the chain of images")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
@@ -467,7 +468,7 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		args = append(args, "-in-sandbox-cgroup="+*inSandboxCgroup)
 	}
 	if *dirtyVerify || *saveIncremental {
-		args = append(args, "-dirty-tracking=wp")
+		args = append(args, "-dirty-tracking="+*dirtyTracking)
 	}
 	if *dirtyVerify {
 		args = append(args, "-dirty-tracking-verify=hash")
