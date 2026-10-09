@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"testing"
@@ -475,6 +476,14 @@ type testPagesFileOpts struct {
 	// an object store serving parallel requests.
 	channels int
 
+	// If contention is positive, the device's channels share its resources,
+	// as an object store's requests share its CPUs: a read transfers at
+	// bandwidth times n to the power -contention, n being the number of reads
+	// transferring when it is submitted, itself included, so that n reads
+	// deliver n to the power 1-contention times one read's bandwidth, and each
+	// takes longer than one alone.
+	contention float64
+
 	// If manual is true, virtual time advances only when the test calls
 	// advance; otherwise Wait advances it to the completion it waits for.
 	manual bool
@@ -642,7 +651,17 @@ func (r *testPagesFile) submit(id int, off int64, length uint64, dst stateio.Loc
 	start := max(r.now, r.channelFree[ch])
 	var transfer time.Duration
 	if r.opts.bandwidth != 0 {
-		transfer = time.Duration(length * uint64(time.Second) / r.opts.bandwidth)
+		bandwidth := float64(r.opts.bandwidth)
+		if r.opts.contention > 0 {
+			n := 1
+			for _, rd := range r.inflight {
+				if rd.completed-r.opts.latency > start {
+					n++
+				}
+			}
+			bandwidth *= math.Pow(float64(n), -r.opts.contention)
+		}
+		transfer = time.Duration(float64(length) * float64(time.Second) / bandwidth)
 	}
 	r.channelFree[ch] = start + transfer
 	rd := &testRead{
