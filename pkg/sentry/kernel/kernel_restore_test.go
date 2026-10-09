@@ -17,13 +17,14 @@ package kernel
 import (
 	"bytes"
 	"errors"
-	"io"
 	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
@@ -33,8 +34,8 @@ func TestAsyncMFLoaderStartupError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// A sub-page read limit fails before metadata or mainMF is loaded.
 		pages := stateio.NewIOReader(bytes.NewReader(nil), 1, 1, 1)
-		metadata := io.NopCloser(bytes.NewReader(nil))
-		loader := NewAsyncMFLoader(metadata, pages, nil, nil, pgalloc.AsyncPagesFileLoadOpts{Throttled: true})
+		image := &checkpointimage.Image{Proto: &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{}}}}
+		loader := NewAsyncMFLoader(image, []stateio.AsyncReader{pages}, nil, nil, pgalloc.AsyncPagesFileLoadOpts{Throttled: true})
 		defer loader.Unthrottle()
 
 		startErr := loader.WaitMainMFStart()
