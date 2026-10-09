@@ -662,6 +662,12 @@ const (
 	// recorded (write_tracking.go): the Sentry's writes through
 	// MapInternalUntracked's mappings and, on kvm, the application's stores.
 	DirtyMarkUffdInternal
+
+	// DirtyMarkUffdUnmap is the mark made by a platform that tracks writes
+	// through its own mappings (platform.WriteTracker, on systrap) when it
+	// harvests a mapping that it is about to unmap or replace, which loses
+	// what write tracking recorded in it.
+	DirtyMarkUffdUnmap
 )
 
 // disabledDirtyMarkPath is the DirtyMarkPath disabled by
