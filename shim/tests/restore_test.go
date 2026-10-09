@@ -59,6 +59,10 @@ func TestRestoreSandbox(t *testing.T) {
 		// annotations restores from the restore annotations on the
 		// containers' specs, rather than from CreateTaskRequest.checkpoint.
 		annotations bool
+		// resourcesChanged restores the root container with a memory limit
+		// and an OOM score adjustment it was not checkpointed with, as a pod
+		// restored with a different memory request has.
+		resourcesChanged bool
 	}{
 		{
 			name: "root container only",
@@ -73,6 +77,10 @@ func TestRestoreSandbox(t *testing.T) {
 			subcontainers: 1,
 			named:         true,
 			annotations:   true,
+		},
+		{
+			name:             "resources changed",
+			resourcesChanged: true,
 		},
 		{
 			name:          "with subcontainer",
@@ -232,6 +240,18 @@ func TestRestoreSandbox(t *testing.T) {
 					annotateSpec(t, container.Bundle(), map[string]string{
 						"dev.gvisor.internal.restore.host-image-path": imagePath,
 						"dev.gvisor.internal.restore.background":      "true",
+					})
+				}
+				if tc.resourcesChanged && container == sandbox {
+					editSpec(t, container.Bundle(), func(spec *specs.Spec) {
+						// Kubernetes derives the OOM score adjustment of a
+						// burstable pod's containers from its memory request.
+						oomScoreAdj := 968
+						spec.Process.OOMScoreAdj = &oomScoreAdj
+						limit := int64(512 << 20)
+						spec.Linux.Resources = &specs.LinuxResources{
+							Memory: &specs.LinuxMemory{Limit: &limit},
+						}
 					})
 				}
 				if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
@@ -395,6 +415,14 @@ func TestRestoreAnnotationsMissingCheckpoint(t *testing.T) {
 // containerd does with the pod annotations its runtime passes on.
 func annotateSpec(t *testing.T, bundle string, annotations map[string]string) {
 	t.Helper()
+	editSpec(t, bundle, func(spec *specs.Spec) {
+		maps.Copy(spec.Annotations, annotations)
+	})
+}
+
+// editSpec changes the spec in a container's bundle with edit.
+func editSpec(t *testing.T, bundle string, edit func(*specs.Spec)) {
+	t.Helper()
 	path := filepath.Join(bundle, "config.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -404,7 +432,7 @@ func annotateSpec(t *testing.T, bundle string, annotations map[string]string) {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		t.Fatalf("failed to parse spec: %v", err)
 	}
-	maps.Copy(spec.Annotations, annotations)
+	edit(&spec)
 	if data, err = json.Marshal(&spec); err != nil {
 		t.Fatalf("failed to marshal spec: %v", err)
 	}
