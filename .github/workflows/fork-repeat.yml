@@ -1,0 +1,147 @@
+# Runs chosen tests of a branch many times, on demand: to tell a flaky test
+# from a broken one, to prove a fix to a flaky test, and to find, branch by
+# branch, the series that broke a test. The runners are set up as tier 2's
+# (fork-nightly.yml): unprivileged user namespaces allowed, /dev/kvm open for
+# the kvm platform, transparent huge pages for shared memory when asked for.
+# Posts no commit status.
+name: Fork repeat
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to test (main or a series/ branch)
+        required: true
+        default: main
+        type: string
+      suite:
+        description: How upstream's Makefile runs them (syscall-tests for //test/syscalls targets, which need runsc installed as a runtime)
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - syscall-tests
+      targets:
+        description: Bazel test targets, separated by spaces
+        required: true
+        type: string
+      options:
+        description: More Bazel options, quoted for the shell (e.g. --test_env=CGROUPV2=true '--test_filter=TestFoo' --test_arg=--test_platforms=kvm)
+        required: false
+        default: ""
+        type: string
+      runs:
+        description: Runs of each target (Bazel's --runs_per_test)
+        required: true
+        default: "20"
+        type: string
+      kvm:
+        description: Open /dev/kvm
+        required: false
+        default: false
+        type: boolean
+      thp:
+        description: Use transparent huge pages for shared memory
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}-${{ inputs.targets }}-${{ inputs.options }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+  # Test results stay out of the disk cache, so that each comes from a run.
+  TEST_OPTIONS: --modify_execution_info=TestRunner=+no-cache
+
+jobs:
+  repeat:
+    name: Repeat ${{ inputs.targets }} on ${{ inputs.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Give access to /dev/kvm
+        if: inputs.kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Use transparent huge pages for shared memory
+        if: inputs.thp
+        run: |
+          echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+          echo defer | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: resolve
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+          echo "base=$(git show origin/series/fork-infra:SERIES | awk '$1 == "base" {print $2}')" >>"${GITHUB_OUTPUT}"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-nightly-${{ steps.resolve.outputs.base }}-${{ steps.resolve.outputs.sha }}
+          restore-keys: |
+            bazel-nightly-${{ steps.resolve.outputs.base }}-
+      - name: Test
+        env:
+          REF: ${{ inputs.ref }}
+          SUITE: ${{ inputs.suite }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          TARGETS: ${{ inputs.targets }}
+          EXTRA: ${{ inputs.options }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          [[ "${RUNS}" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive number."; exit 1; }
+          echo "make ${SUITE}: ${TARGETS} at ${REF} (${SHA}), ${RUNS} runs each, options: ${EXTRA:-none}" >>"${GITHUB_STEP_SUMMARY}"
+          set +e
+          # tools/bazel.mk adds BAZEL_REMOTE_CACHE and TEST_OPTIONS; make
+          # would expand a "$" in the options (as in a test filter's regular
+          # expression), so it is doubled.
+          make "${SUITE}" TARGETS="${TARGETS}" OPTIONS="--runs_per_test=${RUNS} ${EXTRA//\$/\$\$}" 2>&1 |
+            tee "${RUNNER_TEMP}/test.log"
+          status=$?
+          set -e
+          # Bazel's summary: how many runs of each target passed.
+          if ! grep -E '^//.* (PASSED|FAILED|FLAKY|TIMEOUT|NO STATUS)' "${RUNNER_TEMP}/test.log" >"${RUNNER_TEMP}/summary"; then
+            echo "::error::No test ran."
+            exit 1
+          fi
+          sed 's/^/    /' "${RUNNER_TEMP}/summary" >>"${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Test logs
+        if: failure()
+        run: |
+          # The logs and outputs (runsc's own logs among them) of the runs that
+          # failed, kept as an artifact.
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
