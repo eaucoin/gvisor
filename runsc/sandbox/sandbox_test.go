@@ -88,49 +88,56 @@ func TestIsRunning(t *testing.T) {
 	}
 }
 
-func TestGetGCSURIFromImagePath(t *testing.T) {
+func TestCheckpointGoferURI(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	testCases := []struct {
-		name      string
-		content   string
-		writeOpts bool
-		want      string
+		name string
+		// optsFile and content are the options file written in the image
+		// path, if optsFile is not empty, and its contents.
+		optsFile string
+		content  string
+		want     string
 	}{
 		{
-			name:      "missing file",
-			writeOpts: false,
-			want:      "",
+			name: "missing file",
+			want: "",
 		},
 		{
-			name:      "invalid json",
-			content:   "not valid json",
-			writeOpts: true,
-			want:      "",
+			name:     "invalid json",
+			optsFile: checkpointGCSOptsFileName,
+			content:  "not valid json",
+			want:     "",
 		},
 		{
-			name:      "empty bucket",
-			content:   `{"bucket": ""}`,
-			writeOpts: true,
-			want:      "",
+			name:     "empty bucket",
+			optsFile: checkpointGCSOptsFileName,
+			content:  `{"bucket": ""}`,
+			want:     "",
 		},
 		{
-			name:      "bucket only",
-			content:   `{"bucket": "my-test-bucket"}`,
-			writeOpts: true,
-			want:      "gs://my-test-bucket",
+			name:     "bucket only",
+			optsFile: checkpointGCSOptsFileName,
+			content:  `{"bucket": "my-test-bucket"}`,
+			want:     "gs://my-test-bucket",
 		},
 		{
-			name:      "bucket with object prefix",
-			content:   `{"bucket": "my-test-bucket", "object_prefix": "snapshots/test/"}`,
-			writeOpts: true,
-			want:      "gs://my-test-bucket/snapshots/test/",
+			name:     "bucket with object prefix",
+			optsFile: checkpointGCSOptsFileName,
+			content:  `{"bucket": "my-test-bucket", "object_prefix": "snapshots/test/"}`,
+			want:     "gs://my-test-bucket/snapshots/test/",
 		},
 		{
-			name:      "bucket with leading slash in object prefix",
-			content:   `{"bucket": "my-test-bucket", "object_prefix": "/snapshots/test/"}`,
-			writeOpts: true,
-			want:      "gs://my-test-bucket/snapshots/test/",
+			name:     "bucket with leading slash in object prefix",
+			optsFile: checkpointGCSOptsFileName,
+			content:  `{"bucket": "my-test-bucket", "object_prefix": "/snapshots/test/"}`,
+			want:     "gs://my-test-bucket/snapshots/test/",
+		},
+		{
+			name:     "s3 bucket with object prefix",
+			optsFile: checkpointS3OptsFileName,
+			content:  `{"endpoint": "http://127.0.0.1:8333", "bucket": "my-test-bucket", "object_prefix": "snapshots/test/"}`,
+			want:     "s3://my-test-bucket/snapshots/test/",
 		},
 	}
 
@@ -140,15 +147,52 @@ func TestGetGCSURIFromImagePath(t *testing.T) {
 			if err := os.MkdirAll(subDir, 0755); err != nil {
 				t.Fatalf("failed to create directory: %v", err)
 			}
-			if tc.writeOpts {
-				optsPath := filepath.Join(subDir, checkpointGCSOptsFileName)
+			if tc.optsFile != "" {
+				optsPath := filepath.Join(subDir, tc.optsFile)
 				if err := os.WriteFile(optsPath, []byte(tc.content), 0644); err != nil {
 					t.Fatalf("failed to write %s: %v", optsPath, err)
 				}
 			}
-			got := getGCSURIFromImagePath(subDir)
+			got := checkpointGoferURI(subDir)
 			if got != tc.want {
-				t.Errorf("getGCSURIFromImagePath(%q) = %q, want %q", subDir, got, tc.want)
+				t.Errorf("checkpointGoferURI(%q) = %q, want %q", subDir, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenCheckpointGoferOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		optsFiles []string
+		want      string
+		wantErr   bool
+	}{
+		{name: "none"},
+		{name: "gcs", optsFiles: []string{checkpointGCSOptsFileName}, want: "GCS"},
+		{name: "s3", optsFiles: []string{checkpointS3OptsFileName}, want: "S3"},
+		{name: "both", optsFiles: []string{checkpointGCSOptsFileName, checkpointS3OptsFileName}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range tc.optsFiles {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(`{"bucket": "b"}`), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store, f, err := openCheckpointGoferOptions(dir)
+			if f != nil {
+				defer f.Close()
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("openCheckpointGoferOptions: %v, want error %t", err, tc.wantErr)
+			}
+			var got string
+			if store != nil {
+				got = store.name
+			}
+			if got != tc.want || (store != nil) != (f != nil) {
+				t.Errorf("openCheckpointGoferOptions = %q, %v; want %q", got, f, tc.want)
 			}
 		})
 	}

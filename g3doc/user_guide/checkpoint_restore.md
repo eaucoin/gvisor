@@ -610,6 +610,66 @@ and restore: Kubernetes writes `/etc/hosts`, `/etc/hostname` and
 containers, pods or the host while the sandbox is checkpointed. `all` suits
 sandboxes whose mounts do not change, such as read-only volumes.
 
+## Checkpoint images in object stores
+
+`runsc checkpoint` and `runsc restore` can keep an image in an object store
+instead of the image path: the image path then holds only a file of options
+that selects the store, and a separate process, the checkpoint gofer, reads and
+writes the image's files as objects named by an object prefix and the file's
+name (`checkpoint.img`, `pages_meta.img`, `pages.img`, and
+`layers/<identity>/pages_meta.img` and `layers/<identity>/pages.img` for the
+image's layers). Checkpoint with `--compression=none` to restore with
+`--background`, which then loads pages from the store while the application
+runs.
+
+For Google Cloud Storage, the file is `gcs_opts.json`:
+`{"bucket": "<bucket>", "object_prefix": "<prefix>"}`.
+
+For an S3-compatible object store (Amazon S3, MinIO, SeaweedFS, Ceph's RADOS
+Gateway and others), the file is `s3_opts.json`:
+
+```json
+{
+  "endpoint": "https://s3.example.com",
+  "bucket": "checkpoints",
+  "object_prefix": "my-sandbox/",
+  "credentials": {"access_key_id": "<id>", "secret_access_key": "<secret>"}
+}
+```
+
+-   `endpoint`: the URL of the store; without it, the store is Amazon S3 in
+    `region`.
+-   `region`: the region requests are signed for (default: the AWS SDK's
+    configuration, such as `AWS_REGION`, or `us-east-1` with an `endpoint`).
+-   `bucket` and `object_prefix`: where the objects are; the prefix is
+    prepended to file names as is (end it with `/` to make it a directory).
+-   `addressing`: `path` (`https://host/bucket/key`, the default with an
+    `endpoint`, as most stores other than Amazon S3 require) or `virtual`
+    (`https://bucket.host/key`).
+-   `credentials` (`access_key_id`, `secret_access_key`, `session_token`), or
+    `credentials_file` and `profile` (a file in the format of
+    `~/.aws/credentials`); without them, the AWS SDK's default chain provides
+    credentials (environment variables, shared files, web identity, container
+    and instance metadata). The checkpoint gofer refuses an options file or
+    `credentials_file` owned by a user other than root and the one that runs
+    runsc, or that users other than its owner may write, or, if it holds
+    credentials, read: make them readable and writable by their owner only
+    (`chmod 600`).
+-   `max_attempts` (default 5): requests are retried on throttling, server
+    errors and connection errors, with exponential backoff; a read whose
+    response ends early continues where it ended.
+-   `request_timeout_seconds` (default 30): each request, with its retries,
+    fails after this time plus the time its bytes take at 1 MiB/s, so that a
+    stalled store fails a checkpoint or restore rather than hangs it.
+-   `read_bytes` and `read_parallel` (default 16 MiB and 8): the size of reads
+    of `pages.img` and the number in flight.
+-   `write_part_bytes` and `write_parallel` (default 32 MiB and 4): `pages.img`
+    is uploaded in a multipart upload of parts of this size (at least 5 MiB; a
+    file smaller than a part is uploaded at once), this many at a time. A
+    failed checkpoint aborts its upload; a checkpoint gofer that is killed
+    cannot, so configure the bucket to delete incomplete multipart uploads
+    after a day, as stores allow with a lifecycle rule.
+
 ## Networking
 
 Checkpoint/restore is supported with `--network=sandbox` (default),
