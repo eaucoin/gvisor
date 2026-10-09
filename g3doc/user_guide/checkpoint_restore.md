@@ -207,6 +207,34 @@ the order the sandbox touched them, so that a restore, which loads `pages.img`
 in order in the background, loads them first. All of them take
 `--layer-path`, as `runsc restore` does.
 
+`inspect`, `verify` and `layers` also read the checkpoint archives that
+container engines make of runsc containers, such as those of the kubelet's
+checkpoint API through containerd or CRI-O, or of `podman container checkpoint
+--export`: tar files, uncompressed or compressed with gzip or zstd, whose
+`checkpoint/` directory holds the runsc image. `inspect` then also shows the
+container's name, pod, engine and runtime, read from the archive's `spec.dump`
+and `config.dump`. Layers are looked for in the archive and with
+`--layer-path`.
+
+### Using checkpointctl
+
+[checkpointctl](https://github.com/checkpoint-restore/checkpointctl) reads the
+checkpoint archives of CRIU-based runtimes. Version 1.6.0 and later run
+executables named `checkpointctl-<name>` found in `PATH` as `checkpointctl
+<name>`. Installed under the name `checkpointctl-runsc`, runsc is such a plugin,
+and runs `runsc image` with the plugin's arguments:
+
+```bash
+sudo ln -s "$(which runsc)" /usr/local/bin/checkpointctl-runsc
+checkpointctl plugin list
+checkpointctl runsc inspect checkpoint-counter.tar
+checkpointctl runsc verify --pages --layer-path=<parent image path> checkpoint-counter.tar
+```
+
+`checkpointctl show` lists runsc archives as it does others (container, engine,
+runtime, sizes); `checkpointctl inspect` and `memparse` read CRIU images, which
+runsc archives do not have.
+
 ## How to use checkpoint/restore in Docker:
 
 Run a container:
