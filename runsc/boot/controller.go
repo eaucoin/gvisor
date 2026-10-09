@@ -625,6 +625,11 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	if err != nil {
 		return err
 	}
+	if rate := cm.l.root.conf.TestOnlyRestoreReadRate; rate != 0 {
+		for i, pagesFile := range pagesFiles {
+			pagesFiles[i] = stateio.NewRateLimitedReader(pagesFile, rate)
+		}
+	}
 	defer func() {
 		if stateFile != nil {
 			stateFile.Close()
