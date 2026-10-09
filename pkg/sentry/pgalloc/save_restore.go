@@ -1331,6 +1331,12 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// wake is notified when a range is added to priority, so that the async
+	// page loader goroutine enqueues its read without waiting for an inflight
+	// read to complete, if ar implements stateio.WaitOrAsyncReader. wake is
+	// immutable.
+	wake chan struct{}
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1351,7 +1357,7 @@ type AsyncPagesFileLoad struct {
 	// from this pages file. totalWaiters is protected by mu.
 	totalWaiters int
 
-	// timeStartWaiters was the value of gohacks.Nanotime() when numWaiters
+	// timeStartWaiters was the value of aplNanotime() when numWaiters
 	// most recently transitioned from 0 to 1. If numWaiters is 0,
 	// timeStartWaiters is MaxInt64. timeStartWaiters is protected by mu.
 	timeStartWaiters int64
@@ -1376,6 +1382,10 @@ type AsyncPagesFileLoad struct {
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
 
+	// waitOr is ar if it implements stateio.WaitOrAsyncReader, and nil
+	// otherwise. waitOr is immutable.
+	waitOr stateio.WaitOrAsyncReader
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -1383,6 +1393,12 @@ type AsyncPagesFileLoad struct {
 
 	// qavail is unused capacity in ar.
 	qavail int
+
+	// bgInflight is the number of bytes of background reads (reads of pages
+	// that had no waiters when they were enqueued) in flight. bgBudget bounds
+	// it.
+	bgInflight uint64
+	bgBudget   aplBackgroundBudget
 
 	// The async page loader combines multiple loads with contiguous pages file
 	// offsets (the common case) into a single read, even if their
@@ -1701,7 +1717,7 @@ type aplWaiter struct {
 	wakeup syncevent.Waiter
 	fr     memmap.FileRange
 
-	// timeStart was the value of gohacks.Nanotime() when this waiter started
+	// timeStart was the value of aplNanotime() when this waiter started
 	// waiting. timeStart is immutable after initialization.
 	timeStart int64
 
@@ -1737,8 +1753,12 @@ type aplOp struct {
 	iovecs []unix.Iovec
 
 	// If tempRef is true, a temporary reference is held on pages in frs that
-	// should be dropped after completion.
+	// should be dropped after completion. This is the case for background
+	// reads, of pages that had no waiters when the read was enqueued.
 	tempRef bool
+
+	// issued is the value of aplNanotime() when the read was enqueued.
+	issued int64
 }
 
 func (op *aplOp) off() int64 {
@@ -1759,12 +1779,14 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		timeStartWaiters: math.MaxInt64,
 		timeline:         timeline.Fork("async page loading"),
 		doneCallback:     doneCallback,
+		wake:             make(chan struct{}, 1),
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
 	}
+	apfl.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
 		apfl.opsBusy.Add(uint32(i))
@@ -1879,6 +1901,10 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
 				prioritized = true
+				select {
+				case apfl.wake <- struct{}{}:
+				default:
+				}
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1896,7 +1922,7 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 		// The loader may be idle, with no read in flight to complete.
 		apfl.lfStatus.Notify(aplLFPending)
 	}
-	w.timeStart = gohacks.Nanotime()
+	w.timeStart = aplNanotime()
 	if apfl.numWaiters == 0 {
 		apfl.timeStartWaiters = w.timeStart
 	}
@@ -1913,7 +1939,7 @@ func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
 	}
 	w.wakeup.WaitAndAckAll()
 	if logAwaitedLoads {
-		waitNS := gohacks.Nanotime() - w.timeStart
+		waitNS := aplNanotime() - w.timeStart
 		log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), w.fr, w.fr.Length())
 	}
 	fr := w.fr
@@ -1934,6 +1960,19 @@ func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
 	return apfl.qavail > 0
 }
 
+// mayStartBackgroundRead returns true if a new background read may be
+// started: if a full-size read more stays within the background reads'
+// budget, or none is in flight, and background reads leave a slot free for
+// awaited reads, so that an awaited read never waits for a slot.
+//
+// Preconditions:
+// - apfl.canEnqueue() == true.
+// - apfl.curOp == nil.
+func (apfl *AsyncPagesFileLoad) mayStartBackgroundRead() bool {
+	withinBudget := apfl.bgInflight == 0 || apfl.bgInflight+apfl.maxReadBytes <= apfl.bgBudget.bytes
+	return withinBudget && (apfl.qavail > 1 || len(apfl.ops) == 1)
+}
+
 // Preconditions: apfl.canEnqueue() == true.
 func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	if apfl.qavail <= 0 {
@@ -1949,6 +1988,10 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 
 	apfl.qavail--
 	apfl.curOp = nil
+	op.issued = aplNanotime()
+	if op.tempRef {
+		apfl.bgInflight += op.total
+	}
 	if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized read to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncReader implementation.
@@ -1968,6 +2011,9 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
 	for {
 		if apfl.curOp == nil {
+			if tempRef && !apfl.mayStartBackgroundRead() {
+				return 0
+			}
 			id, err := apfl.opsBusy.FirstZero(0)
 			if err != nil {
 				panic(fmt.Sprintf("all ops busy with qavail=%d: %v", apfl.qavail, err))
@@ -2128,7 +2174,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
-	timeStart := gohacks.Nanotime()
+	timeStart := aplNanotime()
+	// Background reads may use every slot but one, which is kept for awaited
+	// reads (see mayStartBackgroundRead).
+	apfl.bgBudget.init(timeStart, apfl.maxReadBytes, uint64(max(maxParallel-1, 1))*apfl.maxReadBytes)
 	apfl.timeline.Reached("async page loading started")
 	if log.IsLogging(log.Debug) {
 		log.Debugf("Async page loading started")
@@ -2153,7 +2202,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					bytesWaited := apfl.bytesWaited
 					bytesLoaded := apfl.bytesLoaded
 					apfl.mu.Unlock()
-					now := gohacks.Nanotime()
+					now := aplNanotime()
 					durTotal := time.Duration(now - timeStart)
 					// apfl can have at least one waiter for a very long time
 					// due to new waiters enqueueing before old ones are
@@ -2298,18 +2347,26 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 			if ev&aplLFDone != 0 {
 				// Successfully completed all loading for all MemoryFiles.
-				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
+				durTotal := time.Duration(aplNanotime() - timeStart)
 				apfl.mu.Lock()
-				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited)
+				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s)", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget)
 				apfl.mu.Unlock()
 				return
 			}
 			panic(fmt.Sprintf("unknown events in lfStatus: %#x", ev))
 		}
 
-		// Wait for any number of reads to complete.
+		// Wait for any number of reads to complete, or, if a read can be
+		// enqueued, for a waiter to need one.
 		var err error
-		completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		if apfl.waitOr != nil && apfl.canEnqueue() {
+			completions, err = apfl.waitOr.WaitOr(completions[:0], apfl.wake)
+			if err == nil && len(completions) == 0 {
+				continue
+			}
+		} else {
+			completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		}
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)
 			apfl.mu.Lock()
@@ -2319,6 +2376,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 
 		// Process completions.
+		now := aplNanotime()
 		apfl.amflsMu.Lock()
 		apfl.mu.Lock()
 		failed := false
@@ -2326,7 +2384,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			op := &apfl.ops[c.ID]
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
+			apfl.bgBudget.readCompleted(now, c.N, op.issued, op.tempRef && op.total == apfl.maxReadBytes)
 			if op.tempRef {
+				apfl.bgInflight -= op.total
 				// Delay f.DecRef(fr) until after dropping locks. This is
 				// required to avoid lock recursion via dropping the last
 				// reference => asyncMemoryFileLoad.cancelWasteLoad() =>
@@ -2351,7 +2411,6 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.bytesLoaded += op.total
 			amfl := op.amfl
 			haveWaiters := false
-			now := int64(0)
 			for _, fr := range op.frs {
 				// All pages in fr have been started and were split around fr
 				// when they were started (above), and fr.amfl.unloaded never
@@ -2368,9 +2427,6 @@ func (apfl *AsyncPagesFileLoad) main() {
 						w.pending -= ullen
 						if w.pending == 0 {
 							wakeups = append(wakeups, w)
-							if now == 0 {
-								now = gohacks.Nanotime()
-							}
 							// This definition of "wait time" skips the time
 							// taken for w to wake up (bad), but avoids having
 							// to lock apfl.mu again in apfl.awaitLoad()
@@ -2408,6 +2464,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			return
 		}
 		dropDelayedDecRefs()
+		apfl.bgBudget.update(now)
 	}
 }
 
