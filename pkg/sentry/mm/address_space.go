@@ -46,11 +46,19 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 	return nil
 }
 
-// asyncLoadMapUnit bounds the ranges that are mapped at once while async page
-// loading is in progress, in order to avoid calling
-// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal() with
-// unnecessarily large ranges, resulting in unnecessarily long waits.
+// asyncLoadMapUnit is the length above which the internal mappings of a pma
+// whose MemoryFile is still being loaded asynchronously are not cached
+// (internalMappingsUncached): mapping it whole would wait for all of it to be
+// loaded.
 const asyncLoadMapUnit = 32 << 20
+
+// asyncLoadingMapUnit is the map unit of mapASLocked for pmas whose
+// MemoryFile is still being loaded asynchronously: a first touch waits for
+// this much to be loaded. It is the unit Linux's fault-around maps by default
+// (fault_around_bytes), small enough that a fault waits for about one read of
+// a pages file, large enough to keep the number of faults during loading
+// moderate.
+const asyncLoadingMapUnit = 64 << 10
 
 // mapASLocked maps addresses in ar into mm.as.
 //
@@ -84,11 +92,19 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// since an underlying device file may be sensitive to the mapped
 		// range.
 		mapAR = ar
+	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
+		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
+		// waits for every page in the mapped range to be loaded, so a first
+		// touch waits for its whole map unit: map a small unit while loading,
+		// keeping hugepage-backed pmas' huge pages whole.
+		if pseg.ValuePtr().huge {
+			setMapUnit(hostarch.HugePageSize)
+		} else {
+			setMapUnit(asyncLoadingMapUnit)
+		}
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
-	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		setMapUnit(asyncLoadMapUnit)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
