@@ -15,6 +15,7 @@
 package systrap
 
 import (
+	"fmt"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -22,9 +23,11 @@ import (
 	"golang.org/x/sys/unix"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -34,8 +37,21 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// testProcFS is the procfs FD that the tests' Systrap tracks writes with, or
+// nil if the host cannot track writes. Every stub inherits the seccomp filter
+// of the first, so all tests share the choice.
+var testProcFS *fd.FD
+
 func TestMain(m *testing.M) {
 	cpuid.Initialize()
+	if uffd, err := hostmm.NewWPAsyncUserfaultfd(); err == nil {
+		unix.Close(uffd)
+		procFD, err := unix.Open("/proc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			panic(fmt.Sprintf("opening /proc: %v", err))
+		}
+		testProcFS = fd.New(procFD)
+	}
 	os.Exit(m.Run())
 }
 
@@ -59,16 +75,18 @@ func (*testMemoryManager) FindVMAByName(hostarch.AddrRange, string) (hostarch.Ad
 
 const userCodeAddr = hostarch.Addr(0x100000)
 
-// newSystrapTest creates a real Systrap instance, maps userCode into a new
-// address space, and returns a context ready to Switch into it.
-func newSystrapTest(t *testing.T) (*Systrap, platform.AddressSpace, *platformContext, *arch.Context64) {
+// newSystrapTest creates a real Systrap instance, which tracks writes if the
+// host can, maps code into a new address space, and returns a context ready
+// to Switch into it.
+func newSystrapTest(t *testing.T, code []byte) (*Systrap, platform.AddressSpace, *platformContext, *arch.Context64) {
 	t.Helper()
 
 	s, err := New(platform.Options{
 		DisableSyscallPatching: true,
 		// Only slow-path for now in order to not have to use a real
 		// memory manager.
-		DisableFastPath: true,
+		DisableFastPath:     true,
+		WriteTrackingProcFS: testProcFS,
 	})
 	if err != nil {
 		t.Fatalf("failed to create Systrap platform: %v", err)
@@ -88,7 +106,7 @@ func newSystrapTest(t *testing.T) (*Systrap, platform.AddressSpace, *platformCon
 	if err != nil {
 		t.Fatalf("failed to map user code page: %v", err)
 	}
-	if _, err := safemem.CopySeq(bs, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(testutil.UserCode))); err != nil {
+	if _, err := safemem.CopySeq(bs, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(code))); err != nil {
 		t.Fatalf("failed to write user code: %v", err)
 	}
 	if err := as.MapFile(userCodeAddr, s.memoryFile, fr, hostarch.AccessType{Read: true, Execute: true}, false); err != nil {
@@ -107,7 +125,7 @@ func newSystrapTest(t *testing.T) (*Systrap, platform.AddressSpace, *platformCon
 // that there is no window during which the ContextState indicates it's being
 // worked on AND there is no thread currently working on it.
 func TestSwitchThreadIDVisibility(t *testing.T) {
-	_, as, pctx, ac := newSystrapTest(t)
+	_, as, pctx, ac := newSystrapTest(t, testutil.UserCode)
 	mm := &testMemoryManager{as: as}
 	ctx := pkgcontext.Background()
 	violations := atomic.Uint64{}

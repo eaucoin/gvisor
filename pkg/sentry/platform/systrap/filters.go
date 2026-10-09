@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -28,24 +29,65 @@ import (
 // encode the sysmsg thread priority.
 const sysmsgThreadPriorityVarName = "systrap_sysmsg_thread_priority"
 
+// writeTrackingProcFDVarName is the seccomp filter variable name used to
+// encode the procfs directory FD of write tracking.
+const writeTrackingProcFDVarName = "systrap_write_tracking_proc_fd"
+
 // systrapSeccomp implements platform.SeccompInfo.
-type systrapSeccomp struct{}
+type systrapSeccomp struct {
+	// trackWrites is true if the platform tracks writes.
+	trackWrites bool
+}
 
 // Variables implements `platform.SeccompInfo.Variables`.
-func (systrapSeccomp) Variables() precompiledseccomp.Values {
+func (s systrapSeccomp) Variables() precompiledseccomp.Values {
 	initSysmsgThreadPriority()
 	vars := precompiledseccomp.Values{}
 	vars.SetUint64(sysmsgThreadPriorityVarName, uint64(sysmsgThreadPriority))
+	if s.trackWrites {
+		vars[writeTrackingProcFDVarName] = uint32(writeTracking.procFD)
+	}
 	return vars
 }
 
 // ConfigKey implements `platform.SeccompInfo.ConfigKey`.
-func (systrapSeccomp) ConfigKey() string {
+func (s systrapSeccomp) ConfigKey() string {
+	if s.trackWrites {
+		return "systrap-write-tracking"
+	}
 	return "systrap"
 }
 
 // SyscallFilters implements `platform.SeccompInfo.SyscallFilters`.
-func (systrapSeccomp) SyscallFilters(vars precompiledseccomp.Values) seccomp.SyscallRules {
+func (s systrapSeccomp) SyscallFilters(vars precompiledseccomp.Values) seccomp.SyscallRules {
+	rules := s.baseSyscallFilters(vars)
+	if s.trackWrites {
+		// The Sentry opens the pagemap of each stub through the procfs
+		// FD, then tracks writes with the stub's userfaultfd and pagemap.
+		// The path cannot be checked: the rule allows read-only opens of
+		// any file of that procfs, and absolute paths in the Sentry's
+		// root.
+		rules.Merge(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+			unix.SYS_OPENAT: seccomp.PerArg{
+				seccomp.EqualTo(vars[writeTrackingProcFDVarName]),
+				seccomp.AnyValue{},
+				seccomp.EqualTo(unix.O_RDONLY | unix.O_CLOEXEC),
+			},
+			// To find a stub's PID in a procfs of an ancestor PID
+			// namespace; see procPID.
+			unix.SYS_PIDFD_OPEN: seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(0),
+			},
+		}))
+		rules.Merge(hostmm.WriteTrackingSyscallRules())
+	}
+	return rules
+}
+
+// baseSyscallFilters returns the syscall rules of the platform without write
+// tracking.
+func (systrapSeccomp) baseSyscallFilters(vars precompiledseccomp.Values) seccomp.SyscallRules {
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_PTRACE: seccomp.Or{
 			seccomp.PerArg{
@@ -137,7 +179,10 @@ func (systrapSeccomp) HottestSyscalls() []uintptr {
 
 // SeccompInfo returns seccomp filter info for the systrap platform.
 func (p *Systrap) SeccompInfo() platform.SeccompInfo {
-	return systrapSeccomp{}
+	if p == nil {
+		return systrapSeccomp{}
+	}
+	return systrapSeccomp{trackWrites: p.trackWrites}
 }
 
 // PrecompiledSeccompInfo implements

@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 )
 
 const syscallEvent unix.Signal = 0x80
@@ -135,6 +136,11 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 				},
 			}),
 			Action: seccomp.Allow,
+		}
+		if writeTrackingEnabled() {
+			// Injected to track writes; see write_tracking.go.
+			ruleSet.Rules.Set(unix.SYS_USERFAULTFD, seccomp.PerArg{seccomp.EqualTo(hostmm.UserfaultfdFlags)})
+			ruleSet.Rules.Set(unix.SYS_MPROTECT, seccomp.MatchAll{})
 		}
 		rules = append(rules, ruleSet)
 		rules = appendArchSeccompRules(rules)
