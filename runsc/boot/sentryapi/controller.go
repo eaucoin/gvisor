@@ -116,9 +116,12 @@ type RestoreOpts struct {
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
-	// 4. optional platform device file.
+	// 4. if the image has layers other than itself, the pages file of each, in
+	//    layer order (LayerFiles files).
+	// 5. optional platform device file.
 	urpc.FilePayload
 	HavePagesFile  bool
+	LayerFiles     int
 	HaveDeviceFile bool
 	Background     bool
 
