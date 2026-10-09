@@ -579,6 +579,17 @@ const (
 	// DirtyMarkIOUring is io_uring's registration of its rings with
 	// MarkAlwaysDirty.
 	DirtyMarkIOUring
+
+	// DirtyMarkWriteProtectFault is the mark made by the MemoryManager when
+	// a write, by the application or by the Sentry on its behalf, reaches a
+	// pma write-protected for dirty tracking (mm's dirty.go).
+	DirtyMarkWriteProtectFault
+
+	// DirtyMarkWriteProtectArm is the MemoryManager's write-protection of the
+	// pmas that exist at the start of an epoch
+	// (mm.MemoryManager.ArmDirtyTracking). Disabled, pmas written during an
+	// earlier epoch stay writable, and their next writes are not marked.
+	DirtyMarkWriteProtectArm
 )
 
 // disabledDirtyMarkPath is the DirtyMarkPath disabled by
