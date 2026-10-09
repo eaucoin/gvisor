@@ -24,6 +24,7 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sync",
         "@com_github_cenkalti_backoff//:go_default_library",
@@ -42,14 +43,18 @@ go_test(
     size = "small",
     srcs = [
         "errors_test.go",
+        "gcs_test.go",
         "parallelwriter_test.go",
     ],
     embed = [":gcs"],
     deps = [
+        "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "@com_google_cloud_go_storage//:go_default_library",
         "@org_golang_google_api//googleapi:go_default_library",
         "@org_golang_google_api//option:go_default_library",
+        "@org_golang_x_oauth2//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
