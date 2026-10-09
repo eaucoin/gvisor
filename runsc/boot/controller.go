@@ -406,6 +406,11 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	if err != nil {
 		return err
 	}
+	if rate := cm.l.root.conf.TestOnlyRestoreReadRate; rate != 0 {
+		for i, pagesFile := range pagesFiles {
+			pagesFiles[i] = stateio.NewRateLimitedReader(pagesFile, rate)
+		}
+	}
 	defer func() {
 		if stateFile != nil {
 			stateFile.Close()
