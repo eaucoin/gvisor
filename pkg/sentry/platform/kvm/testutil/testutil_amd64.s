@@ -44,6 +44,19 @@ TEXT ·AddrOfTouch(SB), $0-8
 	MOVQ AX, ret+0(FP)
 	RET
 
+TEXT ·store(SB),NOSPLIT|NOFRAME,$0
+start:
+	MOVQ AX, 0(AX) // store to AX
+	MOVQ $39, AX   // getpid
+	SYSCALL
+	JMP start
+
+// func AddrOfStore() uintptr
+TEXT ·AddrOfStore(SB), $0-8
+	MOVQ $·store(SB), AX
+	MOVQ AX, ret+0(FP)
+	RET
+
 TEXT ·syscallLoop(SB),NOSPLIT|NOFRAME,$0
 start:
 	SYSCALL
