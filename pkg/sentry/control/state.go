@@ -96,6 +96,7 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 			Budget:    o.PrecopyBudget,
 			MaxRounds: o.PrecopyMaxRounds,
 			Auto:      o.Precopy == "auto",
+			Throttle:  o.PrecopyThrottle,
 		}
 	default:
 		return nil, fmt.Errorf("invalid pre-copy mode %q", o.Precopy)
