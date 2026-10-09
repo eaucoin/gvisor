@@ -111,6 +111,11 @@ func (r *Reader) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Co
 	return stateio.CompletionChanWait(r.cmps, cs, minCompletions)
 }
 
+// WaitOr implements stateio.WaitOrAsyncReader.WaitOr.
+func (r *Reader) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]stateio.Completion, error) {
+	return stateio.CompletionChanWaitOr(r.cmps, cs, wake)
+}
+
 func (r *Reader) workerMain(ctx context.Context) {
 	defer r.workers.Done()
 	obj := r.obj
