@@ -84,10 +84,35 @@ const (
 	// It contains the namespace of the pod that a sandbox is in when running in Kubernetes.
 	namespaceAnnotation = "io.kubernetes.cri.sandbox-namespace"
 
-	// checkpointGCSOptsFileName is a file that may exist in an image-path
-	// directory that specifies options for storing checkpoint files in GCS.
+	// checkpointGCSOptsFileName and checkpointS3OptsFileName are files that
+	// may exist in an image-path directory that specify options for storing
+	// checkpoint files in GCS or in an S3-compatible object store.
 	checkpointGCSOptsFileName = "gcs_opts.json"
+	checkpointS3OptsFileName  = "s3_opts.json"
 )
+
+// checkpointGoferStore is a store of checkpoint files that the checkpoint
+// gofer accesses.
+type checkpointGoferStore struct {
+	// name names the store in logs.
+	name string
+
+	// optsFileName is the file in an image-path directory that selects the
+	// store and holds the checkpoint gofer's options for it.
+	optsFileName string
+
+	// optsFDFlag is the checkpoint gofer's flag that takes the options file.
+	optsFDFlag string
+
+	// uriScheme is the scheme of the store's URIs.
+	uriScheme string
+}
+
+// checkpointGoferStores are the stores that the checkpoint gofer accesses.
+var checkpointGoferStores = []checkpointGoferStore{
+	{name: "GCS", optsFileName: checkpointGCSOptsFileName, optsFDFlag: "-gcs-opts-fd", uriScheme: "gs"},
+	{name: "S3", optsFileName: checkpointS3OptsFileName, optsFDFlag: "-s3-opts-fd", uriScheme: "s3"},
+}
 
 func controlSocketName(id string) string {
 	return fmt.Sprintf("runsc-%s.sock", id)
@@ -609,7 +634,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	// Restore the container and start the root container.
 	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := checkpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
 			}
 		}
@@ -631,7 +656,7 @@ func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, layerPat
 		clientSockFile.Close()
 		return fmt.Errorf("layer paths %q cannot be used with a checkpoint gofer, which finds layers in the image's %q directory", layerPaths, checkpointimage.LayersDir)
 	}
-	log.Infof("Restoring from GCS via checkpoint gofer")
+	log.Infof("Restoring via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
 	opt.UseCheckpointGofer = true
 	return nil
@@ -1786,10 +1811,11 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
 	if len(opts.SplitFSCheckpointPaths) > 0 {
-		// Verify we are not using GCS/gofer.
-		gcsOptsPath := filepath.Join(imagePath, checkpointGCSOptsFileName)
-		if _, err := os.Stat(gcsOptsPath); err == nil {
-			return fmt.Errorf("split filesystem checkpoint is not supported with GCS/gofer")
+		// Verify we are not using a checkpoint gofer.
+		for _, store := range checkpointGoferStores {
+			if _, err := os.Stat(filepath.Join(imagePath, store.optsFileName)); err == nil {
+				return fmt.Errorf("split filesystem checkpoint is not supported with a checkpoint gofer (%s)", store.name)
+			}
 		}
 	}
 
@@ -1828,7 +1854,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := checkpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -1846,7 +1872,7 @@ func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, 
 	if clientSockFile == nil {
 		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, opt)
 	}
-	log.Infof("Saving to GCS via checkpoint gofer")
+	log.Infof("Saving via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
 	opt.UseCheckpointGofer = true
 	opt.HavePagesFile = opts.Compression == statefile.CompressionLevelNone
@@ -1942,7 +1968,7 @@ func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, dire
 		return openFSRestoreFilesForLocalCheckpoint(imagePath, direct)
 	}
 	cmd.Args = append(cmd.Args, "-fs-restore-checkpoint-gofer")
-	log.Infof("Restoring filesystem checkpoint from GCS via checkpoint gofer")
+	log.Infof("Restoring filesystem checkpoint via checkpoint gofer")
 	return []*os.File{clientSockFile}, nil
 }
 
@@ -1984,7 +2010,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	if err := s.call(boot.ContMgrFSSave, &args, nil); err != nil {
 		if args.UseCheckpointGofer {
-			if target := getGCSURIFromImagePath(imagePath); target != "" {
+			if target := checkpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2001,7 +2027,7 @@ func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bo
 	if clientSockFile == nil {
 		return setFSSaveArgsForLocalCheckpointFiles(conf, imagePath, direct, args)
 	}
-	log.Infof("Saving filesystem checkpoint to GCS via checkpoint gofer")
+	log.Infof("Saving filesystem checkpoint via checkpoint gofer")
 	args.FilePayload.Files = append(args.FilePayload.Files, clientSockFile)
 	args.UseCheckpointGofer = true
 	return nil
@@ -2087,25 +2113,55 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 	return files[:], nil
 }
 
-// getGCSURIFromImagePath returns the GCS URI (e.g. "gs://bucket" or "gs://bucket/prefix")
-// specified in gcs_opts.json under imagePath, or empty string if not applicable.
-func getGCSURIFromImagePath(imagePath string) string {
-	gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
-	data, err := os.ReadFile(gcsOptsPath)
-	if err != nil {
-		return ""
+// checkpointGoferURI returns the URI (e.g. "gs://bucket/prefix" or
+// "s3://bucket") of the checkpoint files that the options file under
+// imagePath specifies, or an empty string if not applicable.
+func checkpointGoferURI(imagePath string) string {
+	for _, store := range checkpointGoferStores {
+		data, err := os.ReadFile(path.Join(imagePath, store.optsFileName))
+		if err != nil {
+			continue
+		}
+		var opts struct {
+			Bucket       string `json:"bucket"`
+			ObjectPrefix string `json:"object_prefix"`
+		}
+		if err := json.Unmarshal(data, &opts); err != nil || opts.Bucket == "" {
+			return ""
+		}
+		if opts.ObjectPrefix != "" {
+			return fmt.Sprintf("%s://%s/%s", store.uriScheme, opts.Bucket, strings.TrimPrefix(opts.ObjectPrefix, "/"))
+		}
+		return fmt.Sprintf("%s://%s", store.uriScheme, opts.Bucket)
 	}
-	var opts struct {
-		Bucket       string `json:"bucket"`
-		ObjectPrefix string `json:"object_prefix"`
+	return ""
+}
+
+// openCheckpointGoferOptions returns the store whose options file is in
+// imagePath, and the file, open; or nil if there is none.
+func openCheckpointGoferOptions(imagePath string) (*checkpointGoferStore, *os.File, error) {
+	var (
+		found     *checkpointGoferStore
+		foundFile *os.File
+	)
+	for i := range checkpointGoferStores {
+		store := &checkpointGoferStores[i]
+		optsPath := path.Join(imagePath, store.optsFileName)
+		f, err := os.Open(optsPath)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				log.Warningf("Failed to open %q: %v", optsPath, err)
+			}
+			continue
+		}
+		if found != nil {
+			foundFile.Close()
+			f.Close()
+			return nil, nil, fmt.Errorf("image path %q holds both %s and %s", imagePath, found.optsFileName, store.optsFileName)
+		}
+		found, foundFile = store, f
 	}
-	if err := json.Unmarshal(data, &opts); err != nil || opts.Bucket == "" {
-		return ""
-	}
-	if opts.ObjectPrefix != "" {
-		return fmt.Sprintf("gs://%s/%s", opts.Bucket, strings.TrimPrefix(opts.ObjectPrefix, "/"))
-	}
-	return fmt.Sprintf("gs://%s", opts.Bucket)
+	return found, foundFile, nil
 }
 
 // maybeStartCheckpointGoferAndGetSocket checks if use of a checkpoint gofer is
@@ -2113,15 +2169,15 @@ func getGCSURIFromImagePath(imagePath string) string {
 // checkpoint gofer and returns an os.File representing a socket connected to
 // it. Otherwise, it returns nil.
 func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg cgroup.Cgroup, imagePath string, extraFlags ...string) (*os.File, error) {
-	gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
-	gcsOptsFile, err := os.Open(gcsOptsPath)
+	store, optsFile, err := openCheckpointGoferOptions(imagePath)
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			log.Warningf("Failed to open %q: %v", gcsOptsPath, err)
-		}
+		return nil, err
+	}
+	if store == nil {
 		return nil, nil
 	}
-	defer gcsOptsFile.Close()
+	defer optsFile.Close()
+	log.Infof("Starting checkpoint gofer for %s", store.name)
 	// Pass /dev/null as the checkpoint gofer's standard streams to avoid
 	// polluting this process' logs. The checkpoint gofer accepts flags like
 	// -debug-log, which are plumbed through to it by passing conf.ToFlags()
@@ -2139,7 +2195,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 	clientSockFile := os.NewFile(uintptr(socketFDs[0]), "checkpointgofer-socket")
 	err = cgroup.RunInCgroup(cg, func(cloneIntoCgroupFD *os.File) error {
 		argv := append([]string{"runsc-checkpointgofer"}, conf.ToFlags()...)
-		extraFiles := []uintptr{devNullFile.Fd(), devNullFile.Fd(), devNullFile.Fd(), uintptr(socketFDs[1]), gcsOptsFile.Fd()}
+		extraFiles := []uintptr{devNullFile.Fd(), devNullFile.Fd(), devNullFile.Fd(), uintptr(socketFDs[1]), optsFile.Fd()}
 
 		// Add log file FDs.
 		if conf.LogFilename != "" {
@@ -2167,7 +2223,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 			argv = append(argv, fmt.Sprintf("--debug-log-fd=%d", len(extraFiles)-1))
 		}
 
-		argv = append(argv, "checkpointgofer", "-sock-fd=3", "-gcs-opts-fd=4")
+		argv = append(argv, "checkpointgofer", "-sock-fd=3", store.optsFDFlag+"=4")
 		argv = append(argv, extraFlags...)
 		// Don't forward GOMAXPROCS defaults that apply to this process (in
 		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
@@ -2220,7 +2276,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 	if clientSockFile != nil {
 		donations.DonateAndClose("save-fds", clientSockFile)
 		cmd.Args = append(cmd.Args, "-save-checkpoint-gofer")
-		log.Infof("Enabling workload-trigger saving to GCS via checkpoint gofer")
+		log.Infof("Enabling workload-trigger saving via checkpoint gofer")
 	} else {
 		files, err := createSaveFiles(path, direct, comp)
 		if err != nil {
