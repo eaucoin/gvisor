@@ -20,6 +20,7 @@ import (
 	"io"
 	"slices"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -485,5 +486,49 @@ func TestDirtyTrackingNegativeControls(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestDirtyThrottleDelay checks the delays that limit the rate at which a
+// MemoryManager's tasks dirty memory.
+func TestDirtyThrottleDelay(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm, _ := dirtyTestMM(t, ctx)
+	ar := mmap(t, ctx, mm, 16, true)
+	copyOut(t, ctx, mm, ar.Start, int(ar.Length()))
+	mm.ArmDirtyTracking(hostarch.PageSize)
+	const (
+		limit = 40 * hostarch.PageSize // bytes per second; 4 pages of burst
+		ms    = int64(time.Millisecond)
+	)
+
+	// The first call of a session charges nothing dirtied before it.
+	copyOut(t, ctx, mm, page(ar, 0), hostarch.PageSize)
+	if d := mm.DirtyThrottleDelay(limit, 1, 0); d != 0 {
+		t.Errorf("first delay of a session: got %v, want 0", d)
+	}
+	// Within the burst, no delay.
+	copyOut(t, ctx, mm, page(ar, 1), 3*hostarch.PageSize)
+	if d := mm.DirtyThrottleDelay(limit, 1, 0); d != 0 {
+		t.Errorf("delay within the burst: got %v, want 0", d)
+	}
+	// 6 pages more: 5 over the limit, which takes 125 ms to make up.
+	copyOut(t, ctx, mm, page(ar, 4), 6*hostarch.PageSize)
+	if d, want := mm.DirtyThrottleDelay(limit, 1, 0), 125*time.Millisecond; d != want {
+		t.Errorf("delay over the limit: got %v, want %v", d, want)
+	}
+	// 125 ms later, the deficit is made up.
+	if d := mm.DirtyThrottleDelay(limit, 1, 125*ms); d != 0 {
+		t.Errorf("delay after making up the deficit: got %v, want 0", d)
+	}
+	// Writes to disarmed units are not charged.
+	copyOut(t, ctx, mm, page(ar, 4), 6*hostarch.PageSize)
+	if d := mm.DirtyThrottleDelay(limit, 1, 125*ms); d != 0 {
+		t.Errorf("delay after rewriting dirty units: got %v, want 0", d)
+	}
+	// A new session starts with full credit.
+	copyOut(t, ctx, mm, page(ar, 10), 6*hostarch.PageSize)
+	if d := mm.DirtyThrottleDelay(limit, 2, 125*ms); d != 0 {
+		t.Errorf("first delay of a new session: got %v, want 0", d)
 	}
 }
