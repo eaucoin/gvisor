@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -273,6 +274,20 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 		t.Fatalf("error checkpointing container to empty file: %v", err)
 	}
 
+	// The state file's metadata gives the format of the pages metadata file
+	// if the image has one, which it does unless it is compressed.
+	md, err := readStateFileMetadata(filepath.Join(dir, checkpointfiles.StateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFormat := ""
+	if compression == statefile.CompressionLevelNone {
+		wantFormat = checkpointimage.FormatVersion()
+	}
+	if got := md[checkpointimage.FormatMetadataKey]; got != wantFormat {
+		t.Errorf("state file metadata %s = %q, want %q", checkpointimage.FormatMetadataKey, got, wantFormat)
+	}
+
 	lastNum, err := readOutputNum(outputPath, -1)
 	if err != nil {
 		t.Fatalf("error with outputFile: %v", err)
@@ -372,6 +387,16 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 		t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum2)
 	}
 	cont3.Destroy()
+}
+
+// readStateFileMetadata returns the metadata of the state file at path.
+func readStateFileMetadata(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return statefile.MetadataUnsafe(f)
 }
 
 // TestCheckpointRestore does the checkpoint/restore test on each platform.
