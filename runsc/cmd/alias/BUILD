@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -13,4 +13,11 @@ go_library(
         "//runsc/cmd/alias/bwrap",
         "//runsc/cmd/util",
     ],
+)
+
+go_test(
+    name = "alias_test",
+    size = "small",
+    srcs = ["aliases_test.go"],
+    library = ":alias",
 )
