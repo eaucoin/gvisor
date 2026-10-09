@@ -52,6 +52,7 @@ go_test(
     srcs = [
         "console_test.go",
         "container_test.go",
+        "incremental_test.go",
         "metric_server_test.go",
         "multi_container_test.go",
         "shared_volume_test.go",
@@ -69,6 +70,8 @@ go_test(
     }),
     data = [
         "//:release",
+        "//test/cmd/dirty_tracking:escapes",
+        "//test/cmd/dirty_tracking:mem_touch",
         "//test/cmd/test_app",
     ],
     library = ":container",
@@ -94,6 +97,7 @@ go_test(
         "//pkg/sentry/seccheck/sinks/remote/test",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
+        "//pkg/sentry/usage",
         "//pkg/state/statefile",
         "//pkg/sync",
         "//pkg/test/testutil",
