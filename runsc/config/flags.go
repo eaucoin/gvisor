@@ -195,6 +195,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
+	flagSet.String("TESTONLY-autosave-compression", "flate-best-speed", "TEST ONLY; compression level of auto saves for syscall tests: none|flate-best-speed.")
 
 	RegisterDeprecatedFlags(flagSet)
 }

@@ -2117,6 +2117,105 @@ func testCheckpointRestoreLayers(t *testing.T, conf *config.Config) {
 	}
 }
 
+// TestCheckpointRestoreBackground checks that a sandbox restored with
+// --background, whose memory loads while its application runs, finds its
+// memory intact: the application checksums 32 MiB of random data that it holds
+// in memory before the checkpoint and after the restore.
+func TestCheckpointRestoreBackground(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+
+			script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.2; done`, 32<<20, outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+			want, err := firstLine(outputPath)
+			if err != nil {
+				t.Fatalf("error reading output: %v", err)
+			}
+
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			cont.Destroy()
+			cont = nil
+			if err := os.Remove(outputPath); err != nil {
+				t.Fatalf("error removing file: %v", err)
+			}
+			outputFile2, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile2.Close()
+
+			cont2, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, dir, nil /* layerPaths */, false /* direct */, true /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile2); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+			got, err := firstLine(outputPath)
+			if err != nil {
+				t.Fatalf("error reading output: %v", err)
+			}
+			if got != want {
+				t.Errorf("checksum of the application's data after the restore is %q, want %q as before the checkpoint", got, want)
+			}
+		})
+	}
+}
+
+// firstLine returns the first complete line of the file at path.
+func firstLine(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	line, _, ok := strings.Cut(string(data), "\n")
+	if !ok {
+		return "", fmt.Errorf("no complete line in %q", data)
+	}
+	return line, nil
+}
+
 // TestCheckpointRestoreHostname verifies that hostname is updated on restore
 // if it was not changed inside the container, and is NOT updated if it was changed.
 func TestCheckpointRestoreHostname(t *testing.T) {
