@@ -4372,10 +4372,11 @@ func TestFSCheckpointSharedVolume(t *testing.T) {
 		t.Fatalf("Error saving filesystem checkpoint: %v", err)
 	}
 
-	for i, c := range conts {
-		if err := c.SignalContainer(unix.SIGKILL, false); err != nil && !strings.Contains(err.Error(), "no such process") {
-			t.Fatalf("Error killing container %d: %v", i, err)
-		}
+	// The sandbox exits after saving: wait for it, rather than signal its
+	// containers while it may be exiting, when its control server may refuse
+	// the connection.
+	if _, err := conts[0].Wait(); err != nil {
+		t.Fatalf("Error waiting for the sandbox to exit after saving: %v", err)
 	}
 
 	restoreSpecs, restoreIDs := createSpecs(testAppSleepArgv, testAppSleepArgv)
