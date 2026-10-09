@@ -507,6 +507,50 @@ type Requirements struct {
 	// FrequentHostThreadWakeups indicates that the platform wakes sleeping
 	// host threads at a very high rate.
 	FrequentHostThreadWakeups bool
+
+	// WriteTracking is how the platform supports write tracking.
+	WriteTracking WriteTracking
+}
+
+// WriteTracking is how a platform supports write tracking: reporting the
+// application's stores to MemoryFiles that track dirty pages (see
+// pgalloc.MemoryFile.EnableDirtyTracking), which the Sentry does not see.
+type WriteTracking int
+
+const (
+	// WriteTrackingUnsupported means that the platform cannot track writes.
+	WriteTrackingUnsupported WriteTracking = iota
+
+	// WriteTrackingInternalMappings means that the application writes to
+	// MemoryFiles through the Sentry's internal mappings of them, so that
+	// tracking the writes through those mappings
+	// (pgalloc.EnableInternalWriteTracking), which the Sentry's own writes
+	// go through, tracks the application's.
+	WriteTrackingInternalMappings
+
+	// WriteTrackingPlatform means that the application writes to
+	// MemoryFiles through the platform's own mappings of them, whose writes
+	// the platform tracks if it is created with Options.WriteTrackingProcFS;
+	// it then implements WriteTracker. The Sentry's own writes are tracked
+	// through its internal mappings, as for WriteTrackingInternalMappings.
+	WriteTrackingPlatform
+)
+
+// WriteTracker is implemented by platforms that track the application's
+// writes through their mappings of MemoryFiles that track dirty pages
+// (WriteTrackingPlatform). A mapping is write-tracked if its MemoryFile
+// tracks dirty pages when it is mapped, or from the next call to ArmWrites.
+// The writes through a mapping are reported, by marking the pages written
+// dirty (pgalloc.MemoryFile.MarkDirty), when HarvestWrites is called and
+// before the mapping is unmapped or replaced.
+type WriteTracker interface {
+	// ArmWrites write-tracks the mappings of MemoryFiles that track dirty
+	// pages that are not write-tracked yet.
+	ArmWrites() error
+
+	// HarvestWrites reports the writes through every write-tracked mapping
+	// since it was armed or last harvested, and keeps tracking it.
+	HarvestWrites() error
 }
 
 // SeccompInfo represents seccomp-bpf data for a given platform.
@@ -620,6 +664,13 @@ type Options struct {
 	// It allows releasing them asynchronously.
 	// See `//pkg/pinring`.
 	PinRing *pinring.PinRing
+
+	// If WriteTrackingProcFS is not nil, a platform whose
+	// Requirements().WriteTracking is WriteTrackingPlatform tracks writes;
+	// see WriteTracker. WriteTrackingProcFS is a directory FD of the procfs
+	// of the Sentry's PID namespace, which the platform uses for as long as
+	// it runs. Other platforms ignore it.
+	WriteTrackingProcFS *fd.FD
 }
 
 // Constructor represents a platform type.
