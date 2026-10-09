@@ -41,6 +41,7 @@ func TestStubFilterPrecompiled(t *testing.T) {
 			fn   func(precompiledseccomp.Values) *seccomp.Program
 		}{
 			{stubfilter.StubProcessName, stubfilter.StubProcessVars(stubStart, stubROMapLen), stubfilter.StubProcess},
+			{stubfilter.StubProcessWriteTrackingName, stubfilter.StubProcessVars(stubStart, stubROMapLen), stubfilter.StubProcessWriteTracking},
 			{stubfilter.SysmsgThreadName, stubfilter.SysmsgThreadVars(stubStart, stubSysmsgStart), stubfilter.SysmsgThread},
 			{stubfilter.SyscallThreadName, nil, stubfilter.SyscallThread},
 		} {
