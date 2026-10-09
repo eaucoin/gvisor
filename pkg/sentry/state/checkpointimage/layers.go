@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 )
@@ -37,6 +38,20 @@ const LayersDir = "layers"
 // named name of the layer with digest d.
 func LayerPath(d Digest, name string) string {
 	return path.Join(LayersDir, d.String(), name)
+}
+
+// ParseLayerPath returns the digest of the layer and the name of the file that
+// p names in it, if p is a path that LayerPath returns.
+func ParseLayerPath(p string) (d Digest, name string, ok bool) {
+	parts := strings.Split(p, "/")
+	if len(parts) != 3 || parts[0] != LayersDir || parts[2] == "" {
+		return Digest{}, "", false
+	}
+	d, err := ParseDigest(parts[1])
+	if err != nil || d.String() != parts[1] {
+		return Digest{}, "", false
+	}
+	return d, parts[2], true
 }
 
 // FileDigest returns the digest of the pages metadata file at path, the
