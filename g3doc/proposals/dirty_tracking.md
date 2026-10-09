@@ -250,16 +250,18 @@ that every round of a pre-copy would find more to write than was written.
 
 ### Configuration
 
--   `--dirty-tracking=off|auto|wp` (default `off`): `wp` selects this source;
+-   `--dirty-tracking=off|auto|wp|uffd` (default `off`): `wp` selects this
+    source; `uffd` selects the host kernel's userfaultfd write-protection
+    ([Dirty Tracking with Userfaultfd Write-Protection](uffd_wp_dirty_tracking.md));
     `auto` selects the best available.
 -   `--dirty-tracking-unit` (default 64 KiB): the tracking unit, a power of 2
     of at least a page.
 -   `--dirty-tracking-verify=off|hash` (default `off`): with `hash`, every
     checkpoint verifies tracking and fails on an escape.
--   `--TESTONLY-dirty-tracking-break=none|mapinternal|decommit|tmpfs|iouring|fault|arm`
+-   `--TESTONLY-dirty-tracking-break=none|mapinternal|decommit|tmpfs|iouring|fault|arm|uffd-internal|uffd-unmap`
     disables one marking path, for container tests that check that
     verification catches it; `fault` and `arm` are this source's first-write
-    mark and its arming.
+    mark and its arming, `uffd-internal` and `uffd-unmap` are `uffd`'s.
 
 The syscall tests' `_save_verify` variants run every test, on every platform,
 with `--dirty-tracking=wp --dirty-tracking-verify=hash` and a save after
