@@ -182,7 +182,10 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "address_space_test.go",
+        "mm_test.go",
+    ],
     embed = [":mm"],
     deps = [
         "//pkg/context",
@@ -198,6 +201,7 @@ go_test(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/platform",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
         "//pkg/usermem",
