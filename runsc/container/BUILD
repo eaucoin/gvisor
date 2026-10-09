@@ -101,6 +101,7 @@ go_test(
         "//pkg/unet",
         "//runsc/boot",
         "//runsc/cgroup",
+        "//runsc/checkpointgofer/s3/s3test",
         "//runsc/config",
         "//runsc/flag",
         "//runsc/sandbox",

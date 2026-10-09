@@ -24,6 +24,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path"
@@ -58,6 +59,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/checkpointgofer/s3/s3test"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/sandbox"
@@ -2133,74 +2135,117 @@ func TestCheckpointRestoreBackground(t *testing.T) {
 			if err := os.Chmod(dir, 0777); err != nil {
 				t.Fatalf("error chmoding file: %q, %v", dir, err)
 			}
-			outputPath := filepath.Join(dir, "output")
-			outputFile, err := createWriteableOutputFile(outputPath)
-			if err != nil {
-				t.Fatalf("error creating output file: %v", err)
-			}
-			defer outputFile.Close()
+			testCheckpointRestoreBackground(t, conf, dir)
+		})
+	}
+}
 
-			script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.2; done`, 32<<20, outputPath)
-			spec := testutil.NewSpecWithArgs("bash", "-c", script)
-			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+// TestCheckpointRestoreS3 checks that a container checkpointed to an
+// S3-compatible object store through the checkpoint gofer, uncompressed,
+// restores from it with --background.
+func TestCheckpointRestoreS3(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			store := s3test.NewStore(t)
+			srv := httptest.NewServer(store)
+			defer srv.Close()
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
 			if err != nil {
-				t.Fatalf("error setting up container: %v", err)
+				t.Fatalf("os.MkdirTemp failed: %v", err)
 			}
-			defer cleanup()
-			args := Args{
-				ID:        testutil.RandomContainerID(),
-				Spec:      spec,
-				BundleDir: bundleDir,
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
 			}
-			cont, err := New(conf, args)
-			if err != nil {
-				t.Fatalf("error creating container: %v", err)
-			}
-			defer cont.Destroy()
-			if err := cont.Start(conf); err != nil {
-				t.Fatalf("error starting container: %v", err)
-			}
-			if err := waitForFileNotEmpty(outputFile); err != nil {
-				t.Fatalf("Failed to wait for output file: %v", err)
-			}
-			want, err := firstLine(outputPath)
-			if err != nil {
-				t.Fatalf("error reading output: %v", err)
+			opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": "image/", "credentials": {"access_key_id": "key", "secret_access_key": "secret"}}`, srv.URL, s3test.Bucket)
+			if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), []byte(opts), 0644); err != nil {
+				t.Fatalf("error writing S3 options: %v", err)
 			}
 
-			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
-				t.Fatalf("error checkpointing container: %v", err)
-			}
-			cont.Destroy()
-			cont = nil
-			if err := os.Remove(outputPath); err != nil {
-				t.Fatalf("error removing file: %v", err)
-			}
-			outputFile2, err := createWriteableOutputFile(outputPath)
-			if err != nil {
-				t.Fatalf("error creating output file: %v", err)
-			}
-			defer outputFile2.Close()
+			testCheckpointRestoreBackground(t, conf, dir)
 
-			cont2, err := New(conf, args)
-			if err != nil {
-				t.Fatalf("error creating container: %v", err)
-			}
-			defer cont2.Destroy()
-			if err := cont2.Restore(conf, dir, nil /* layerPaths */, false /* direct */, true /* background */, nil /* networkArgs */); err != nil {
-				t.Fatalf("error restoring container: %v", err)
-			}
-			if err := waitForFileNotEmpty(outputFile2); err != nil {
-				t.Fatalf("Failed to wait for output file: %v", err)
-			}
-			got, err := firstLine(outputPath)
-			if err != nil {
-				t.Fatalf("error reading output: %v", err)
-			}
-			if got != want {
-				t.Errorf("checksum of the application's data after the restore is %q, want %q as before the checkpoint", got, want)
+			for _, name := range []string{checkpointfiles.StateFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
+				if _, ok := store.Object("image/" + name); !ok {
+					t.Errorf("checkpoint did not write %s to the object store", name)
+				}
+				if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+					t.Errorf("checkpoint wrote %s to the image path", name)
+				}
 			}
 		})
+	}
+}
+
+// testCheckpointRestoreBackground checkpoints a container that holds 32 MiB of
+// data to imagePath, uncompressed, restores it with --background, and checks
+// that its data survived.
+func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePath string) {
+	outputPath := filepath.Join(imagePath, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.2; done`, 32<<20, outputPath)
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+	want, err := firstLine(outputPath)
+	if err != nil {
+		t.Fatalf("error reading output: %v", err)
+	}
+
+	if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont.Destroy()
+	cont = nil
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("error removing file: %v", err)
+	}
+	outputFile2, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile2.Close()
+
+	cont2, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, imagePath, nil /* layerPaths */, false /* direct */, true /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile2); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+	got, err := firstLine(outputPath)
+	if err != nil {
+		t.Fatalf("error reading output: %v", err)
+	}
+	if got != want {
+		t.Errorf("checksum of the application's data after the restore is %q, want %q as before the checkpoint", got, want)
 	}
 }
 
