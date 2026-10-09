@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
@@ -241,10 +242,11 @@ func TestAsyncLoadCompletionAccounting(t *testing.T) {
 	l := startLoad(t, img, r, restored)
 	t.Cleanup(func() { releaseAll(t, restored) })
 
-	amfl := restored.asyncPageLoad.Load()
-	if amfl == nil {
+	loads := restored.asyncPageLoad.Load()
+	if loads == nil {
 		t.Fatalf("IsAsyncLoading() = false before any page is loaded")
 	}
+	amfl := loads.amfls[0]
 	for i := uint64(0); i < 4; i++ {
 		r.waitPending()
 		if got, want := amfl.minUnloaded.Load(), fr.Start+i*hostarch.PageSize; got != want {
@@ -407,10 +409,15 @@ func TestSaveDuringAsyncLoad(t *testing.T) {
 	t.Cleanup(func() { releaseAll(t, restored) })
 	r.waitInflight(1)
 
-	var meta, pages bytes.Buffer
+	var (
+		meta, pages bytes.Buffer
+		saveImg     *checkpointimage.Image
+	)
 	saved := make(chan error, 1)
 	go func() {
-		saved <- saveImageTo(&meta, stateio.NewIOWriter(&pages, 256<<10, 64, 4), SaveOpts{}, restored)
+		var err error
+		saveImg, err = saveImageTo(&meta, stateio.NewIOWriter(&pages, 256<<10, 64, 4), SaveOpts{}, restored)
+		saved <- err
 	}()
 	waitForWaiters(t, l.apfl, 1)
 	r.finish()
@@ -420,7 +427,7 @@ func TestSaveDuringAsyncLoad(t *testing.T) {
 	if err := l.wait(t); err != nil {
 		t.Fatalf("async page loading: %v", err)
 	}
-	img2 := &testImage{meta: meta.Bytes(), pages: pages.Bytes()}
+	img2 := &testImage{meta: meta.Bytes(), pages: pages.Bytes(), img: saveImg, layers: [][]byte{pages.Bytes()}}
 	if !bytes.Equal(img2.pages, img.pages) {
 		t.Errorf("image saved during loading differs from the image loaded")
 	}

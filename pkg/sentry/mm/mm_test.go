@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -1155,7 +1156,12 @@ func TestIODuringAsyncPageLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileLoad got err %v want nil", err)
 	}
-	if err := mf.LoadFrom(ctx, &metadata, &pgalloc.LoadOpts{PagesFile: apfl}); err != nil {
+	// The records SaveTo wrote are those of an image whose one layer is pages,
+	// without page hashes, as a filesystem checkpoint saves them.
+	if err := mf.LoadFrom(ctx, &metadata, &pgalloc.LoadOpts{
+		Image:      &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{PagesSize: uint64(pages.Len())}}},
+		PagesFiles: []*pgalloc.AsyncPagesFileLoad{apfl},
+	}); err != nil {
 		t.Fatalf("LoadFrom got err %v want nil", err)
 	}
 	apfl.MemoryFilesDone()
