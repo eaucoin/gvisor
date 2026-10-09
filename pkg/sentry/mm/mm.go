@@ -165,6 +165,10 @@ type MemoryManager struct {
 	// dirtyUnit is protected by activeMu.
 	dirtyUnit hostarch.Addr `state:"nosave"`
 
+	// dirtyThrottle limits the rate at which tasks of this MemoryManager
+	// dirty memory while a checkpoint pre-copies it; see dirty.go.
+	dirtyThrottle dirtyThrottle `state:"nosave"`
+
 	// hasPinned is true if pages in this MemoryManager have ever been pinned
 	// by Pin. It is never cleared, even if all pinned pages are unpinned;
 	// compare Linux's MMF_HAS_PINNED.
