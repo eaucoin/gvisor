@@ -16,6 +16,7 @@ go_library(
         "ioreader.go",
         "iowriter.go",
         "pagesfile.go",
+        "ratelimit.go",
         "stateio.go",
         "stateio_impl_util.go",
         "stateio_util.go",
@@ -46,6 +47,7 @@ go_test(
         "fdwriter_test.go",
         "ioreader_test.go",
         "iowriter_test.go",
+        "ratelimit_test.go",
     ],
     library = ":stateio",
     deps = [
