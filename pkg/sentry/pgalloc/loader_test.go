@@ -573,3 +573,41 @@ func TestSaveDuringAsyncLoad(t *testing.T) {
 	t.Cleanup(func() { releaseAll(t, again) })
 	gens.checkPages(t, again, fr)
 }
+
+// TestAsyncLoadWaitMetrics checks that loading reports the waits for pages
+// that it served in its metrics.
+func TestAsyncLoadWaitMetrics(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 1<<20)
+	opts := testDisk
+	opts.manual = true
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
+	waits, waitBytes, waitNanoseconds := asyncLoadWaits.Value(), asyncLoadWaitBytes.Value(), asyncLoadWaitNanoseconds.Value()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+
+	r.waitPending()
+	last := memmap.FileRange{fr.End - hostarch.PageSize, fr.End}
+	faultAt := time.Duration(r.nanotime())
+	done := awaitAsync(restored, last)
+	waitForWaiters(t, l.apfl, 1)
+	r.finish()
+	if err := receive(t, done, "the awaited page"); err != nil {
+		t.Fatalf("MapInternal(%v): %v", last, err)
+	}
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	awaited, _ := r.readAt(int64(last.Start - fr.Start))
+	if got := asyncLoadWaits.Value() - waits; got != 1 {
+		t.Errorf("waits = %d, want 1", got)
+	}
+	if got := asyncLoadWaitBytes.Value() - waitBytes; got != hostarch.PageSize {
+		t.Errorf("bytes waited for = %d, want %d", got, hostarch.PageSize)
+	}
+	if got, want := time.Duration(asyncLoadWaitNanoseconds.Value()-waitNanoseconds), awaited.completed-faultAt; got != want {
+		t.Errorf("time waited = %v, want %v", got, want)
+	}
+	gens.checkPages(t, restored, fr)
+}
