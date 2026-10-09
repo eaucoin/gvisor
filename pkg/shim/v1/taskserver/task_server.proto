@@ -49,6 +49,11 @@ message CheckpointRequest {
 
   // Flags from runsc fscheckpoint
   string fs_path = 14;
+
+  // If not empty, the checkpoint is incremental, of the image at this path,
+  // which must be the image the sandbox was last checkpointed to or restored
+  // from (runsc checkpoint --parent-image-path).
+  string parent_image_path = 15;
 }
 
 message CheckpointResponse {}
