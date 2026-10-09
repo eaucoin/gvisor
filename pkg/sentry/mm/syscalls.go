@@ -723,7 +723,7 @@ func (mm *MemoryManager) MProtect(addr hostarch.Addr, length uint64, realPerms h
 					didUnmapAS = true
 				}
 				pma.effectivePerms = effectivePerms.Intersect(pma.translatePerms)
-				if pma.needCOW {
+				if pma.needCOW || pma.dirtyArmed {
 					pma.effectivePerms.Write = false
 				}
 			}
