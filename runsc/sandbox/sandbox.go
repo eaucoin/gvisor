@@ -1331,7 +1331,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	donations.DonateAndClose("sink-fds", args.SinkFiles...)
 
 	if len(conf.TestOnlyAutosaveImagePath) != 0 {
-		files, err := createSaveFiles(conf.TestOnlyAutosaveImagePath, false, statefile.CompressionLevelFlateBestSpeed)
+		compression, err := statefile.CompressionLevelFromString(conf.TestOnlyAutosaveCompression)
+		if err != nil {
+			return fmt.Errorf("invalid auto save compression %q: %w", conf.TestOnlyAutosaveCompression, err)
+		}
+		files, err := createSaveFiles(conf.TestOnlyAutosaveImagePath, false, compression)
 		if err != nil {
 			return fmt.Errorf("failed to create auto save files: %w", err)
 		}

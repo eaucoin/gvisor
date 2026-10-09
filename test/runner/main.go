@@ -75,6 +75,7 @@ var (
 	leakCheck        = flag.Bool("leak-check", false, "check for reference leaks")
 	waitForPid       = flag.Duration("delay-for-debugger", 0, "Print out the sandbox PID and wait for the specified duration to start the test. This is useful for attaching a debugger to the runsc-sandbox process.")
 	save             = flag.Bool("save", false, "enables save restore")
+	saveBackground   = flag.Bool("save-background", false, "with --save, restores with runsc restore --background, loading memory while the test runs")
 	saveResume       = flag.Bool("save-resume", false, "enables save resume")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
@@ -344,6 +345,11 @@ func prepareSave(args []string, undeclaredOutputsDir string, index int) ([]strin
 	}
 	// Pass the directory path of the state file to the sandbox.
 	args = append(args, "-TESTONLY-autosave-image-path", dir)
+	if *saveBackground {
+		// runsc restore --background loads only a separate pages file
+		// lazily.
+		args = append(args, "-TESTONLY-autosave-compression=none")
+	}
 	return args, dir, nil
 }
 
@@ -701,7 +707,11 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			}
 			restoreArgs = append(restoreArgs, "restore")
 			restoreArgs = append(restoreArgs, passFDArgs...)
-			restoreArgs = append(restoreArgs, "--image-path", currentRestoreDir, "--bundle", bundleDir, id)
+			restoreArgs = append(restoreArgs, "--image-path", currentRestoreDir, "--bundle", bundleDir)
+			if *saveBackground {
+				restoreArgs = append(restoreArgs, "--background")
+			}
+			restoreArgs = append(restoreArgs, id)
 			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
 			restoreCmd := exec.Command(specutils.ExePath, restoreArgs...)
 			restoreCmd.ExtraFiles = extraFiles
