@@ -42,6 +42,11 @@ func SetTouchTarget(regs *arch.Registers, target *uintptr) {
 	}
 }
 
+// SetStoreTarget sets the address that the store function stores to.
+func SetStoreTarget(regs *arch.Registers, addr uintptr) {
+	regs.Rax = uint64(addr)
+}
+
 // RewindSyscall rewinds a syscall RIP.
 func RewindSyscall(regs *arch.Registers) {
 	regs.Rip -= 2
