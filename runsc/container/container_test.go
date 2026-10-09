@@ -49,6 +49,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm/hostmmtest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -2532,46 +2534,117 @@ done`, 64<<20, sumPath, checkPath, answersPath)
 	}
 }
 
-// TestCheckpointRestorePrecopy checks checkpoints that pre-copy memory while
-// the container runs. The container tracks dirty pages, with verification:
-// its first checkpoint, which starts tracking while it runs, or an incremental
-// checkpoint of a full one, pre-copies; then the container is restored from
-// the checkpoint (and its parent) without dirty tracking, and continues where
-// it stopped.
-func TestCheckpointRestorePrecopy(t *testing.T) {
-	for _, incremental := range []bool{false, true} {
-		t.Run(fmt.Sprintf("incremental=%t", incremental), func(t *testing.T) {
-			conf := testutil.TestConfig(t)
-			conf.DirtyTracking = config.DirtyTrackingWriteProtect
-			conf.DirtyTrackingVerify = config.DirtyTrackingVerifyHash
-
+// TestCheckpointRestoreBackgroundUffd checks that the pages that async page
+// loading writes after a restore with --background are not reported dirty by
+// --dirty-tracking=uffd, which starts tracking while they load: they are the
+// image the sandbox was restored from, not writes. The application holds 32
+// MiB of random data in base64; it is checkpointed, then restored with
+// --background from a pages file read at the rate that loads it in 4
+// seconds, and checksums its data, which waits for every page of it to load.
+// Its next checkpoint is incremental, relative to the image it was restored
+// from, and pre-copies: pre-copy writes every page reported dirty to the
+// pages file, without comparing it with the parent's as the final save does,
+// so the pages file must hold only the few pages the application wrote. The
+// restore from both checkpoints must find the data intact. Verification
+// (--dirty-tracking-verify=hash) would make the restore wait for every page
+// before tracking starts, which is the case this test must not avoid; the
+// last restore checks the incremental checkpoint's contents instead.
+func TestCheckpointRestoreBackgroundUffd(t *testing.T) {
+	const loadTime = 4 * time.Second
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			requireWriteTracking(t)
+			conf.DirtyTracking = config.DirtyTrackingUFFD
 			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
 			if err != nil {
 				t.Fatalf("os.MkdirTemp failed: %v", err)
 			}
-			defer os.RemoveAll(dir)
+			// Removed by cleanups rather than deferred calls, as the
+			// containers that restore creates are destroyed by cleanups,
+			// which run after deferred calls.
+			t.Cleanup(func() { os.RemoveAll(dir) })
 			if err := os.Chmod(dir, 0777); err != nil {
 				t.Fatalf("error chmoding file: %q, %v", dir, err)
 			}
-			outputPath := filepath.Join(dir, "output")
-			outputFile, err := createWriteableOutputFile(outputPath)
-			if err != nil {
-				t.Fatalf("error creating output file: %v", err)
+			baseDir := filepath.Join(dir, "base")
+			incrementalDir := filepath.Join(dir, "incremental")
+			for _, d := range []string{baseDir, incrementalDir} {
+				if err := os.Mkdir(d, 0777); err != nil {
+					t.Fatalf("os.Mkdir failed: %v", err)
+				}
 			}
-			defer outputFile.Close()
-
-			script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 0.1; i=$((i+1)); done", outputPath)
+			checkPath := filepath.Join(dir, "check")
+			sumPath := filepath.Join(dir, "sum")
+			script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0)
+echo -n "$x" | md5sum > %[2]q.tmp && mv %[2]q.tmp %[2]q
+while true; do
+  if [ -e %[3]q ]; then rm %[3]q; echo -n "$x" | md5sum > %[2]q.tmp && mv %[2]q.tmp %[2]q; fi
+  sleep 0.05
+done`, 32<<20, sumPath, checkPath)
 			spec := testutil.NewSpecWithArgs("bash", "-c", script)
 			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 			if err != nil {
 				t.Fatalf("error setting up container: %v", err)
 			}
-			defer cleanup()
-			cont, err := New(conf, Args{
+			t.Cleanup(cleanup)
+			args := Args{
 				ID:        testutil.RandomContainerID(),
 				Spec:      spec,
 				BundleDir: bundleDir,
-			})
+			}
+			// sum returns the checksum of the application's data, after
+			// asking for it if ask is true, waiting up to timeout for it.
+			sum := func(ask bool, timeout time.Duration) string {
+				t.Helper()
+				if ask {
+					check, err := createWriteableOutputFile(checkPath)
+					if err != nil {
+						t.Fatalf("error creating file: %v", err)
+					}
+					check.Close()
+				}
+				var line string
+				if err := testutil.Poll(func() error {
+					if _, err := os.Stat(checkPath); err == nil {
+						return fmt.Errorf("the application has not checksummed its data yet")
+					}
+					var err error
+					line, err = firstLine(sumPath)
+					return err
+				}, timeout); err != nil {
+					t.Fatalf("error waiting for the checksum of the application's data: %v", err)
+				}
+				if err := os.Remove(sumPath); err != nil {
+					t.Fatalf("error removing file: %v", err)
+				}
+				return line
+			}
+			// restore restores a new container from the checkpoint in
+			// imageDir, in the background, reading pages files at
+			// readRate bytes per second if it is not 0, and checks that
+			// the application's data is intact.
+			restore := func(imageDir string, layerPaths []string, readRate uint64, want string) *Container {
+				t.Helper()
+				conf.TestOnlyRestoreReadRate = readRate
+				cont, err := New(conf, Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      spec,
+					BundleDir: bundleDir,
+				})
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				t.Cleanup(func() { cont.Destroy() })
+				if err := cont.Restore(conf, imageDir, layerPaths, false /* direct */, true /* background */, nil /* networkArgs */); err != nil {
+					t.Fatalf("error restoring container: %v", err)
+				}
+				if got := sum(true, loadTime+time.Minute); got != want {
+					t.Fatalf("checksum of the application's data after the restore from %s is %q, want %q as before the checkpoint", imageDir, got, want)
+				}
+				return cont
+			}
+
+			cont, err := New(conf, args)
 			if err != nil {
 				t.Fatalf("error creating container: %v", err)
 			}
@@ -2579,77 +2652,181 @@ func TestCheckpointRestorePrecopy(t *testing.T) {
 			if err := cont.Start(conf); err != nil {
 				t.Fatalf("error starting container: %v", err)
 			}
-			if err := waitForFileNotEmpty(outputFile); err != nil {
-				t.Fatalf("Failed to wait for output file: %v", err)
-			}
-
-			opts := sandbox.CheckpointOpts{
-				Compression:      statefile.CompressionLevelNone,
-				Precopy:          "on",
-				PrecopyBudget:    100 * time.Millisecond,
-				PrecopyMaxRounds: 8,
-			}
-			var layerPaths []string
-			if incremental {
-				parentDir := filepath.Join(dir, "parent")
-				if err := os.Mkdir(parentDir, 0755); err != nil {
-					t.Fatalf("os.Mkdir failed: %v", err)
-				}
-				if err := cont.Checkpoint(conf, parentDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone, Resume: true}); err != nil {
-					t.Fatalf("error checkpointing container: %v", err)
-				}
-				opts.ParentImagePath = parentDir
-				layerPaths = []string{parentDir}
-			}
-			imageDir := filepath.Join(dir, "image")
-			if err := os.Mkdir(imageDir, 0755); err != nil {
-				t.Fatalf("os.Mkdir failed: %v", err)
-			}
-			if err := cont.Checkpoint(conf, imageDir, opts); err != nil {
-				t.Fatalf("error checkpointing container with pre-copy: %v", err)
-			}
-			lastNum, err := readOutputNum(outputPath, -1)
-			if err != nil {
-				t.Fatalf("error with outputFile: %v", err)
+			want := sum(false, time.Minute)
+			if err := cont.Checkpoint(conf, baseDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
 			}
 			cont.Destroy()
 
-			if err := os.Remove(outputPath); err != nil {
-				t.Fatalf("error removing file")
-			}
-			outputFile2, err := createWriteableOutputFile(outputPath)
+			base, err := os.Stat(filepath.Join(baseDir, checkpointfiles.PagesFileName))
 			if err != nil {
-				t.Fatalf("error creating output file: %v", err)
+				t.Fatalf("error reading the size of the pages file: %v", err)
 			}
-			defer outputFile2.Close()
-			// Restore without dirty tracking, into the root directory that
-			// testutil.SetupContainer gave conf.
-			restoreConf := *conf
-			restoreConf.DirtyTracking = config.DirtyTrackingOff
-			restoreConf.DirtyTrackingVerify = config.DirtyTrackingVerifyOff
-			cont2, err := New(&restoreConf, Args{
-				ID:        testutil.RandomContainerID(),
-				Spec:      spec,
-				BundleDir: bundleDir,
-			})
+			cont2 := restore(baseDir, nil /* layerPaths */, uint64(base.Size())*uint64(time.Second)/uint64(loadTime), want)
+			if err := cont2.Checkpoint(conf, incrementalDir, sandbox.CheckpointOpts{
+				Compression:      statefile.CompressionLevelNone,
+				ParentImagePath:  baseDir,
+				Precopy:          "on",
+				PrecopyBudget:    100 * time.Millisecond,
+				PrecopyMaxRounds: 8,
+			}); err != nil {
+				t.Fatalf("error checkpointing the restored container incrementally: %v", err)
+			}
+			cont2.Destroy()
+			incremental, err := os.Stat(filepath.Join(incrementalDir, checkpointfiles.PagesFileName))
 			if err != nil {
-				t.Fatalf("error creating container: %v", err)
+				t.Fatalf("error reading the size of the pages file: %v", err)
 			}
-			defer cont2.Destroy()
-			if err := cont2.Restore(&restoreConf, imageDir, layerPaths, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
-				t.Fatalf("error restoring container: %v", err)
+			t.Logf("pages files: %d bytes in the checkpoint, %d bytes in the incremental checkpoint of its restore", base.Size(), incremental.Size())
+			if incremental.Size() > base.Size()/8 {
+				t.Errorf("the incremental checkpoint of the restored container holds %d bytes of pages, want at most an eighth of its parent's %d: the pages loaded in the background were reported dirty", incremental.Size(), base.Size())
 			}
-			if err := waitForFileNotEmpty(outputFile2); err != nil {
-				t.Fatalf("Failed to wait for output file: %v", err)
-			}
-			firstNum, err := readOutputNum(outputPath, 0)
-			if err != nil {
-				t.Fatalf("error with outputFile: %v", err)
-			}
-			if lastNum+1 != firstNum {
-				t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
-			}
+
+			restore(incrementalDir, []string{baseDir}, 0 /* readRate */, want)
 		})
+	}
+}
+
+// TestCheckpointRestorePrecopy checks checkpoints that pre-copy memory while
+// the container runs. The container tracks dirty pages, with each dirty source
+// on each platform, with verification: its first checkpoint, which starts
+// tracking while it runs, or an incremental checkpoint of a full one,
+// pre-copies; then the container is restored from the checkpoint (and its
+// parent) without dirty tracking, and continues where it stopped.
+func TestCheckpointRestorePrecopy(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, source := range []config.DirtyTrackingMode{config.DirtyTrackingWriteProtect, config.DirtyTrackingUFFD} {
+			for _, incremental := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/dirty-tracking=%v/incremental=%t", name, source, incremental), func(t *testing.T) {
+					if source == config.DirtyTrackingUFFD {
+						requireWriteTracking(t)
+					}
+					conf := *conf
+					conf.DirtyTracking = source
+					conf.DirtyTrackingVerify = config.DirtyTrackingVerifyHash
+					testCheckpointRestorePrecopy(t, &conf, incremental)
+				})
+			}
+		}
+	}
+}
+
+// requireWriteTracking ends the test (hostmmtest.Unavailable) if the host
+// cannot track writes as --dirty-tracking=uffd does.
+func requireWriteTracking(t *testing.T) {
+	t.Helper()
+	uffd, err := hostmm.NewWPAsyncUserfaultfd()
+	if err != nil {
+		hostmmtest.Unavailable(t, err)
+	}
+	unix.Close(uffd)
+}
+
+func testCheckpointRestorePrecopy(t *testing.T, conf *config.Config, incremental bool) {
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 0.1; i=$((i+1)); done", outputPath)
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	cont, err := New(conf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+
+	opts := sandbox.CheckpointOpts{
+		Compression:      statefile.CompressionLevelNone,
+		Precopy:          "on",
+		PrecopyBudget:    100 * time.Millisecond,
+		PrecopyMaxRounds: 8,
+	}
+	var layerPaths []string
+	if incremental {
+		parentDir := filepath.Join(dir, "parent")
+		if err := os.Mkdir(parentDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir failed: %v", err)
+		}
+		if err := cont.Checkpoint(conf, parentDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone, Resume: true}); err != nil {
+			t.Fatalf("error checkpointing container: %v", err)
+		}
+		opts.ParentImagePath = parentDir
+		layerPaths = []string{parentDir}
+	}
+	imageDir := filepath.Join(dir, "image")
+	if err := os.Mkdir(imageDir, 0755); err != nil {
+		t.Fatalf("os.Mkdir failed: %v", err)
+	}
+	if err := cont.Checkpoint(conf, imageDir, opts); err != nil {
+		t.Fatalf("error checkpointing container with pre-copy: %v", err)
+	}
+	lastNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	cont.Destroy()
+
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("error removing file")
+	}
+	outputFile2, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile2.Close()
+	// Restore without dirty tracking, into the root directory that
+	// testutil.SetupContainer gave conf.
+	restoreConf := *conf
+	restoreConf.DirtyTracking = config.DirtyTrackingOff
+	restoreConf.DirtyTrackingVerify = config.DirtyTrackingVerifyOff
+	cont2, err := New(&restoreConf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(&restoreConf, imageDir, layerPaths, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile2); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+	firstNum, err := readOutputNum(outputPath, 0)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	if lastNum+1 != firstNum {
+		t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
 	}
 }
 
