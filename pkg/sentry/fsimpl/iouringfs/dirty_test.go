@@ -75,7 +75,10 @@ func TestDirtyTrackingRings(t *testing.T) {
 			if err := mf.SaveTo(ctx, io.Discard, &pgalloc.SaveOpts{}); err != nil {
 				t.Fatalf("SaveTo: %v", err)
 			}
-			v := mf.VerifyDirty(mf.SwapDirty(true /* paused */))
+			v, err := mf.VerifyDirty(mf.SwapDirty(true /* paused */))
+			if err != nil {
+				t.Fatalf("VerifyDirty: %v", err)
+			}
 			want := uint64(0)
 			if disabled {
 				// The page holding the rings' header.
