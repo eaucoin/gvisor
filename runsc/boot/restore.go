@@ -397,7 +397,7 @@ func (r *restorer) restore(l *Loader) error {
 	r.timer.Reached("specs validated")
 
 	tscOffset, willJumpBackwards := r.computeTSCOffset()
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing, tscOffset)
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing, tscOffset, l.writeTrackingProcFS)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
 	}
@@ -427,7 +427,13 @@ func (r *restorer) restore(l *Loader) error {
 	l.k = &kernel.Kernel{
 		Platform: p,
 	}
-	configureDirtyTracking(l.k, l.root.conf)
+	tracker, err := l.writeTracker(p)
+	if err != nil {
+		return err
+	}
+	if err := configureDirtyTracking(l.k, l.root.conf, l.uffdDirtyTracking, tracker); err != nil {
+		return err
+	}
 	l.k.SetMemoryFile(r.mainMF)
 
 	if l.root.conf.ProfileEnable {
