@@ -253,6 +253,52 @@ checkpointctl runsc verify --pages --layer-path=<parent image path> checkpoint-c
 runtime, sizes); `checkpointctl inspect` and `memparse` read CRIU images, which
 runsc archives do not have.
 
+## Incremental checkpoints
+
+With `--dirty-tracking=wp` (a runsc flag, given when the sandbox is created or
+restored), the sandbox tracks the memory pages written between checkpoints. A
+checkpoint can then be incremental: given the image the container was last
+checkpointed to or restored from, it writes only the pages written since, and
+refers to that image, its parent, for the others:
+
+```bash
+runsc --dirty-tracking=wp run <container id>
+runsc checkpoint --image-path=<image 1> --leave-running <container id>
+runsc checkpoint --image-path=<image 2> --parent-image-path=<image 1> --leave-running <container id>
+runsc checkpoint --image-path=<image 3> --parent-image-path=<image 2> <container id>
+```
+
+The parent and the images it refers to become layers of the new image (see
+above), so restoring it needs them:
+
+```bash
+runsc --dirty-tracking=wp restore --image-path=<image 3> --layer-path=<image 1> --layer-path=<image 2> <container id>
+```
+
+A page is read from the image that holds its latest contents, and an image
+refers only to the layers that hold some of its pages: a chain of incremental
+checkpoints shortens itself as pages are rewritten. The parent must be the
+image the container was last checkpointed to or restored from (the checkpoint
+fails otherwise), and a failed checkpoint leaves it so; the first checkpoint of
+a container, and the first after enabling dirty tracking, are full. An
+incremental checkpoint records its parent's identity in its state file
+metadata as `parent_id`, which `runsc image inspect` prints.
+
+Restoring an image opens every layer it refers to, so keep chains short: take a
+full checkpoint (without `--parent-image-path`) every so often, or compact the
+chain with `runsc image compact` or `runsc image flatten` (see above) and
+restore from the result, whose next incremental checkpoint is then of it.
+
+Tracking makes the first write to a page after a checkpoint fault into the
+sandbox's kernel: `--dirty-tracking-unit` (64 KiB by default) is the size of
+the memory that one such fault marks written, trading the cost of writes after
+a checkpoint (more faults with a smaller unit) for the size of the next
+incremental image (more pages with a larger one).
+`--dirty-tracking-verify=hash` makes every checkpoint also check, by hashing
+every page, that no page changed without being tracked, and fail if one did;
+it is meant for tests and debugging. [Dirty page tracking](../proposals/dirty_tracking.md)
+describes how the sandbox tracks writes, and what tracking costs.
+
 ## How to use checkpoint/restore in Docker:
 
 Run a container:
