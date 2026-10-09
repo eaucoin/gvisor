@@ -142,6 +142,17 @@ func optionsToPrecompile() ([]Options, error) {
 			}
 			return opts, nil
 		},
+
+		// Expand internal write tracking on KVM, where
+		// --dirty-tracking=auto selects it.
+		func(opt Options) ([]Options, error) {
+			if opt.Platform.ConfigKey() != "kvm" {
+				return []Options{opt}, nil
+			}
+			tracking := opt
+			tracking.InternalWriteTracking = true
+			return []Options{opt, tracking}, nil
+		},
 	} {
 		var newOpts []Options
 		for _, opt := range opts {
