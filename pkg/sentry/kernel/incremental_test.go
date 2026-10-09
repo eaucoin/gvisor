@@ -72,6 +72,39 @@ func (w *fullDiskWriter) Close() error {
 // image, its directory and the error of the save.
 func saveImage(t *testing.T, ctx context.Context, k *Kernel, parent *checkpointimage.Digest, limit int) (*checkpointimage.Image, string, error) {
 	t.Helper()
+	return saveImageOpts(t, ctx, k, testSaveOpts{parent: parent, fullDisk: limit != noLimit, limit: limit})
+}
+
+// testSaveOpts configures saveImageOpts. Its zero value is a full save of k's
+// MemoryFile to a pages file without limit.
+type testSaveOpts struct {
+	// parent is the parent of an incremental save.
+	parent *checkpointimage.Digest
+
+	// If fullDisk is true, writing more than limit bytes to the pages file
+	// fails with ENOSPC, the pages being written one at a time.
+	fullDisk bool
+	limit    int
+
+	// If writeRate is not 0, the pages file is written at writeRate bytes
+	// per second.
+	writeRate uint64
+
+	// privates are the private MemoryFiles that the save saves, by owner,
+	// after k's.
+	privates map[checkpoint.ResourceID]*pgalloc.MemoryFile
+
+	// If precopy is not nil, the save pre-copies memory first: k's
+	// MemoryFile and the private MemoryFiles in precopyPrivates. If stats is
+	// not nil, it receives the pre-copy's.
+	precopy         *PrecopyOpts
+	precopyPrivates []*pgalloc.MemoryFile
+	stats           *precopyStats
+}
+
+// saveImageOpts is saveImage with the options in opts.
+func saveImageOpts(t *testing.T, ctx context.Context, k *Kernel, opts testSaveOpts) (*checkpointimage.Image, string, error) {
+	t.Helper()
 	dir := t.TempDir()
 	meta, err := os.Create(filepath.Join(dir, checkpointfiles.PagesMetadataFileName))
 	if err != nil {
@@ -79,7 +112,7 @@ func saveImage(t *testing.T, ctx context.Context, k *Kernel, parent *checkpointi
 	}
 	pagesPath := filepath.Join(dir, checkpointfiles.PagesFileName)
 	var pages stateio.AsyncWriter
-	if limit == noLimit {
+	if !opts.fullDisk {
 		pagesFD, err := unix.Open(pagesPath, unix.O_WRONLY|unix.O_CREAT|unix.O_CLOEXEC, 0644)
 		if err != nil {
 			t.Fatalf("creating the pages file: %v", err)
@@ -90,27 +123,42 @@ func saveImage(t *testing.T, ctx context.Context, k *Kernel, parent *checkpointi
 		if err != nil {
 			t.Fatalf("creating the pages file: %v", err)
 		}
-		pages = stateio.NewIOWriter(&fullDiskWriter{f: pagesFile, limit: limit}, hostarch.PageSize, 1 /* maxRanges */, 1 /* maxParallel */)
+		pages = stateio.NewIOWriter(&fullDiskWriter{f: pagesFile, limit: opts.limit}, hostarch.PageSize, 1 /* maxRanges */, 1 /* maxParallel */)
+	}
+	if opts.writeRate != 0 {
+		pages = stateio.NewRateLimitedWriter(pages, opts.writeRate)
 	}
 
-	e, err := k.beginDirtySave(ctx)
-	if err != nil {
-		t.Fatalf("beginDirtySave: %v", err)
+	// As state.SaveOpts.Save and Kernel.SaveTo do.
+	var precopy *Precopy
+	if opts.precopy != nil {
+		precopy, err = k.precopy(ctx, pages, opts.parent, opts.precopyPrivates, *opts.precopy) // transfers ownership of pages
+		if err != nil {
+			meta.Close()
+			return nil, dir, err
+		}
+		pages = nil
+		if opts.stats != nil {
+			// After Release, which completes them.
+			defer func() { *opts.stats = precopy.stats }()
+		}
+		defer precopy.Release()
 	}
-	var (
-		delta *incrementalSave
-		img   *checkpointimage.Image
-	)
-	if parent != nil {
-		delta, err = k.beginIncrementalSave(*parent, e)
+	saved := []*pgalloc.MemoryFile{k.mf}
+	for _, mf := range opts.privates {
+		saved = append(saved, mf)
 	}
+	saveEpoch, lastRound, delta, err := k.beginSave(ctx, opts.parent, precopy)
+	var img *checkpointimage.Image
 	if err == nil {
-		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, map[checkpoint.ResourceID]*pgalloc.MemoryFile{}, false /* appMFExcludeCommittedZeroPages */, delta)
+		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, opts.privates, false /* appMFExcludeCommittedZeroPages */, delta, precopy, lastRound)
 	} else {
 		meta.Close()
-		pages.Close()
+		if pages != nil {
+			pages.Close()
+		}
 	}
-	return img, dir, k.endDirtySave(ctx, e, []*pgalloc.MemoryFile{k.mf}, img, err)
+	return img, dir, k.endDirtySave(ctx, saveEpoch, saved, img, err)
 }
 
 // loadImage restores img, whose layers after the first are in the image

@@ -154,8 +154,162 @@ refused.
 
 ## Pre-copy
 
-<!-- Placeholder: the pre-copy series describes here how pre-copy rounds save
-an incremental checkpoint's pages while the sandbox runs. -->
+Even a delta pauses the sandbox for the pages it writes, and a full checkpoint
+for all of memory: 2.6 s for 256 MiB on a store that takes 100 MiB/s, against
+a floor of 25 to 160 ms to quiesce the sandbox and save its object graph.
+`runsc checkpoint --precopy=on` writes memory while the sandbox runs, as VM
+live migration does, so that the pause writes only what the sandbox wrote
+during the last of several rounds. It applies to full and incremental
+checkpoints alike, and its images are ordinary images.
+
+### Rounds
+
+`Kernel.Precopy` (`pkg/sentry/kernel/precopy.go`), called by
+`state.SaveOpts.Save` before it pauses the sandbox, starts the save's pages
+file writer (`pgalloc.AsyncPagesFileSave`) and runs rounds. Each ends the dirty
+tracking epoch with tasks running (`DirtyEpoch`'s non-paused form) and copies
+pages to the pages file:
+
+-   round 0 copies every page that may hold data (known-committed ranges, and
+    the `SEEK_DATA` ranges of the others, so that holes are not read), or, for
+    a delta, the pages dirtied since the parent (all of a MemoryFile that the
+    delta saves whole);
+-   round *k* copies the pages dirtied during round *k*−1.
+
+The rounds copy the application MemoryFile and the private MemoryFiles that
+the save saves (those of tmpfs filesystems and overlay upper layers backed by
+a filestore, which `vfs.PrepareSave` records; the Kernel finds them, while
+tasks run, as `tmpfs.MemoryFileOf` the Kernel's filesystems). Dirty tracking
+starts at the end of a save or restore, for the MemoryFiles it saved or
+loaded: a pre-copy starts it, with the Kernel paused for the arming, for those
+that are not tracked yet, the application MemoryFile at a Kernel's first save
+among them. Rounds track first writes in single pages (Sentry write-protection
+otherwise tracks 64 KiB units, in which random writes dirty every unit of a
+large image within a round, so that rounds never converge).
+
+The save then runs in its usual pause. Its epoch, which `endDirtySave` verifies
+and folds back on failure, is the union of the rounds' and its own: the pages
+dirtied since the pre-copy started. The save writes the pages dirtied during
+the last round; every other page refers to its last copy, wherever it is in the
+pages file (`pgalloc.SaveOpts.Precopy`). Copies that a later round or the save
+superseded stay in the pages file unreferenced, which keeps it a stream that an
+object store accepts, at the cost of its size (1.0 to 2.1 times the image
+below). A delta's MemoryFiles that the pre-copy did not copy are saved as
+deltas of the pages dirtied since the parent, rounds included.
+
+### The copier
+
+`SaveTo` assumes a stopped sandbox; the copier (`pgalloc.Precopy`) reads
+MemoryFiles in use. It takes no reference on the pages it copies, unlike
+async page loading, which writes into them: its correctness comes from dirty
+tracking. Every change to a page's contents dirties it, and each round re-arms
+tracking before copying, so a copy that raced with a write, a free or a
+reallocation is superseded by the next round or the save, and a page that the
+save finds clean holds the contents of its last copy, whose hash (for the
+image's page hashes) is computed after the copy was written. A page dirtied
+while it was not allocated is not copied and is marked as of unknown contents,
+so that the save reads it whatever its dirty state: a reallocated page can
+become known-committed without being written (a read, then `UpdateUsage`), and
+would otherwise refer to its previous contents. Dirty tracking verification
+hashes possibly-committed pages too, so that tracking can start while tasks
+run, before a save has made every page known-committed.
+
+### Stop rule
+
+After each round, the bytes dirtied since it started are *pending*, and its
+cost per MiB is measured (the last measure is kept when a round writes less
+than 1 MiB). The rounds stop:
+
+-   when the pending bytes would take at most the budget (`--precopy-budget`,
+    100 ms) to write: QEMU's rule (`migration.c`), which Cloud Hypervisor uses
+    too;
+-   after `--precopy-max-rounds` (8), QEMU's cap;
+-   when a round does not halve the bytes left to write: the sandbox then
+    dirties memory at least half as fast as the store takes it, and more
+    rounds would mostly rewrite the same pages (experiment 06's prototype,
+    without this rule, wrote 7.3 times the image in 8 rounds at 200 MiB/s
+    against a 100 MiB/s store, for a pause no shorter).
+
+Whatever stops them, the save follows (Cloud Hypervisor's "ignore"
+timeout); a pre-copy never aborts a checkpoint.
+
+The kvm platform maps memory into its guest without marking it dirty
+(`MapInternalUntracked`), so that rounds converge there as on systrap: with
+tracked `MapInternal`, every unit mapped writable (as much as a pma at a
+time) was marked, the marks made while tasks run were carried into the next
+epoch, and the halving rule stopped the rounds after the first. A model of
+random writes at rate *r* over *N* MiB, *N*(1 − e^(−*rt*/*N*)) MiB dirty
+after *t*
+(experiment 06's `sim06.py`), predicts the rounds within one, and
+`TestPrecopyStopRule` drives the rule with it.
+
+### `--precopy=auto`
+
+`auto` skips the rounds when the pages the save would write, all of memory or
+a delta's dirty pages, would take at most the budget at the cost of writing
+pages that the Kernel last measured, by a save or a round that wrote at least
+1 MiB (`/checkpoint/pages_write_cost`): on a local disk with `O_DIRECT`, about
+240 MiB per 100 ms. The measure is the sandbox's, not the store's: the Sentry
+does not know which store a pages file goes to, and a restored sandbox has
+none until its first save.
+
+Without a measure, the first round measures it. Deciding earlier, during round
+0's first second, could not shorten the pause: if memory fits the budget at
+the speed measured, round 0 writes it within the budget, before that second
+ends for any budget under a second, and the stop rule then stops the rounds,
+the bytes dirtied during round 0 being at most memory; for larger budgets,
+stopping round 0 early would move the rest of memory into the pause. So the
+first checkpoint with `auto` always runs round 0, and the later ones decide
+before any round.
+
+### Metrics
+
+Metric                                | Kind                                       | What
+------------------------------------- | ------------------------------------------ | ----
+`/checkpoint/precopy_rounds`          | counter                                    | rounds run
+`/checkpoint/precopy_bytes`           | counter                                    | bytes the rounds wrote
+`/checkpoint/precopy_round_bytes`     | distribution                               | bytes each round wrote
+`/checkpoint/precopy_pending_bytes`   | distribution                               | bytes left after each round
+`/checkpoint/pages_write_cost`        | gauge, ns per MiB                          | the last cost measured by a save or round
+`/checkpoint/precopy_stops`           | counter, field `reason`                    | pre-copies by why their rounds stopped: `converged`, `round_cap`, `not_halved`, `skipped`
+`/checkpoint/precopy_pause`           | distribution, ns                           | the pause of each save that completed a pre-copy
+`/checkpoint/precopy_longest_stall`   | distribution, ns                           | per pre-copy, the longest that tasks were kept from running before the pause
+
+Tasks are kept from running while a pre-copy starts dirty tracking (a Kernel
+pause) and while it re-arms the dirty sources for a round (Sentry
+write-protection pauses the Kernel to arm every MemoryManager).
+
+### Measurements
+
+Experiment 06's prototype (256 MiB rewritten at random pages, systrap, 4
+shared vCPUs; a store limited to 100 MiB/s by cgroup `io.max`; budget 100 ms;
+63 restores passed a page-by-page check):
+
+Store                   | Dirty rate         | Stop the world | Pre-copy
+----------------------- | ------------------ | -------------- | --------
+local disk, `O_DIRECT`  | 1 to 200 MiB/s     | 136–189 ms     | 29–69 ms, 1 round, 1.00–1.04 times the image written
+100 MiB/s               | 1 / 10 / 50 MiB/s  | ~2,630 ms      | 116 / 39 / 136 ms, 1 / 2 / 4 rounds, 1.0 / 1.1 / 1.7 times
+100 MiB/s               | 200 MiB/s          | 2,647 ms       | 2,284 ms: 8 rounds without converging, 7.3 times
+
+This implementation, on the same workload (`checkpoint --leave-running
+--direct`, median of 3, pause from the Sentry's log; 48 restores, no bad
+page; verified pre-copies at 50 and 200 MiB/s found no escaped write):
+
+-   local disk: stop-the-world 184, 203, 188 and 192 ms at 1, 10, 50 and
+    200 MiB/s; pre-copy 37, 30, 51 and 68 ms, in 1 round, 1.00 to 1.04 times
+    the image written;
+-   writes limited to 100 MiB/s: stop-the-world 2,626 to 2,643 ms; pre-copy
+    62, 56 and 118 ms at 1, 10 and 50 MiB/s, in 1, 2 and 4 rounds, 1.0, 1.1
+    and 1.7 times the image; at 200 MiB/s the halving rule stops the rounds
+    after the first, for a 2,339 ms pause and 1.85 times the image (the
+    prototype: 8 rounds, 7.3 times).
+
+The fork's benchmark (tier 3, run 37993424590: a C workload of 512 MiB that
+rewrites 5 or 12 % of it per second, Sentry write-protection, `--direct`,
+writes limited to 100 MiB/s, 3 runs): at 5 %/s, pre-copy pauses 83 ms
+(82–89) against 5.40 s stopping the world, after 4 rounds that wrote 694
+MiB; at 12 %/s, more than half the store's speed, the halving rule stops the
+rounds after the first (512 MiB), and the pause is 3.42 s against 5.42 s.
 
 ## Templates
 
@@ -231,6 +385,12 @@ Measured on systrap, with Sentry write-protection at its 64 KiB unit:
     incremental checkpoints and restores.
 -   The syscall tests' `_save_incremental` variants save every test
     incrementally, verified, and restore from the chain.
+-   Pre-copy: in `pkg/sentry/pgalloc`, copies racing with writes and
+    reallocations; in `pkg/sentry/kernel`, the stop rule driven by
+    experiment 06's model, saves completing pre-copies (full, delta, private
+    MemoryFiles, a delta's MemoryFile left uncopied), a pre-copy failing in
+    round 0 or 1 that loses no dirty page, and `--precopy=auto`, with a store
+    slowed by `stateio.RateLimitedWriter`.
 
 ## Prior art
 
@@ -240,3 +400,8 @@ Measured on systrap, with Sentry write-protection at its 64 KiB unit:
 -   Firecracker's diff snapshots, its rule that a failed snapshot folds its
     dirty bitmap back, and its test of it.
 -   containerd's `parent_checkpoint`, which the shim maps.
+-   QEMU's pre-copy migration: its stop rule (pending bytes at the measured
+    bandwidth within the downtime budget) and round cap; Cloud Hypervisor's
+    same rule and its timeout that completes rather than aborts.
+-   CRIU's pre-dump iterations, each a delta of the previous, which pre-copy
+    folds into one image.

@@ -122,6 +122,19 @@ type SaveOpts struct {
 	// digest (checkpointimage.Digest.String) of the image the sandbox was last
 	// saved to or restored from, of which the save writes only the changes.
 	ParentImageDigest string `json:"parent_image_digest"`
+
+	// Precopy, if not empty, makes the save pre-copy memory while the
+	// sandbox runs: "on", or "auto" to skip pre-copy when the previous save's
+	// write cost says that the save would write its pages within
+	// PrecopyBudget anyway. See kernel.PrecopyOpts.
+	Precopy string `json:"precopy"`
+
+	// PrecopyBudget is the time that pre-copy rounds aim to leave to the
+	// save's pause for writing pages.
+	PrecopyBudget time.Duration `json:"precopy_budget"`
+
+	// PrecopyMaxRounds is the maximum number of pre-copy rounds.
+	PrecopyMaxRounds int `json:"precopy_max_rounds"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
@@ -156,6 +169,20 @@ func ConvertToStateSaveOpts(o *SaveOpts) (*state.SaveOpts, error) {
 			return nil, fmt.Errorf("parent image digest: %w", err)
 		}
 		saveOpts.Parent = &d
+	}
+	switch o.Precopy {
+	case "":
+	case "on", "auto":
+		if o.PrecopyBudget <= 0 || o.PrecopyMaxRounds <= 0 {
+			return nil, fmt.Errorf("pre-copy requires a positive budget and round cap, got %v and %d", o.PrecopyBudget, o.PrecopyMaxRounds)
+		}
+		saveOpts.Precopy = &kernel.PrecopyOpts{
+			Budget:    o.PrecopyBudget,
+			MaxRounds: o.PrecopyMaxRounds,
+			Auto:      o.Precopy == "auto",
+		}
+	default:
+		return nil, fmt.Errorf("invalid pre-copy mode %q", o.Precopy)
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
