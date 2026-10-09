@@ -43,6 +43,10 @@ type testDirtySource struct {
 
 	// armErr is returned by Arm.
 	armErr error
+
+	// If onHarvest is not nil, Harvest calls it first: it simulates the
+	// application writes that happen while tasks run.
+	onHarvest func()
 }
 
 func (s *testDirtySource) Name() string { return "test" }
@@ -54,6 +58,9 @@ func (s *testDirtySource) Arm(context.Context, bool) error {
 
 func (s *testDirtySource) Harvest(context.Context) error {
 	s.calls = append(s.calls, "harvest")
+	if s.onHarvest != nil {
+		s.onHarvest()
+	}
 	for _, fr := range s.writes {
 		s.mf.MarkDirty(fr)
 	}

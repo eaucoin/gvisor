@@ -255,6 +255,36 @@ incremental image (more pages with a larger one).
 every page, that no page changed without being tracked, and fail if one did;
 it is meant for tests and debugging.
 
+## Pre-copy
+
+A checkpoint pauses the container while it writes its memory. With
+`--precopy=on` (or `auto`), `runsc checkpoint` first writes memory while the
+container runs, in rounds: the first writes all of memory (or, with
+`--parent-image-path`, the memory written since the parent), and each next
+round writes the memory written during the previous one, as VM live migration
+does. Rounds stop when the memory written during the last one would take at
+most `--precopy-budget` (100 ms by default) to write, at the speed measured
+during that round; after `--precopy-max-rounds` rounds (8); or when a round
+does not halve the memory left to write, as when the container writes memory
+at least half as fast as the checkpoint can write it, where more rounds would
+only write the same memory again. Then the container is paused, and the
+checkpoint writes only the memory written since the last round, besides the
+rest of its state. The image refers to the latest copy of every page, and is
+restored as any other.
+
+```bash
+runsc --dirty-tracking=wp run <container id>
+runsc checkpoint --image-path=<path> --precopy=on --direct <container id>
+```
+
+Pre-copy requires `--dirty-tracking` and an uncompressed image. It pays when
+writing memory takes longer than the budget, as with large containers or slow
+stores; `--precopy=auto` skips it when the previous checkpoint's write speed
+says that the pause would write memory within the budget anyway. The pause
+also includes saving the rest of the container's state, which does not depend
+on its memory size. `--direct` is recommended: writes with `O_DIRECT` cost a
+third of buffered ones per MiB.
+
 ## How to use checkpoint/restore in Docker:
 
 Run a container:

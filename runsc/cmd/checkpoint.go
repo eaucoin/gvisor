@@ -46,6 +46,9 @@ type Checkpoint struct {
 	saveRestoreExecTimeout    time.Duration
 	splitFSCheckpointPaths    string
 	parentImagePath           string
+	precopy                   string
+	precopyBudget             time.Duration
+	precopyMaxRounds          int
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -82,6 +85,9 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 	f.StringVar(&c.parentImagePath, "parent-image-path", "", "make the checkpoint incremental: write only the memory changed since the image at this path, which must be the image the container was last checkpointed to or restored from (with --dirty-tracking), and refer to it for the rest. Restoring the checkpoint then needs that image, found by --layer-path or in the checkpoint's layers/ directory.")
+	f.StringVar(&c.precopy, "precopy", "off", "write memory while the container runs, in rounds over the memory written meanwhile, before pausing it to write the rest: off, on, or auto (on unless the previous checkpoint's write speed says that the pause would write memory within --precopy-budget anyway). Requires --dirty-tracking and an uncompressed image; --direct is recommended.")
+	f.DurationVar(&c.precopyBudget, "precopy-budget", 100*time.Millisecond, "with --precopy, stop the rounds when the memory written during the last one would take at most this long to write in the pause.")
+	f.IntVar(&c.precopyMaxRounds, "precopy-max-rounds", 8, "with --precopy, the maximum number of rounds. Rounds also stop when one does not halve the memory left to write.")
 	f.StringVar(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", "", "comma-separated list of container:path targets to include in the filesystem checkpoint. For capturing all of tmpfs, the value should be \"all-tmpfs\".")
 
 	// Unimplemented flags necessary for compatibility with docker.
@@ -144,6 +150,15 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecContainerID: cont.ID,
 		SplitFSCheckpointPaths:     paths,
 		ParentImagePath:            c.parentImagePath,
+		PrecopyBudget:              c.precopyBudget,
+		PrecopyMaxRounds:           c.precopyMaxRounds,
+	}
+	switch c.precopy {
+	case "off":
+	case "on", "auto":
+		opts.Precopy = c.precopy
+	default:
+		util.Fatalf("invalid --precopy %q: want off, on or auto", c.precopy)
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {

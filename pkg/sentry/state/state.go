@@ -90,6 +90,10 @@ type SaveOpts struct {
 	// memory changed since the image the sandbox was last saved to or
 	// restored from, whose digest *Parent must be. See kernel.Kernel.SaveTo.
 	Parent *checkpointimage.Digest
+
+	// If Precopy is not nil, the save writes memory while the sandbox runs
+	// before pausing it, as Precopy configures. See kernel.Kernel.Precopy.
+	Precopy *kernel.PrecopyOpts
 }
 
 // Close releases resources owned by opts.
@@ -131,6 +135,19 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Infof("Before save wall time: %s", wt.String())
 	}
 
+	var precopy *kernel.Precopy
+	if opts.Precopy != nil {
+		if opts.PagesFile == nil {
+			return fmt.Errorf("pre-copy requires a pages file")
+		}
+		log.Infof("Pre-copying memory while tasks run.")
+		precopy, err = k.Precopy(ctx, opts.PagesFile, opts.Parent, *opts.Precopy) // transfers ownership of opts.PagesFile
+		opts.PagesFile = nil
+		if err != nil {
+			return fmt.Errorf("pre-copy: %w", err)
+		}
+	}
+
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
 	k.ReceiveTaskStates()
@@ -170,10 +187,13 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
 	if err != nil {
 		err = fmt.Errorf("statefile.NewWriter failed: %w", err)
+		if precopy != nil {
+			precopy.Release()
+		}
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, opts.Parent) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, opts.Parent, precopy) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil

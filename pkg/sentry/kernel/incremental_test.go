@@ -38,6 +38,26 @@ import (
 // the error of the save.
 func saveImage(t *testing.T, ctx context.Context, k *Kernel, parent *checkpointimage.Digest, failPages bool) (*checkpointimage.Image, error) {
 	t.Helper()
+	img, _, err := saveImageOpts(t, ctx, k, testSaveOpts{parent: parent, failPages: failPages})
+	return img, err
+}
+
+// testSaveOpts configures saveImageOpts.
+type testSaveOpts struct {
+	// parent is the parent of an incremental save.
+	parent *checkpointimage.Digest
+
+	// If failPages is true, writing the pages file fails.
+	failPages bool
+
+	// If precopy is not nil, the save pre-copies memory first.
+	precopy *PrecopyOpts
+}
+
+// saveImageOpts is saveImage with the options in opts. It also returns the
+// image's directory.
+func saveImageOpts(t *testing.T, ctx context.Context, k *Kernel, opts testSaveOpts) (*checkpointimage.Image, string, error) {
+	t.Helper()
 	dir := t.TempDir()
 	meta, err := os.Create(filepath.Join(dir, "pages_meta.img"))
 	if err != nil {
@@ -48,33 +68,53 @@ func saveImage(t *testing.T, ctx context.Context, k *Kernel, parent *checkpointi
 		t.Fatalf("creating the pages file: %v", err)
 	}
 	flags := unix.O_WRONLY
-	if failPages {
+	if opts.failPages {
 		flags = unix.O_RDONLY
 	}
 	pagesFD, err := unix.Open(pagesPath, flags, 0)
 	if err != nil {
 		t.Fatalf("opening the pages file: %v", err)
 	}
-	pages := stateio.NewPagesFileFDWriterDefault(int32(pagesFD))
+	var pages stateio.AsyncWriter = stateio.NewPagesFileFDWriterDefault(int32(pagesFD))
+
+	// As Kernel.SaveTo does with a pre-copy.
+	var precopy *Precopy
+	if opts.precopy != nil {
+		precopy, err = k.Precopy(ctx, pages, opts.parent, *opts.precopy) // transfers ownership of pages
+		if err != nil {
+			meta.Close()
+			return nil, dir, err
+		}
+		pages = nil
+		defer precopy.Release()
+	}
 
 	e, err := k.beginDirtySave(ctx)
 	if err != nil {
 		t.Fatalf("beginDirtySave: %v", err)
 	}
 	var (
-		delta *incrementalSave
-		img   *checkpointimage.Image
+		delta     *incrementalSave
+		img       *checkpointimage.Image
+		saveEpoch = e
+		lastRound *pgalloc.DirtySet
 	)
-	if parent != nil {
-		delta, err = k.beginIncrementalSave(*parent, e)
+	if precopy != nil {
+		lastRound = e.Sets[k.mf]
+		saveEpoch = precopy.epochSince(e)
+	}
+	if opts.parent != nil {
+		delta, err = k.beginIncrementalSave(*opts.parent, e)
 	}
 	if err == nil {
-		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, map[checkpoint.ResourceID]*pgalloc.MemoryFile{}, false /* appMFExcludeCommittedZeroPages */, delta)
+		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, map[checkpoint.ResourceID]*pgalloc.MemoryFile{}, false /* appMFExcludeCommittedZeroPages */, delta, precopy, lastRound)
 	} else {
 		meta.Close()
-		pages.Close()
+		if pages != nil {
+			pages.Close()
+		}
 	}
-	return img, k.endDirtySave(ctx, e, []*pgalloc.MemoryFile{k.mf}, img, err)
+	return img, dir, k.endDirtySave(ctx, saveEpoch, []*pgalloc.MemoryFile{k.mf}, img, err)
 }
 
 // pageImages returns, for each page of fr, the digest of the image whose
