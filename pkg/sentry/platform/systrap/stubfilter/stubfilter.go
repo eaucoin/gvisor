@@ -24,14 +24,20 @@ import (
 	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 )
 
 // Program names.
 const (
 	// StubProcessName is the program installed in stub processes.
 	StubProcessName = "systrap_stub_process"
+
+	// StubProcessWriteTrackingName is the program installed in stub processes
+	// when the platform tracks writes (see systrap's write_tracking.go).
+	StubProcessWriteTrackingName = "systrap_stub_process_write_tracking"
 
 	// SysmsgThreadName is the program installed in sysmsg threads.
 	SysmsgThreadName = "systrap_sysmsg_thread"
@@ -158,6 +164,35 @@ func StubProcess(vars precompiledseccomp.Values) *seccomp.Program {
 	}
 }
 
+// StubProcessWriteTracking returns StubProcess's program, with the system
+// calls that the Sentry injects in stubs to track writes; application code
+// cannot make them, since the filter of the stub threads that run it traps
+// every system call.
+//
+//   - userfaultfd, with exactly the flags of hostmm.UserfaultfdFlags: a stub
+//     creates the userfaultfd of its address space, which the Sentry uses
+//     through the FD table that stubs share with it.
+//   - mprotect, to the protections that write tracking gives tracked
+//     mappings: a mapping is mapped without write access until it is
+//     write-protected, then given its protection, which includes PROT_WRITE;
+//     and it is made inaccessible (PROT_NONE) before the harvest that precedes
+//     its removal, so that no write lands in between. Other protections, such
+//     as making a mapping executable without write access, are refused.
+func StubProcessWriteTracking(vars precompiledseccomp.Values) *seccomp.Program {
+	program := StubProcess(vars)
+	mprotect := seccomp.Or{
+		seccomp.PerArg{seccomp.AnyValue{}, seccomp.AnyValue{}, seccomp.EqualTo(unix.PROT_NONE)},
+	}
+	for _, at := range []hostarch.AccessType{hostarch.Write, hostarch.ReadWrite, {Write: true, Execute: true}, hostarch.AnyAccess} {
+		mprotect = append(mprotect, seccomp.PerArg{seccomp.AnyValue{}, seccomp.AnyValue{}, seccomp.EqualTo(at.Prot())})
+	}
+	program.RuleSets[0].Rules.Merge(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_USERFAULTFD: seccomp.PerArg{seccomp.EqualTo(hostmm.UserfaultfdFlags)},
+		unix.SYS_MPROTECT:    mprotect,
+	}))
+	return program
+}
+
 // SysmsgThread returns the program that only allows system calls made from
 // the sysmsg code stub.
 func SysmsgThread(vars precompiledseccomp.Values) *seccomp.Program {
@@ -241,6 +276,7 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 		fn   func(precompiledseccomp.Values) *seccomp.Program
 	}{
 		{StubProcessName, StubProcessVars(0, 0), StubProcess},
+		{StubProcessWriteTrackingName, StubProcessVars(0, 0), StubProcessWriteTracking},
 		{SysmsgThreadName, SysmsgThreadVars(0, 0), SysmsgThread},
 		{SyscallThreadName, nil, SyscallThread},
 	} {
