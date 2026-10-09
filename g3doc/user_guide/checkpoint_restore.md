@@ -104,6 +104,18 @@ prioritizes loading that page immediately to unblock the application thread.
 This can dramatically reduce the "Time to First Instruction" for large
 applications.
 
+A page the application touches waits for its own read, not for the background
+reads already under way. gVisor maps memory that is still loading 64 KiB at a
+time, and it bounds the background reads it keeps in flight to what keeps the
+storage busy: the bandwidth the storage delivers times the latency of a
+background read, plus 2 ms. On a disk, which serves reads in order, a touched
+page then waits for about one background read and 2 ms; on a store that serves
+reads in parallel, such as an object store behind the checkpoint gofer, it does
+not wait for them at all. Loading starts with four reads in flight and grows
+until reads begin to queue, as TCP's slow start does. The log line "Async page
+loading completed" reports how many times and how long the application waited
+for pages.
+
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means
 that until the sandbox has fully restored (async page loading has completed):

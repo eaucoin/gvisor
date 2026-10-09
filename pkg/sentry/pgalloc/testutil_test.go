@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -465,21 +466,26 @@ type testPagesFileOpts struct {
 	// reads overlap.
 	latency time.Duration
 
-	// bandwidth is the device's transfer rate in bytes per second; 0 is
-	// unlimited.
+	// bandwidth is the transfer rate of each of the device's channels in
+	// bytes per second; 0 is unlimited.
 	bandwidth uint64
+
+	// channels is the number of reads the device transfers at once, each at
+	// bandwidth: 1 (the default) for a disk or a FUSE connection, several for
+	// an object store serving parallel requests.
+	channels int
 
 	// If manual is true, virtual time advances only when the test calls
 	// advance; otherwise Wait advances it to the completion it waits for.
 	manual bool
 }
 
-// testPagesFile is a stateio.AsyncReader over an in-memory pages file that
-// models a storage device in virtual time: the device transfers one read at a
-// time, in submission order (a FIFO queue, as a disk or a FUSE connection
-// serves reads), at its bandwidth, and each read completes its latency after
-// its transfer ends. A read's data is copied to its destination when it
-// completes.
+// testPagesFile is a stateio.WaitOrAsyncReader over an in-memory pages file
+// that models a storage device in virtual time: the device transfers reads in
+// submission order, on the first of its channels to be free (with one channel,
+// a FIFO queue, as a disk or a FUSE connection serves reads), at its
+// bandwidth, and each read completes its latency after its transfer ends. A
+// read's data is copied to its destination when it completes.
 //
 // The virtual clock makes queueing deterministic: a test can tell, to the
 // nanosecond of virtual time, how long a read waited behind the reads
@@ -496,12 +502,12 @@ type testPagesFile struct {
 	// now is the virtual time.
 	now time.Duration
 
-	// deviceFree is the virtual time at which the device finishes
-	// transferring every submitted read.
-	deviceFree time.Duration
+	// channelFree are the virtual times at which the device's channels finish
+	// transferring the reads submitted to them.
+	channelFree []time.Duration
 
 	// inflight are submitted reads not yet returned by Wait, in completion
-	// order (which is submission order).
+	// order.
 	inflight []*testRead
 
 	// reads records every read ever submitted, in submission order.
@@ -545,11 +551,15 @@ func newTestPagesFile(t *testing.T, data []byte, opts testPagesFileOpts) *testPa
 	if opts.maxParallel == 0 {
 		opts.maxParallel = 16
 	}
+	if opts.channels == 0 {
+		opts.channels = 1
+	}
 	r := &testPagesFile{
-		t:       t,
-		opts:    opts,
-		data:    data,
-		failOff: -1,
+		t:           t,
+		opts:        opts,
+		data:        data,
+		channelFree: make([]time.Duration, opts.channels),
+		failOff:     -1,
 	}
 	r.cond.L = &r.mu
 	return r
@@ -623,30 +633,77 @@ func (r *testPagesFile) submit(id int, off int64, length uint64, dst stateio.Loc
 	if len(r.inflight) >= r.opts.maxParallel {
 		panic(fmt.Sprintf("read %d submitted with %d reads in flight", id, len(r.inflight)))
 	}
-	start := max(r.now, r.deviceFree)
+	ch := 0
+	for i, free := range r.channelFree {
+		if free < r.channelFree[ch] {
+			ch = i
+		}
+	}
+	start := max(r.now, r.channelFree[ch])
 	var transfer time.Duration
 	if r.opts.bandwidth != 0 {
 		transfer = time.Duration(length * uint64(time.Second) / r.opts.bandwidth)
 	}
-	r.deviceFree = start + transfer
+	r.channelFree[ch] = start + transfer
 	rd := &testRead{
 		id:        id,
 		off:       off,
 		len:       length,
 		dst:       dst,
 		submitted: r.now,
-		completed: r.deviceFree + r.opts.latency,
+		completed: r.channelFree[ch] + r.opts.latency,
 	}
-	r.inflight = append(r.inflight, rd)
+	i := len(r.inflight)
+	for i > 0 && r.inflight[i-1].completed > rd.completed {
+		i--
+	}
+	r.inflight = slices.Insert(r.inflight, i, rd)
 	r.reads = append(r.reads, rd)
 	r.cond.Broadcast()
 }
 
 // Wait implements stateio.AsyncReader.Wait.
 func (r *testPagesFile) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
+	return r.wait(cs, minCompletions, nil)
+}
+
+// WaitOr implements stateio.WaitOrAsyncReader.WaitOr.
+func (r *testPagesFile) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]stateio.Completion, error) {
+	return r.wait(cs, 1, wake)
+}
+
+// wait waits for minCompletions reads to complete, or, if wake is not nil, for
+// wake to be readable.
+func (r *testPagesFile) wait(cs []stateio.Completion, minCompletions int, wake <-chan struct{}) ([]stateio.Completion, error) {
+	woken := false // protected by r.mu
+	if wake != nil {
+		select {
+		case <-wake:
+			return cs, nil
+		default:
+		}
+		if r.opts.manual {
+			// Turn a wake into a broadcast of r.cond while blocked below.
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() {
+				select {
+				case <-wake:
+					r.mu.Lock()
+					woken = true
+					r.cond.Broadcast()
+					r.mu.Unlock()
+				case <-stop:
+				}
+			}()
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for {
+		if woken {
+			return cs, nil
+		}
 		if r.closed {
 			return cs, fmt.Errorf("testPagesFile closed")
 		}
@@ -693,6 +750,22 @@ func (r *testPagesFile) complete(rd *testRead) stateio.Completion {
 		off += int64(n)
 	}
 	return c
+}
+
+// nanotime returns r's virtual time in nanoseconds.
+func (r *testPagesFile) nanotime() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int64(r.now)
+}
+
+// useClock makes r's virtual time the clock of async page loading until the
+// test ends. It must be called before startLoad, so that loading stops before
+// the clock is restored.
+func (r *testPagesFile) useClock() {
+	nanotime := aplNanotime
+	aplNanotime = r.nanotime
+	r.t.Cleanup(func() { aplNanotime = nanotime })
 }
 
 // failAt makes reads covering the pages file offset off fail with EIO.
