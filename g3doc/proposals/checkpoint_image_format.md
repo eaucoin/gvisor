@@ -274,6 +274,8 @@ The JSON metadata at the start of `checkpoint.img` holds, among others:
 | --------------- | ------------------------------------------------------------------------ |
 | `runsc_version` | the version of runsc that saved the checkpoint                           |
 | `image_format`  | the version of the pages metadata format, e.g. `2.0`; absent for compressed checkpoints, which have no pages metadata file |
+| `platform`      | the platform the sandbox ran on                                          |
+| `cpu_features`  | the CPU features the sandbox exposed, by name, comma-separated            |
 
 The image's identity and the size of its pages file are not in the state file's
 metadata: the metadata is written before the object graph, and the pages
