@@ -164,11 +164,13 @@ func TestRunscRestoreCLI(t *testing.T) {
 				Detach:     true,
 				Direct:     true,
 				Background: true,
+				LayerPaths: []string{"/parent", "/grandparent"},
 				Paused:     true,
 			},
 			want: []string{
 				"restore", "--bundle=/bundles/app-1", "--image-path=/ckpt",
-				"--detach", "--direct", "--background", "--paused", "cid-1",
+				"--detach", "--direct", "--background",
+				"--layer-path=/parent", "--layer-path=/grandparent", "--paused", "cid-1",
 			},
 		},
 		{
@@ -260,5 +262,54 @@ echo '{"digest": "d", "containers": ["app", "sidecar"]}'
 
 	if _, err := r.ImageInspect(t.Context(), "/invalid"); err == nil || !strings.Contains(err.Error(), "is not a checkpoint image") {
 		t.Errorf("ImageInspect of an invalid image: got error %v, want runsc's", err)
+	}
+}
+
+// TestRunscCheckpointCLI verifies the argv Checkpoint builds.
+func TestRunscCheckpointCLI(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts *CheckpointOpts
+		want []string
+	}{
+		{
+			name: "incremental",
+			opts: &CheckpointOpts{ImagePath: "/ckpt", LeaveRunning: true, ParentImagePath: "/parent"},
+			want: []string{"checkpoint", "--image-path=/ckpt", "--leave-running", "--parent-image-path=/parent", "cid-1"},
+		},
+		{
+			name: "full",
+			opts: &CheckpointOpts{ImagePath: "/ckpt"},
+			want: []string{"checkpoint", "--image-path=/ckpt", "cid-1"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			argsLog := filepath.Join(dir, "args.txt")
+			script := filepath.Join(dir, "fake-runsc")
+			scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >%q\nexit 0\n", argsLog)
+			if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			r := &Runsc{Command: script, Root: filepath.Join(dir, "root")}
+			if err := r.Checkpoint(t.Context(), "cid-1", tc.opts); err != nil {
+				t.Fatalf("Checkpoint: %v", err)
+			}
+			rawArgs, err := os.ReadFile(argsLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Drop the global flags Runsc prepends before the subcommand.
+			args := strings.Fields(string(rawArgs))
+			for i, a := range args {
+				if a == "checkpoint" {
+					args = args[i:]
+					break
+				}
+			}
+			if !slices.Equal(args, tc.want) {
+				t.Errorf("argv = %v, want %v", args, tc.want)
+			}
+		})
 	}
 }
