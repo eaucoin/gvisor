@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
@@ -177,5 +178,166 @@ func TestWorkingSetMapInternal(t *testing.T) {
 	f.StopWorkingSetRecording()
 	if got, want := extentsOf(f.WorkingSet()), []memmap.FileRange{touched}; !equalRanges(got, want) {
 		t.Errorf("working set extents = %v, want %v", got, want)
+	}
+}
+
+// testSlowDisk is a disk that loads a 16 MiB image in 1.6 s, long enough for
+// a working set to be read first.
+var testSlowDisk = testPagesFileOpts{
+	maxReadBytes: 256 << 10,
+	maxParallel:  128,
+	bandwidth:    10 << 20,
+	latency:      100 * time.Microsecond,
+}
+
+// TestAsyncLoadPrefetch checks the order in which a background restore reads
+// a MemoryFile whose image holds a working set: the set first, in its order,
+// then the rest of the pages file, unless prefetching is off or the pages file
+// loads whole too quickly for it to matter.
+func TestAsyncLoadPrefetch(t *testing.T) {
+	const size = 16 << 20
+	for _, tc := range []struct {
+		name     string
+		opts     testPagesFileOpts
+		prefetch PrefetchPolicy
+		// first is true if the working set must be read before the pages
+		// that precede it in the pages file.
+		first bool
+	}{
+		{name: "auto", opts: testSlowDisk, prefetch: PrefetchAuto, first: true},
+		{name: "off", opts: testSlowDisk, prefetch: PrefetchOff},
+		{name: "auto on a fast disk", opts: testFastDisk, prefetch: PrefetchAuto},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr, gens, img := loaderTestImage(t, size)
+			// The working set: 64 KiB at 15 MiB, then 64 KiB at 12 MiB.
+			set := []memmap.FileRange{
+				{fr.Start + 15<<20, fr.Start + 15<<20 + 64*kib},
+				{fr.Start + 12<<20, fr.Start + 12<<20 + 64*kib},
+			}
+			img.img.Proto = proto.Clone(img.img.Proto).(*pgallocpb.ImageProto)
+			img.img.Proto.WorkingSet = workingSetOf(64*kib, set...)
+			r := newTestPagesFile(t, img.pages, tc.opts)
+			r.useClock()
+			restored := newTestMemoryFile(t, testMemoryFileOpts{})
+			l := startLoadWithPrefetch(t, img, r, tc.prefetch, restored)
+			t.Cleanup(func() { releaseAll(t, restored) })
+			if err := l.wait(t); err != nil {
+				t.Fatalf("async page loading failed: %v", err)
+			}
+			gens.checkPages(t, restored, fr)
+			if got := restored.WorkingSet(); !proto.Equal(got, img.img.Proto.WorkingSet) {
+				t.Errorf("restored MemoryFile's working set = %v, want the image's %v", got, img.img.Proto.WorkingSet)
+			}
+
+			read := func(off uint64) testRead {
+				rd, ok := r.readAt(int64(off - fr.Start))
+				if !ok {
+					t.Fatalf("no read of MemoryFile offset %#x", off)
+				}
+				return rd
+			}
+			ws0, ws1 := read(set[0].Start), read(set[1].Start)
+			before := read(fr.Start + 4<<20)
+			if tc.first {
+				if ws0.submitted > ws1.submitted || ws1.submitted > before.submitted {
+					t.Errorf("reads submitted at %v (working set, at 15 MiB), %v (working set, at 12 MiB), %v (at 4 MiB): want the working set first, in its order", ws0.submitted, ws1.submitted, before.submitted)
+				}
+			} else if ws0.submitted < before.submitted || ws1.submitted < before.submitted {
+				t.Errorf("reads submitted at %v (working set, at 15 MiB), %v (working set, at 12 MiB), %v (at 4 MiB): want pages file order", ws0.submitted, ws1.submitted, before.submitted)
+			}
+		})
+	}
+}
+
+// TestAsyncLoadPrefetchParallelPagesFile checks that loading does not read
+// the working set first from an object store that delivers all pages within
+// aplPrefetchMinLoadTime with the reads it serves in parallel, although its
+// first read, alone, would take longer, and that loading then takes no
+// longer than without the set.
+func TestAsyncLoadPrefetchParallelPagesFile(t *testing.T) {
+	const size = 64 << 20
+	took := make(map[PrefetchPolicy]time.Duration)
+	for _, prefetch := range []PrefetchPolicy{PrefetchAuto, PrefetchOff} {
+		fr, gens, img := loaderTestImage(t, size)
+		// A working set of 64 ranges of 64 KiB, one per MiB from the end
+		// of the pages file to its start.
+		var set []memmap.FileRange
+		for off := uint64(size - 1<<20); ; off -= 1 << 20 {
+			set = append(set, memmap.FileRange{fr.Start + off, fr.Start + off + 64*kib})
+			if off == 0 {
+				break
+			}
+		}
+		img.img.Proto = proto.Clone(img.img.Proto).(*pgallocpb.ImageProto)
+		img.img.Proto.WorkingSet = workingSetOf(64*kib, set...)
+		r := newTestPagesFile(t, img.pages, testContendedObjectStore)
+		r.useClock()
+		restored := newTestMemoryFile(t, testMemoryFileOpts{})
+		l := startLoadWithPrefetch(t, img, r, prefetch, restored)
+		if err := l.wait(t); err != nil {
+			t.Fatalf("async page loading failed: %v", err)
+		}
+		gens.checkPages(t, restored, fr)
+		releaseAll(t, restored)
+		if prefetch == PrefetchAuto && l.apfl.prefetched != 0 {
+			t.Errorf("loading read %d bytes of the working set first; want none, since all pages load within %v", l.apfl.prefetched, aplPrefetchMinLoadTime)
+		}
+		for _, rd := range r.readsSnapshot() {
+			took[prefetch] = max(took[prefetch], rd.completed)
+		}
+	}
+	t.Logf("loading took %v with the working set first if worth it, %v without", took[PrefetchAuto], took[PrefetchOff])
+	if took[PrefetchAuto] > took[PrefetchOff] {
+		t.Errorf("loading took %v with the working set first if worth it, longer than %v without", took[PrefetchAuto], took[PrefetchOff])
+	}
+}
+
+// TestAsyncLoadPrefetchFaultWait checks that reading a working set first does
+// not delay a page fault: its read is submitted at once, ahead of the reads
+// of the set that remain.
+func TestAsyncLoadPrefetchFaultWait(t *testing.T) {
+	const size = 16 << 20
+	fr, _, img := loaderTestImage(t, size)
+	// A working set of 4 MiB in the middle of the pages file.
+	img.img.Proto = proto.Clone(img.img.Proto).(*pgallocpb.ImageProto)
+	img.img.Proto.WorkingSet = workingSetOf(64*kib, memmap.FileRange{fr.Start + 6<<20, fr.Start + 10<<20})
+	opts := testSlowDisk
+	opts.manual = true
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoadWithPrefetch(t, img, r, PrefetchAuto, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+
+	// Run until the loader has read the first read of the set.
+	setOff := int64(6 << 20)
+	for {
+		r.advanceToNext()
+		if _, ok := r.readAt(setOff); ok {
+			break
+		}
+	}
+	r.waitPending()
+	last := memmap.FileRange{fr.End - hostarch.PageSize, fr.End}
+	faultAt := time.Duration(r.nanotime())
+	done := awaitAsync(restored, last)
+	waitForWaiters(t, l.apfl, 1)
+	lastOff := int64(last.Start - fr.Start)
+	for rd := r.advanceToNext(); rd.off != lastOff; rd = r.advanceToNext() {
+	}
+	if err := receive(t, done, "the awaited page"); err != nil {
+		t.Fatalf("MapInternal(%v): %v", last, err)
+	}
+	awaited, _ := r.readAt(lastOff)
+	if awaited.submitted != faultAt {
+		t.Errorf("awaited read submitted at %v, want at once, at the fault's %v", awaited.submitted, faultAt)
+	}
+	r.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	if setEnd, ok := r.readAt(10<<20 - hostarch.PageSize); !ok || setEnd.submitted < awaited.submitted {
+		t.Errorf("the end of the working set was read at %v, before the fault's page at %v", setEnd.submitted, awaited.submitted)
 	}
 }
