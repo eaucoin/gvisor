@@ -51,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
@@ -456,9 +457,13 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
+		prefetch := pgalloc.PrefetchAuto
+		if cm.l.root.conf.WorkingSetPrefetch == config.WorkingSetPrefetchOff {
+			prefetch = pgalloc.PrefetchOff
+		}
 		// For background restore, throttle page loading until the kernel is
 		// restored, so that restore does not wait behind page reads.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")
 	}
