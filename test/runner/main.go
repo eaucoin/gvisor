@@ -78,6 +78,8 @@ var (
 	saveBackground   = flag.Bool("save-background", false, "with --save, restores with runsc restore --background, loading memory while the test runs")
 	saveResume       = flag.Bool("save-resume", false, "enables save resume")
 	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
+	dirtyVerify      = flag.Bool("dirty-tracking-verify", false, "enables dirty tracking, verified at every save: saves fail if a page changed without being tracked")
+	dirtyUnit        = flag.Uint64("dirty-tracking-unit", 0, "with --dirty-tracking-verify, the size in bytes of the units in which dirty tracking records first writes; 0 for runsc's default")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
 	inSandboxCgroup  = flag.String("in-sandbox-cgroup", "v1", "cgroup setup to use inside the sandbox (v1 or v2)")
@@ -452,6 +454,12 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	}
 	if *inSandboxCgroup != "" {
 		args = append(args, "-in-sandbox-cgroup="+*inSandboxCgroup)
+	}
+	if *dirtyVerify {
+		args = append(args, "-dirty-tracking=wp", "-dirty-tracking-verify=hash")
+		if *dirtyUnit != 0 {
+			args = append(args, fmt.Sprintf("-dirty-tracking-unit=%d", *dirtyUnit))
+		}
 	}
 
 	testLogDir := ""

@@ -72,7 +72,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -1005,24 +1004,9 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 
 // Preconditions: The kernel must be paused.
 func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
-	invalidated := make(map[*mm.MemoryManager]struct{})
-	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-	for t := range k.tasks.Root.tids {
-		// We can skip locking Task.mu here since the kernel is paused.
-		if memMgr := t.image.MemoryManager; memMgr != nil {
-			if _, ok := invalidated[memMgr]; !ok {
-				if err := memMgr.InvalidateUnsavable(ctx); err != nil {
-					return err
-				}
-				invalidated[memMgr] = struct{}{}
-			}
-		}
-		// I really wish we just had a sync.Map of all MMs...
-		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
-			if err := r.image.MemoryManager.InvalidateUnsavable(ctx); err != nil {
-				return err
-			}
+	for _, memMgr := range k.memoryManagersPaused() {
+		if err := memMgr.InvalidateUnsavable(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
