@@ -134,7 +134,7 @@ An uncompressed checkpoint image is a directory of three files:
 
 The SHA-256 of `pages_meta.img` up to its page hashes identifies the image: it
 covers the location of every saved page and the digest of the page hashes, so
-it changes whenever the image's memory does.
+it changes whenever the image's memory does. `runsc image inspect` prints it.
 
 The pages of an image may be held by the `pages.img` of other images, its
 *layers*, which `pages_meta.img` names by their identity. However long the
@@ -163,6 +163,45 @@ and `layers/<identity>/pages.img`.
 With `--background`, pages are loaded from every layer in parallel, each
 layer's `pages.img` read from start to end, and an access to a page that is not
 loaded yet waits for the layer that holds it.
+
+### Inspecting and rewriting images
+
+`runsc image` reads, checks and rewrites uncompressed checkpoint images without
+a sandbox. It never modifies an image: commands that rewrite one write a new
+image directory, synced before they succeed.
+
+-   `runsc image inspect [--json] IMAGE` prints the image's identity, format
+    version, state file metadata (runsc version, platform, CPU features, time),
+    its layers and where they were found, the memory of each MemoryFile and
+    which layers hold it, and its working set. The JSON output is meant for
+    other tools, such as checkpoint managers listing the checkpoints of every
+    runtime; fields are only ever added to it.
+-   `runsc image verify [--pages] [--host] IMAGE` checks the checksums and
+    consistency of `pages_meta.img` and the identity and size of every layer;
+    with `--pages`, it reads every page and checks it against its hash; with
+    `--host`, it checks that this runsc can restore the image on this host (the
+    same runsc version, the platform, and every CPU feature the image was saved
+    with). Its exit status is 3 if the image is invalid or corrupt, 4 if a layer
+    is missing, and 5 if the image cannot be restored here.
+-   `runsc image flatten --output=DIR IMAGE` writes an image with the same
+    memory, all of it in its own `pages.img`: no layers.
+-   `runsc image compact --output=DIR [--keep-layer=DIGEST]... IMAGE` does the
+    same, but pages held by the kept layers stay there. The new `pages.img` holds
+    only data that the image refers to.
+-   `runsc image rebase --onto=BASE --output=DIR IMAGE` writes an image with the
+    same memory whose pages refer to BASE wherever BASE has the same page at the
+    same place, as is the case for much of the memory of a sandbox restored from
+    BASE: images of sandboxes restored from a common template can share its
+    pages.
+-   `runsc image layers IMAGE` prints the identity of each image that IMAGE
+    refers to, for an image store's garbage collection: an image can be deleted
+    when no image kept lists it.
+
+The commands that rewrite an image take `--working-set-first`: the pages of the
+working set recorded in the image then come first in the new `pages.img`, in
+the order the sandbox touched them, so that a restore, which loads `pages.img`
+in order in the background, loads them first. All of them take
+`--layer-path`, as `runsc restore` does.
 
 ## How to use checkpoint/restore in Docker:
 

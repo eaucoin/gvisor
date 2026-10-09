@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -50,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -1924,6 +1926,194 @@ func TestCheckpointRestore(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// TestCheckpointRestoreLayers restores an image whose pages are partly in
+// another image: a checkpoint rebased by "runsc image rebase" onto an earlier
+// checkpoint of the same container.
+func TestCheckpointRestoreLayers(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			testCheckpointRestoreLayers(t, conf)
+		})
+	}
+}
+
+func testCheckpointRestoreLayers(t *testing.T, conf *config.Config) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	baseDir := filepath.Join(dir, "base")
+	imageDir := filepath.Join(dir, "image")
+	for _, d := range []string{baseDir, imageDir} {
+		if err := os.Mkdir(d, 0777); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+	script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 1; i=$((i+1)); done", outputPath)
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+
+	// Checkpoint the container twice: the base, leaving it running, then the
+	// image, once it has counted further.
+	if err := cont.Checkpoint(conf, baseDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone, Resume: true}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	baseNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	if err := testutil.Poll(func() error {
+		n, err := readOutputNum(outputPath, -1)
+		if err != nil {
+			return err
+		}
+		if n < baseNum+2 {
+			return fmt.Errorf("counted to %d, waiting for %d", n, baseNum+2)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if err := cont.Checkpoint(conf, imageDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	lastNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	cont.Destroy()
+	cont = nil
+
+	// Rebase the image onto the base: most of the container's memory did not
+	// change in between, so the rebased image refers to the base's pages.
+	rebasedDir := filepath.Join(dir, "rebased")
+	cmd := exec.Command(specutils.ExePath, "image", "rebase", "--onto", baseDir, "--output", rebasedDir, imageDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("runsc image rebase: %v\n%s", err, out)
+	}
+	base, err := checkpointimage.ReadMetadataFile(filepath.Join(baseDir, checkpointfiles.PagesMetadataFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebased, err := checkpointimage.ReadMetadataFile(filepath.Join(rebasedDir, checkpointfiles.PagesMetadataFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layers := rebased.Layers(); len(layers) != 2 || layers[1].Digest != base.Digest {
+		t.Fatalf("rebased image has layers %+v, want itself and the base %v", layers, base.Digest)
+	}
+	image, err := checkpointimage.ReadMetadataFile(filepath.Join(imageDir, checkpointfiles.PagesMetadataFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("pages: image %d bytes, rebased image %d bytes and base %d bytes", image.Layers()[0].PagesSize, rebased.Layers()[0].PagesSize, base.Layers()[0].PagesSize)
+
+	// The image records what restoring it requires, and this host has it.
+	out, err := exec.Command(specutils.ExePath, "image", "inspect", "--json", rebasedDir).Output()
+	if err != nil {
+		t.Fatalf("runsc image inspect: %v", err)
+	}
+	var info struct {
+		State struct {
+			Metadata map[string]string `json:"metadata"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		t.Fatalf("runsc image inspect printed %q: %v", out, err)
+	}
+	if md := info.State.Metadata; md[boot.PlatformKey] != conf.Platform || md[boot.CPUFeaturesKey] == "" {
+		t.Errorf("image metadata %v lacks platform %q or CPU features", md, conf.Platform)
+	}
+	if out, err := exec.Command(specutils.ExePath, "image", "verify", "--host", "--pages", "--layer-path", baseDir, rebasedDir).CombinedOutput(); err != nil {
+		t.Errorf("runsc image verify --host: %v\n%s", err, out)
+	}
+
+	restore := func(layerPaths []string, background bool) error {
+		if err := os.Remove(outputPath); err != nil {
+			t.Fatalf("error removing file: %v", err)
+		}
+		outputFile, err := createWriteableOutputFile(outputPath)
+		if err != nil {
+			t.Fatalf("error creating output file: %v", err)
+		}
+		defer outputFile.Close()
+		cont, err := New(conf, Args{
+			ID:        testutil.RandomContainerID(),
+			Spec:      spec,
+			BundleDir: bundleDir,
+		})
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+		defer cont.Destroy()
+		if err := cont.Restore(conf, rebasedDir, layerPaths, false /* direct */, background, nil /* networkArgs */); err != nil {
+			return err
+		}
+		if err := waitForFileNotEmpty(outputFile); err != nil {
+			t.Fatalf("Failed to wait for output file: %v", err)
+		}
+		firstNum, err := readOutputNum(outputPath, 0)
+		if err != nil {
+			t.Fatalf("error with outputFile: %v", err)
+		}
+		if lastNum+1 != firstNum {
+			t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
+		}
+		return nil
+	}
+
+	// Without its layer, the image cannot be restored.
+	if err := restore(nil, false); err == nil {
+		t.Errorf("restoring the rebased image without its layer succeeded")
+	}
+	// The layer given by --layer-path.
+	if err := restore([]string{baseDir}, false /* background */); err != nil {
+		t.Errorf("error restoring container with layer path %q: %v", baseDir, err)
+	}
+	// The layer in the image's layers directory, loaded in the background.
+	layerDir := filepath.Join(rebasedDir, checkpointimage.LayersDir, base.Digest.String())
+	if err := os.MkdirAll(filepath.Dir(layerDir), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(baseDir, layerDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(nil, true /* background */); err != nil {
+		t.Errorf("error restoring container with its layer in %q: %v", layerDir, err)
 	}
 }
 
