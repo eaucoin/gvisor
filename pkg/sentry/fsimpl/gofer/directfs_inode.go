@@ -898,14 +898,15 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
 	if i.isRegularFile() {
+		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
 		if opts.ValidateFileSizes {
-			if i.size.RacyLoad() != uint64(stat.Size) {
-				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, i.size.Load(), stat.Size)}
+			if savedSize != uint64(stat.Size) {
+				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, savedSize, stat.Size)}
 			}
 		}
 		if opts.ValidateFileModificationTimestamps {
-			if want := dentryTimestampFromUnix(stat.Mtime); i.mtime.RacyLoad() != want {
-				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, linux.NsecToStatxTimestamp(i.mtime.RacyLoad()), linux.NsecToStatxTimestamp(want))}
+			if want := dentryTimestampFromUnix(stat.Mtime); savedMtime != want {
+				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, linux.NsecToStatxTimestamp(savedMtime), linux.NsecToStatxTimestamp(want))}
 			}
 		}
 	}

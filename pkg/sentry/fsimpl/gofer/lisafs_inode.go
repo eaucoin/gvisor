@@ -641,20 +641,21 @@ func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opt
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
 	if i.isRegularFile() {
+		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
 		if opts.ValidateFileSizes {
 			if inode.Stat.Mask&linux.STATX_SIZE == 0 {
 				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: file size not available", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID)}
 			}
-			if i.size.RacyLoad() != inode.Stat.Size {
-				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, i.size.Load(), inode.Stat.Size)}
+			if savedSize != inode.Stat.Size {
+				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, savedSize, inode.Stat.Size)}
 			}
 		}
 		if opts.ValidateFileModificationTimestamps {
 			if inode.Stat.Mask&linux.STATX_MTIME == 0 {
 				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: mtime validation failed: mtime not available", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID)}
 			}
-			if want := dentryTimestamp(inode.Stat.Mtime); i.mtime.RacyLoad() != want {
-				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, linux.NsecToStatxTimestamp(i.mtime.RacyLoad()), linux.NsecToStatxTimestamp(want))}
+			if want := dentryTimestamp(inode.Stat.Mtime); savedMtime != want {
+				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, linux.NsecToStatxTimestamp(savedMtime), linux.NsecToStatxTimestamp(want))}
 			}
 		}
 	}
