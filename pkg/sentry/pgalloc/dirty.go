@@ -54,7 +54,9 @@ import (
 // Other writers call MarkDirty: users of the backing file's FD (DataFD) that
 // write through it, and dirty sources, which report application stores
 // through the platform's mappings of the MemoryFile, which the MemoryFile
-// cannot see.
+// cannot see. With write tracking of internal mappings (write_tracking.go),
+// a dirty source also reports the writes through the MemoryFile's internal
+// mappings, including those through MapInternalUntracked's.
 //
 // Async page loading does not mark pages: it restores the contents of the
 // image being loaded, which is the image the next save is relative to.
@@ -201,6 +203,14 @@ type dirtyState struct {
 	// internal marks pages dirtied by MapInternal(Write) since the last swap;
 	// see SwapDirty.
 	internal dirtyBitmap
+
+	// If writesArmed is true, ArmInternalWrites was called: the internal
+	// mappings of the first armedChunks chunks are write-protected for
+	// write tracking (write_tracking.go), and chunks added later are
+	// write-protected as they are mapped. writesArmed and armedChunks are
+	// protected by MemoryFile.mu.
+	writesArmed bool
+	armedChunks int
 
 	// swapMu serializes swaps and protects the fields below. swapMu is
 	// ordered after MemoryFile.mu.

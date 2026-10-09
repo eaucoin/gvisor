@@ -182,6 +182,7 @@ go_library(
         "save_restore.go",
         "unfree_set.go",
         "unwaste_set.go",
+        "write_tracking.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -230,6 +231,7 @@ go_test(
         "precopy_test.go",
         "save_restore_test.go",
         "testutil_test.go",
+        "write_tracking_test.go",
     ],
     library = ":pgalloc",
     deps = [
@@ -237,6 +239,7 @@ go_test(
         "//pkg/context",
         "//pkg/hostarch",
         "//pkg/memutil",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",

@@ -26,6 +26,12 @@ func (c *chunkInfo) sliceAt(fr memmap.FileRange) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(c.mapping+uintptr(fr.Start&chunkMask))), fr.Length())
 }
 
+// loadSliceAt returns the bytes of fr in m, a mapping of a MemoryFile from
+// its start, as returned by MemoryFile.mapLoadMapping.
+func loadSliceAt(m uintptr, fr memmap.FileRange) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(m+uintptr(fr.Start))), fr.Length())
+}
+
 func mincore(s []byte, buf []byte) error {
 	if _, _, errno := unix.RawSyscall(
 		unix.SYS_MINCORE,
