@@ -558,12 +558,14 @@ func (c *Container) endSandboxCreation() error {
 }
 
 // Restore takes a container and replaces its kernel and file system
-// to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, imagePath string, directIO sandbox.DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+// to restore a container from its state file. The image at imagePath may
+// have layers in imagePath/layers or in layerPaths (see
+// checkpointimage.FindLayers).
+func (c *Container) Restore(conf *config.Config, imagePath string, layerPaths []string, directIO sandbox.DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, directIO, background, networkArgs)
+		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, layerPaths, directIO, background, networkArgs)
 	}
 	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
 }
