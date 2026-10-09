@@ -16,6 +16,7 @@
 package alias
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -29,7 +30,16 @@ type aliasType string
 const (
 	aliasBwrap  aliasType = "bwrap"
 	aliasNsjail aliasType = "nsjail"
+
+	// aliasCheckpointctl makes runsc a plugin of checkpointctl
+	// (github.com/checkpoint-restore/checkpointctl), which runs
+	// "checkpointctl-<name> ARGS..." from PATH for "checkpointctl <name>
+	// ARGS...": the plugin runs "runsc image ARGS...".
+	aliasCheckpointctl aliasType = "checkpointctl-runsc"
 )
+
+// checkpointctlPluginDescription describes runsc as a checkpointctl plugin.
+const checkpointctlPluginDescription = "Inspect, verify and rewrite checkpoints of gVisor (runsc) containers"
 
 // HandleAlias routes the command to the appropriate alias handler.
 func HandleAlias() {
@@ -40,6 +50,15 @@ func HandleAlias() {
 		return
 	case aliasNsjail:
 		panic("Nsjail alias not implemented")
+	case aliasCheckpointctl:
+		// checkpointctl asks each plugin for a one-line description by running
+		// it with --plugin-description alone, and uses the answer only if the
+		// plugin exits with status 42.
+		if len(os.Args) == 2 && os.Args[1] == "--plugin-description" {
+			fmt.Println(checkpointctlPluginDescription)
+			os.Exit(42)
+		}
+		os.Args = append([]string{os.Args[0], "image"}, os.Args[1:]...)
 	}
 }
 

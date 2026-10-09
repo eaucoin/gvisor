@@ -33,6 +33,10 @@ type imageDir struct {
 	path string
 	img  *checkpointimage.Image
 
+	// archive is the checkpoint archive that the image was extracted from, or
+	// nil if it was not.
+	archive *archive
+
 	// layerDirs holds the directory of each layer i >= 1 at index i-1, or ""
 	// if it was not found.
 	layerDirs []string
@@ -40,6 +44,41 @@ type imageDir struct {
 	// state is the metadata of the state file, and stateSize its size.
 	state     map[string]string
 	stateSize int64
+}
+
+// openImage opens the image at path: an image directory, or a checkpoint
+// archive of a container engine, which is extracted into a temporary directory
+// (see extractArchive), with the data of its pages files only if withPages is
+// true. It looks for the image's layers in its layers/ directory and in
+// layerPaths. The caller must call close when done with the image.
+func openImage(path string, layerPaths []string, withPages bool) (d *imageDir, close func(), err error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if st.IsDir() {
+		d, err := openImageDir(path, layerPaths)
+		return d, func() {}, err
+	}
+	a, err := extractArchive(path, withPages)
+	if err != nil {
+		return nil, nil, err
+	}
+	if d, err = openImageDir(a.imageDir(), layerPaths); err != nil {
+		a.remove()
+		return nil, nil, err
+	}
+	d.archive = a
+	return d, a.remove, nil
+}
+
+// displayPath returns how to show p, a path of d or of its layers, to the
+// user.
+func (d *imageDir) displayPath(p string) string {
+	if d.archive == nil {
+		return p
+	}
+	return d.archive.displayPath(p)
 }
 
 // openImageDir reads the image in dir, and looks for its layers in
