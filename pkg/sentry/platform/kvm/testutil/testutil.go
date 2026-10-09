@@ -35,6 +35,11 @@ func AddrOfGetpid() uintptr
 func AddrOfTouch() uintptr
 func touch()
 
+// AddrOfStore returns the address of a function that stores to the address in
+// the first register, then executes a syscall, in a loop.
+func AddrOfStore() uintptr
+func store()
+
 // AddrOfSyscallLoop returns the address of a function that executes a syscall
 // and loops.
 func AddrOfSyscallLoop() uintptr

@@ -154,7 +154,9 @@ type untrackedMapper interface {
 // guest accesses it, without recording them as written. The application's
 // writes through them are tracked by dirty tracking's source: the memory
 // manager maps a write-protected pma writable only after the fault of a first
-// write, which it records. Recording every page mapped writable, as
+// write, which it records (wp), or the host records them in the Sentry's
+// write-protected mappings, which guest-physical memory is (uffd; see
+// platform.WriteTrackingInternalMappings). Recording every page mapped writable, as
 // MapInternal does, would report pages that the application did not write,
 // and carry them into the next dirty tracking epoch when the epoch ends while
 // tasks run (pre-copy).
