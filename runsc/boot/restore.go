@@ -69,6 +69,9 @@ const (
 	// ContainerSpecsKey is the key used to add and pop the container specs to the
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
+	// PlatformKey is the key used to save the name of the platform in the save
+	// metadata, for tools that check where an image can be restored.
+	PlatformKey = "platform"
 
 	// TSC snapshot metadata keys. These are written by the save side in
 	// pkg/sentry/state and consumed by computeTSCOffset.
@@ -908,6 +911,7 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	saveOpts.Metadata[VersionKey] = version.Version()
 
 	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
+	saveOpts.Metadata[PlatformKey] = l.root.conf.Platform
 	if l.noRootContainer.enabled {
 		saveOpts.Metadata[noRootContainerKey] = "true"
 	}
