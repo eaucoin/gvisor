@@ -105,8 +105,8 @@ http_file(
 
 http_file(
     name = "github_workflow_schema",
-    sha256 = "7499ccb3e75975504ea1ee7c70291e0c9f6c1f684678091d013061fe263e3ddb",
-    urls = ["https://raw.githubusercontent.com/SchemaStore/schemastore/166136b96a14f103a948053903e9339e63ad9170/src/schemas/json/github-workflow.json"],
+    sha256 = "d10c9f4656e1bd5bc6727e9b35080e017dc167154726fca93da33c7a6bd1c4f3",
+    urls = ["https://raw.githubusercontent.com/SchemaStore/schemastore/8b994c014937a9332f2fb53d993eb1a30705677c/src/schemas/json/github-workflow.json"],
 )
 
 # Root certificates.
