@@ -95,6 +95,7 @@ def _syscall_test(
         directfs = False,
         leak_check = False,
         save = False,
+        save_background = False,
         save_resume = False,
         nftables = False,
         kvm_use_cpu_nums = True,
@@ -122,6 +123,8 @@ def _syscall_test(
         name += "_directfs"
     if save:
         name += "_save"
+    if save_background:
+        name += "_background"
     if save_resume:
         name += "_save_resume"
     if nftables:
@@ -196,6 +199,7 @@ def _syscall_test(
         "--directfs=" + str(directfs),
         "--leak-check=" + str(leak_check),
         "--save=" + str(save),
+        "--save-background=" + str(save_background),
         "--save-resume=" + str(save_resume),
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
@@ -559,6 +563,32 @@ def syscall_test(
             False,  # save_resume, generate all tests without save_resume variant.
             "large",  # size, use size as large by default for all S/R tests.
             "long",  # timeout, use long timeout for S/R tests.
+            nftables = nftables,
+            kvm_use_cpu_nums = kvm_use_cpu_nums,
+            in_sandbox_cgroup = in_sandbox_cgroup,
+            **kwargs
+        )
+
+        # Restore lazily, loading memory while the test runs, on the default
+        # platform.
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = use_tmpfs,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            add_host_tty = add_host_tty,
+            tags = platforms.get(default_platform, []) + tags,
+            iouring = iouring,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            save = True,
+            save_background = True,
+            size = "large",
+            timeout = "long",
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
