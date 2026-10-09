@@ -18,19 +18,20 @@
 
     compare.py BASELINE.jsonl NEW.jsonl [--threshold 0.2] [--floor 0.02]
 
-Each measurement is the median of its repetitions: the checkpoint's duration
-and the pause the workload saw, and for each restore variant the time until
-the command returned, until the workload's first answer, and to touch every
-page. It prints a Markdown table and exits with 1 when a measurement of the
-new run is worse than the baseline's by more than the threshold (a fraction)
-and by more than the floor (seconds), which keeps a few milliseconds of noise
-on short measurements from counting as regressions.
+Each measurement is the median of its repetitions' values (bench.py's "values":
+times, sizes, rounds, the cost of writes; lower is better for all of them). It
+prints a Markdown table and exits with 1 when a measurement of the new run is
+worse than the baseline's by more than the threshold (a fraction) and by more
+than its unit's floor (--floor seconds; 1 MiB; 1 round; 0.5 µs), which keeps
+noise on short measurements from counting as regressions. Ratios are shown,
+not judged.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 
@@ -43,19 +44,15 @@ def measurements(path: str) -> dict[tuple[str, str], float]:
             if not line.strip():
                 continue
             r = json.loads(line)
-            config = (f"{r['workload']} {r['mib']} MiB, dirty {r['dirty_pct_per_s']}%/s, "
-                      f"checkpoint {' '.join(r['checkpoint_flags']) or '(defaults)'}")
-            found = {"checkpoint (s)": r["checkpoint_s"]}
-            if "checkpoint_pause_ms" in r:
-                found["pause inside (s)"] = r["checkpoint_pause_ms"] / 1e3
-            for rr in r.get("restores", []):
-                name = rr["restore"]
-                found[f"restore {name}: command (s)"] = rr["command_s"]
-                found[f"restore {name}: first answer (s)"] = rr["first_answer_s"]
-                found[f"restore {name}: touch all (s)"] = rr["touch_all_s"]
-            for key, value in found.items():
-                values.setdefault((config, key), []).append(value)
+            for name, value in r["values"].items():
+                values.setdefault((r["config"], name), []).append(value)
     return {k: statistics.median(v) for k, v in values.items()}
+
+
+def floor(name: str, seconds: float) -> float | None:
+    """The smallest regression of the measurement that counts, or None if it is not judged."""
+    unit = m[1] if (m := re.search(r"\((\w+)\)$", name)) else "rounds"
+    return {"s": seconds, "MiB": 1.0, "rounds": 1.0, "µs": 0.5}.get(unit)
 
 
 def main() -> None:
@@ -76,7 +73,8 @@ def main() -> None:
             continue
         b, n = base[key], new[key]
         change = (n - b) / b if b else 0.0
-        worse = n - b > a.floor and change > a.threshold
+        least = floor(name, a.floor)
+        worse = least is not None and n - b > least and change > a.threshold
         regressions += worse
         mark = " **regression**" if worse else ""
         print(f"| {config} | {name} | {b:.3f} | {n:.3f} | {change:+.0%}{mark} |")
