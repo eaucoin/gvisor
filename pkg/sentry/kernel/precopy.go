@@ -60,6 +60,15 @@ type PrecopyOpts struct {
 	// save would write its pages within Budget anyway. Without such a
 	// measure, the first round measures it.
 	Auto bool
+
+	// If Throttle is true, a round that does not halve the bytes left to
+	// write does not stop the rounds the first time: instead, each
+	// MemoryManager's tasks may then dirty memory at most at a quarter of the
+	// write bandwidth measured, until the save completes, as QEMU's
+	// dirty-limit does for vCPUs. Only the tasks that dirty memory faster are
+	// delayed, after the faults that record their first writes, so
+	// throttling requires the write-protection dirty source.
+	Throttle bool
 }
 
 // Precopy is a pre-copy that a save completes; see Kernel.Precopy.
@@ -81,6 +90,9 @@ type Precopy struct {
 
 	// stats describes the rounds.
 	stats precopyStats
+
+	// k is the Kernel being saved.
+	k *Kernel
 }
 
 // precopyStats describes the rounds of a pre-copy.
@@ -95,8 +107,9 @@ type precopyStats struct {
 	stop precopyStop
 
 	// longestStall is the longest that the pre-copy kept tasks from running:
-	// while it started dirty tracking, or re-armed the dirty sources for a
-	// round (the write-protection source stops tasks while it arms).
+	// while it started dirty tracking, re-armed the dirty sources for a
+	// round (the write-protection source stops tasks while it arms), or
+	// delayed a task to limit its dirtying.
 	longestStall time.Duration
 }
 
@@ -175,8 +188,13 @@ var (
 		Description: "Pre-copies, by why their rounds stopped: converged (the pages dirtied during the last round would take at most the budget to write), round_cap (the maximum number of rounds), not_halved (a round did not halve the bytes left to write), or skipped (--precopy=auto found that the save would write its pages within the budget anyway).",
 		Fields:      []metric.Field{metric.NewField("reason", precopyStopReasons[precopyConverged:]...)},
 	})
+	precopyThrottled = metric.MustCreateNewUint64Metric("/checkpoint/precopy_throttled_ns", metric.Uint64Metadata{
+		Cumulative:  true,
+		Unit:        metricpb.MetricMetadata_UNITS_NANOSECONDS,
+		Description: "Nanoseconds that tasks were delayed to limit their dirtying of memory during pre-copies.",
+	})
 	precopyLongestStall = metric.MustCreateNewTimerMetric("/checkpoint/precopy_longest_stall", precopyTimeBucketer(100*time.Microsecond),
-		"Longest time that each pre-copy kept tasks from running: while it started dirty tracking, or re-armed the dirty sources for a round.")
+		"Longest time that each pre-copy kept tasks from running: while it started dirty tracking, re-armed the dirty sources for a round, or delayed a task to limit its dirtying.")
 	precopyPause = metric.MustCreateNewTimerMetric("/checkpoint/precopy_pause", precopyTimeBucketer(time.Millisecond),
 		"Time that each save completing a pre-copy paused the sandbox.")
 	pagesWriteCostMetric = metric.MustCreateNewUint64Metric("/checkpoint/pages_write_cost", metric.Uint64Metadata{
@@ -205,7 +223,7 @@ func (k *Kernel) Precopy(ctx context.Context, pagesFile stateio.AsyncWriter, par
 // precopy is Precopy, with privates the private MemoryFiles that the save
 // will save.
 func (k *Kernel) precopy(ctx context.Context, pagesFile stateio.AsyncWriter, parent *checkpointimage.Digest, privates []*pgalloc.MemoryFile, opts PrecopyOpts) (*Precopy, error) {
-	p := &Precopy{apfsDone: make(chan struct{})}
+	p := &Precopy{apfsDone: make(chan struct{}), k: k}
 	apfs, err := pgalloc.StartAsyncPagesFileSave(pagesFile, func(err error) {
 		p.apfsErr = err
 		close(p.apfsDone)
@@ -239,6 +257,8 @@ func (k *Kernel) privateMemoryFiles(ctx context.Context) []*pgalloc.MemoryFile {
 // are returned to the dirty sets, so that the next save writes them. SaveTo
 // releases the Precopy it is given.
 func (p *Precopy) Release() {
+	p.k.setDirtyLimit(0)
+	p.stalled(time.Duration(p.k.dirtyLimitLongestDelay.Swap(0)))
 	for _, e := range p.rounds {
 		e.Abort()
 	}
@@ -328,7 +348,10 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 		p.mfs[mf] = pc
 	}
 	start := time.Now()
-	var copied uint64
+	var (
+		copied     uint64
+		throttling bool
+	)
 	for round := 0; ; round++ {
 		e, stall, err := k.precopyEpoch(ctx)
 		p.stalled(stall)
@@ -377,7 +400,14 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 		p.stats.roundBytes = append(p.stats.roundBytes, n)
 		p.stats.pendingBytes = append(p.stats.pendingBytes, pending)
 		log.Infof("Pre-copy round %d: wrote %d bytes in %v; %d bytes dirty since, %v to write (budget %v)", round, n, took, pending, writeTime(pending, cost), opts.Budget)
-		if stop := precopyNext(round, n, pending, cost, opts); stop != precopyContinue {
+		stop, throttle := precopyNext(round, n, pending, cost, opts, throttling)
+		if throttle {
+			throttling = true
+			limit := precopyThrottleLimit(cost)
+			k.setDirtyLimit(limit)
+			log.Infof("Pre-copy: limiting each MemoryManager's dirtying to %d bytes/s", limit)
+		}
+		if stop != precopyContinue {
 			p.stats.stop = stop
 			precopyStops.Increment(precopyStopReasons[stop])
 			log.Infof("Pre-copy done after %d rounds (%v): %d bytes in %v", round+1, stop, copied, time.Since(start))
@@ -387,20 +417,73 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 }
 
 // precopyNext decides what follows round, which wrote written bytes and left
-// pending bytes dirty, at cost per MiB. It is QEMU's stop rule, with its round
-// cap, and an early stop when a round does not halve the bytes left to write.
-func precopyNext(round int, written, pending uint64, cost time.Duration, opts PrecopyOpts) precopyStop {
+// pending bytes dirty, at cost per MiB, with dirtying throttled if throttling
+// is true. It returns why the rounds stop, or precopyContinue; and whether to
+// throttle dirtying from now on. It is QEMU's stop rule, with its round cap,
+// and an early stop when a round does not halve the bytes left to write,
+// which throttling, if opts.Throttle, defers once.
+func precopyNext(round int, written, pending uint64, cost time.Duration, opts PrecopyOpts, throttling bool) (stop precopyStop, throttle bool) {
 	switch {
 	case writeTime(pending, cost) <= opts.Budget:
-		return precopyConverged
+		return precopyConverged, false
 	case round+1 >= opts.MaxRounds:
-		return precopyRoundCap
+		return precopyRoundCap, false
 	case 2*pending > written:
 		// The dirty rate is at least half the write bandwidth: more rounds
-		// would mostly write the same pages again.
-		return precopyNotHalved
+		// would mostly write the same pages again, unless dirtying is
+		// throttled.
+		if opts.Throttle && !throttling {
+			return precopyContinue, true
+		}
+		return precopyNotHalved, false
 	default:
-		return precopyContinue
+		return precopyContinue, false
+	}
+}
+
+// precopyThrottleLimit returns the rate in bytes per second to which
+// throttling limits each MemoryManager's dirtying, given the write cost per
+// MiB: a quarter of the write bandwidth, at which each round writes at most a
+// quarter of the bytes of the previous one.
+func precopyThrottleLimit(cost time.Duration) uint64 {
+	return uint64(float64(1<<20) / cost.Seconds() / 4)
+}
+
+// setDirtyLimit sets the rate in bytes per second to which each
+// MemoryManager's tasks may dirty memory, or removes the limit if limit is 0.
+func (k *Kernel) setDirtyLimit(limit uint64) {
+	if limit != 0 {
+		k.dirtyLimitSession.Add(1)
+		k.dirtyLimitLongestDelay.Store(0)
+	}
+	k.dirtyLimit.Store(limit)
+}
+
+// throttleDirtying delays t, which just handled a fault, as long as its
+// MemoryManager is over the dirtying limit, if any; see PrecopyOpts.Throttle.
+// A signal or a stop ends the delay early: the task then delays again at its
+// next fault.
+func (t *Task) throttleDirtying() {
+	limit := t.k.dirtyLimit.Load()
+	if limit == 0 {
+		return
+	}
+	d := t.MemoryManager().DirtyThrottleDelay(limit, t.k.dirtyLimitSession.Load(), t.k.MonotonicClock().Now().Nanoseconds())
+	if d <= 0 {
+		return
+	}
+	left, _ := t.BlockWithTimeout(nil, true, d)
+	t.k.recordThrottleDelay(d - left)
+}
+
+// recordThrottleDelay records that the dirtying limit delayed a task for d.
+func (k *Kernel) recordThrottleDelay(d time.Duration) {
+	precopyThrottled.IncrementBy(uint64(d))
+	for {
+		longest := k.dirtyLimitLongestDelay.Load()
+		if int64(d) <= longest || k.dirtyLimitLongestDelay.CompareAndSwap(longest, int64(d)) {
+			return
+		}
 	}
 }
 
