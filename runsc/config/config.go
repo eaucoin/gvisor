@@ -457,6 +457,8 @@ type Config struct {
 	// syscall tests: "none" writes a separate pages file, which runsc restore
 	// --background loads lazily.
 	TestOnlyAutosaveCompression string `flag:"TESTONLY-autosave-compression"`
+	// TestOnlyAutosaveKind tells what saves of syscall tests save.
+	TestOnlyAutosaveKind AutosaveKind `flag:"TESTONLY-autosave-kind"`
 
 	// TestOnlyRestoreReadRate, if not 0, limits the rate at which a restore
 	// reads its pages files, in bytes per second, as a throttled disk does,
@@ -829,6 +831,51 @@ func (d DirtyTrackingMode) String() string {
 		return "wp"
 	}
 	panic(fmt.Sprintf("Invalid dirty tracking mode %d", d))
+}
+
+// AutosaveKind tells what the auto saves of syscall tests save.
+type AutosaveKind int
+
+const (
+	// AutosaveFull saves the whole sandbox.
+	AutosaveFull AutosaveKind = iota
+
+	// AutosaveIncremental saves incrementally, of the image the sandbox was
+	// restored from, if any; it requires dirty tracking.
+	AutosaveIncremental
+)
+
+func autosaveKindPtr(v AutosaveKind) *AutosaveKind {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (a *AutosaveKind) Set(v string) error {
+	switch v {
+	case "full":
+		*a = AutosaveFull
+	case "incremental":
+		*a = AutosaveIncremental
+	default:
+		return fmt.Errorf("invalid autosave kind %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (a *AutosaveKind) Get() any {
+	return *a
+}
+
+// String implements flag.Value.
+func (a AutosaveKind) String() string {
+	switch a {
+	case AutosaveFull:
+		return "full"
+	case AutosaveIncremental:
+		return "incremental"
+	}
+	panic(fmt.Sprintf("Invalid autosave kind %d", a))
 }
 
 // DirtyTrackingVerifyMode tells whether checkpoints verify that dirty tracking

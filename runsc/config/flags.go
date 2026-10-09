@@ -201,6 +201,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
 	flagSet.String("TESTONLY-autosave-compression", "flate-best-speed", "TEST ONLY; compression level of auto saves for syscall tests: none|flate-best-speed.")
 	flagSet.Uint64("TESTONLY-restore-read-rate", 0, "TEST ONLY; limit the rate at which a restore reads pages files, in bytes per second, as a throttled disk does; 0 for no limit.")
+	flagSet.Var(autosaveKindPtr(AutosaveFull), "TESTONLY-autosave-kind", "TEST ONLY; what the auto saves of syscall tests save: full (default), or incremental, of the image the sandbox was restored from (requires --dirty-tracking).")
 
 	RegisterDeprecatedFlags(flagSet)
 }

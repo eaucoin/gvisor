@@ -80,6 +80,7 @@ var (
 	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
 	dirtyVerify      = flag.Bool("dirty-tracking-verify", false, "enables dirty tracking, verified at every save: saves fail if a page changed without being tracked")
 	dirtyUnit        = flag.Uint64("dirty-tracking-unit", 0, "with --dirty-tracking-verify, the size in bytes of the units in which dirty tracking records first writes; 0 for runsc's default")
+	saveIncremental  = flag.Bool("save-incremental", false, "with -save, makes saves incremental, of the image the sandbox was restored from, in chains of at most incrementalChainLength images that each start with a full save, and restores from the chain of images")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
 	inSandboxCgroup  = flag.String("in-sandbox-cgroup", "v1", "cgroup setup to use inside the sandbox (v1 or v2)")
@@ -101,6 +102,15 @@ const (
 
 	// uniqueXMLSuffix is the suffix for individual per-testcase XML outputs.
 	uniqueXMLSuffix = ".unique.xml"
+
+	// incrementalChainLength is the most images in a chain of incremental
+	// saves with -save-incremental: a full save, then deltas, each of the
+	// image before it. Deployments bound chains the same way, by a full
+	// checkpoint or by compacting the chain (runsc image compact), since
+	// restoring an image opens every image of its chain; a test makes
+	// thousands of saves, which unbounded chains turn into restores that
+	// each look through thousands of layers.
+	incrementalChainLength = 16
 )
 
 // getSetupContainerPath returns the path to the setup_container binary.
@@ -336,9 +346,10 @@ func prepareSave(args []string, undeclaredOutputsDir string, index int) ([]strin
 	}
 	// Pass the directory path of the state file to the sandbox.
 	args = append(args, "-TESTONLY-autosave-image-path", dir)
-	if *saveBackground {
+	if *saveBackground || *saveIncremental {
 		// runsc restore --background loads only a separate pages file
-		// lazily.
+		// lazily, and incremental saves refer to the pages files of
+		// their parents.
 		args = append(args, "-TESTONLY-autosave-compression=none")
 	}
 	return args, dir, nil
@@ -455,8 +466,11 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	if *inSandboxCgroup != "" {
 		args = append(args, "-in-sandbox-cgroup="+*inSandboxCgroup)
 	}
+	if *dirtyVerify || *saveIncremental {
+		args = append(args, "-dirty-tracking=wp")
+	}
 	if *dirtyVerify {
-		args = append(args, "-dirty-tracking=wp", "-dirty-tracking-verify=hash")
+		args = append(args, "-dirty-tracking-verify=hash")
 		if *dirtyUnit != 0 {
 			args = append(args, fmt.Sprintf("-dirty-tracking-unit=%d", *dirtyUnit))
 		}
@@ -648,6 +662,15 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			return fmt.Errorf("run error: %v", err)
 		}
 
+		// With -save-incremental, the images of the current chain before the
+		// last are the layers of the last.
+		var layerDirs []string
+		defer func() {
+			for _, dir := range layerDirs {
+				os.RemoveAll(dir)
+			}
+		}()
+
 		// Restore the sandbox with the previous state file.
 		for i := 1; ; i++ {
 			if signalled.Load() {
@@ -679,9 +702,21 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 				os.RemoveAll(currentRestoreDir)
 				return fmt.Errorf("prepareSave error: %v", err)
 			}
+			if *saveIncremental {
+				// The sandbox saves image i, which starts a new chain
+				// every incrementalChainLength images.
+				kind := "incremental"
+				if i%incrementalChainLength == 0 {
+					kind = "full"
+				}
+				restoreArgs = append(restoreArgs, "-TESTONLY-autosave-kind="+kind)
+			}
 			restoreArgs = append(restoreArgs, "restore", "--image-path", currentRestoreDir, "--bundle", bundleDir)
 			if *saveBackground {
 				restoreArgs = append(restoreArgs, "--background")
+			}
+			for _, dir := range layerDirs {
+				restoreArgs = append(restoreArgs, "--layer-path", dir)
 			}
 			restoreArgs = append(restoreArgs, id)
 			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
@@ -699,6 +734,20 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 				os.RemoveAll(currentRestoreDir)
 				os.RemoveAll(currentSaveDir)
 				return fmt.Errorf("after restore error: %v", err)
+			}
+			if *saveIncremental {
+				// Image i-1, which the sandbox now runs from, is a
+				// layer of the images after it in its chain. If it is
+				// full, it started a new chain, and the images of the
+				// previous one are layers of no image left.
+				if (i-1)%incrementalChainLength == 0 {
+					for _, dir := range layerDirs {
+						os.RemoveAll(dir)
+					}
+					layerDirs = layerDirs[:0]
+				}
+				layerDirs = append(layerDirs, currentRestoreDir)
+				continue
 			}
 			// After the restore is successful, we can delete the checkpoint we restored from.
 			os.RemoveAll(currentRestoreDir)
