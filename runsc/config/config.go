@@ -478,6 +478,15 @@ type Config struct {
 	// changes since the checkpoint.
 	RestoreValidateFiles RestoreValidateFilesPolicy `flag:"restore-validate-files"`
 
+	// WorkingSetWindow is how long after a restore the memory that the
+	// application touches is recorded as its working set, which the next
+	// checkpoint saves in its image. 0, the default, disables recording,
+	// which costs a page fault per unit of memory touched while it lasts.
+	WorkingSetWindow time.Duration `flag:"working-set-window"`
+
+	// WorkingSetUnit is the granularity of working sets.
+	WorkingSetUnit WorkingSetUnit `flag:"working-set-unit"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -1917,6 +1926,57 @@ func (p RestoreValidateFilesPolicy) String() string {
 		return "all"
 	default:
 		panic(fmt.Sprintf("invalid restore file validation policy %d", p))
+	}
+}
+
+// WorkingSetUnit is the granularity of working sets in bytes.
+type WorkingSetUnit uint64
+
+// WorkingSetUnit values.
+const (
+	// WorkingSetUnit4K records working sets in pages: they hold no memory
+	// that was not touched, at the cost of a page fault for every page
+	// touched while they are recorded.
+	WorkingSetUnit4K WorkingSetUnit = 4 << 10
+
+	// WorkingSetUnit64K records working sets in units of 64 KiB, the unit in
+	// which a background restore maps memory while it loads.
+	WorkingSetUnit64K WorkingSetUnit = 64 << 10
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (u *WorkingSetUnit) Set(v string) error {
+	switch v {
+	case "4K":
+		*u = WorkingSetUnit4K
+	case "64K":
+		*u = WorkingSetUnit64K
+	default:
+		return fmt.Errorf("invalid working set unit %q: must be 4K or 64K", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `u`.
+// Useful in flag declaration line.
+func (u WorkingSetUnit) Ptr() *WorkingSetUnit {
+	return &u
+}
+
+// Get implements flag.Get.
+func (u *WorkingSetUnit) Get() any {
+	return *u
+}
+
+// String implements flag.String.
+func (u WorkingSetUnit) String() string {
+	switch u {
+	case WorkingSetUnit4K:
+		return "4K"
+	case WorkingSetUnit64K:
+		return "64K"
+	default:
+		panic(fmt.Sprintf("invalid working set unit %d", u))
 	}
 }
 

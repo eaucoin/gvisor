@@ -669,6 +669,12 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	// Record the memory that the application touches first, which the next
+	// checkpoint saves as the image's working set.
+	if conf := l.root.conf; conf.WorkingSetWindow > 0 {
+		l.k.MemoryFile().StartWorkingSetRecording(uint64(conf.WorkingSetUnit), conf.WorkingSetWindow)
+	}
+
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
