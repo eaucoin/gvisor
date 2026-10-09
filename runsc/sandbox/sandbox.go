@@ -2065,11 +2065,12 @@ type CheckpointOpts struct {
 	// saved to or restored from.
 	ParentImagePath string
 
-	// Precopy, PrecopyBudget and PrecopyMaxRounds configure pre-copy; see
-	// control.SaveOpts.
+	// Precopy, PrecopyBudget, PrecopyMaxRounds and PrecopyThrottle configure
+	// pre-copy; see control.SaveOpts.
 	Precopy          string
 	PrecopyBudget    time.Duration
 	PrecopyMaxRounds int
+	PrecopyThrottle  bool
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2104,6 +2105,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Precopy:          opts.Precopy,
 		PrecopyBudget:    opts.PrecopyBudget,
 		PrecopyMaxRounds: opts.PrecopyMaxRounds,
+		PrecopyThrottle:  opts.PrecopyThrottle,
 	}
 	if opts.StateEngine != nil {
 		useGraph := *opts.StateEngine == config.StateEngineGraph
