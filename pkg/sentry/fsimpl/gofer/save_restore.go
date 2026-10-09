@@ -121,12 +121,8 @@ func (d *dentry) prepareSaveDead(ctx context.Context) error {
 		return fmt.Errorf("gofer.dentry(%q).prepareSaveDead: invalidated dentries can't be saved", genericDebugPathname(d.inode.fs, d))
 	}
 	if d.inode.isRegularFile() {
-		if !d.inode.cachedMetadataAuthoritative() {
-			// Get updated metadata for d in case we need to perform metadata
-			// validation during restore.
-			if err := d.inode.updateMetadata(ctx); err != nil {
-				return err
-			}
+		if err := d.saveRemoteMetadata(ctx); err != nil {
+			return err
 		}
 		if err := d.prepareSaveDeletedRegularFile(ctx); err != nil {
 			return err
@@ -177,11 +173,29 @@ func (d *dentry) prepareSaveDeletedRegularFile(ctx context.Context) error {
 	return nil
 }
 
+// saveRemoteMetadata gets the remote file's metadata in case we need to
+// perform metadata validation during restore: d's cached metadata, unless it
+// is authoritative. Synthetic files have no remote file.
+//
+// Preconditions: d.inode.isRegularFile().
+func (d *dentry) saveRemoteMetadata(ctx context.Context) error {
+	if d.inode.isSynthetic() {
+		return nil
+	}
+	if !d.inode.cachedMetadataAuthoritative() {
+		return d.inode.updateMetadata(ctx)
+	}
+	size, mtime, err := d.inode.remoteSizeAndMtime(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to stat %q: %w", genericDebugPathname(d.inode.fs, d), err)
+	}
+	d.inode.savedHostSize, d.inode.savedHostMtime = size, mtime
+	return nil
+}
+
 func (d *dentry) prepareSaveRecursive(ctx context.Context) error {
-	if d.inode.isRegularFile() && !d.inode.cachedMetadataAuthoritative() {
-		// Get updated metadata for d in case we need to perform metadata
-		// validation during restore.
-		if err := d.inode.updateMetadata(ctx); err != nil {
+	if d.inode.isRegularFile() {
+		if err := d.saveRemoteMetadata(ctx); err != nil {
 			return err
 		}
 	}
