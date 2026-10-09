@@ -189,8 +189,14 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	if opts.Resume {
 		k.BeforeResume(ctx)
 	} else {
-		// Kill the sandbox.
-		k.Kill(linux.WaitStatusExit(0))
+		// Kill the sandbox. An autosave that dirty tracking verification
+		// failed fails the test that made it: the image is complete, and the
+		// test would otherwise go on from it.
+		status := linux.WaitStatusExit(0)
+		if opts.Autosave && errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
+			status = linux.WaitStatusExit(1)
+		}
+		k.Kill(status)
 	}
 	return err
 }
