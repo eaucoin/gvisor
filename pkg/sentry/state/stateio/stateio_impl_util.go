@@ -120,12 +120,28 @@ func CompletionChanWait(ch <-chan Completion, cs []Completion, minCompletions in
 		cs = append(cs, <-ch)
 		minCompletions--
 	}
+	return appendReadyCompletions(ch, cs), nil
+}
+
+// CompletionChanWaitOr implements WaitOrAsyncReader.WaitOr by receiving from a
+// channel of completions.
+func CompletionChanWaitOr(ch <-chan Completion, cs []Completion, wake <-chan struct{}) ([]Completion, error) {
+	select {
+	case c := <-ch:
+		cs = append(cs, c)
+	case <-wake:
+	}
+	return appendReadyCompletions(ch, cs), nil
+}
+
+// appendReadyCompletions appends to cs the completions that ch has ready.
+func appendReadyCompletions(ch <-chan Completion, cs []Completion) []Completion {
 	for {
 		select {
 		case c := <-ch:
 			cs = append(cs, c)
 		default:
-			return cs, nil
+			return cs
 		}
 	}
 }
