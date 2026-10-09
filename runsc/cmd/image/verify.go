@@ -47,7 +47,7 @@ func (*verify) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*verify) Usage() string {
-	return `verify [--layer-path=DIR]... [--pages] [--host] IMAGE - check the checkpoint image in the directory IMAGE:
+	return `verify [--layer-path=DIR]... [--pages] [--host] IMAGE - check the checkpoint image IMAGE, an image directory or a container engine's checkpoint archive of a runsc container:
 the checksums and consistency of its pages metadata file, the identity and size of each of its layers,
 and with --pages, the contents of every page against its hash;
 with --host, that this runsc can restore it on this host: same runsc version, every CPU feature it was saved with, and the platform it was saved on available (restore uses the platform it is given).
@@ -67,15 +67,19 @@ func (v *verify) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomman
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, err := openImageDir(f.Arg(0), v.layerPaths)
+	d, closeImage, err := openImage(f.Arg(0), v.layerPaths, v.pages)
 	if err != nil {
 		return exitStatus(err)
 	}
+	defer closeImage()
 	files, err := d.openLayers()
 	if err != nil {
 		return exitStatus(err)
 	}
 	defer closeAll(files)
+	if a := d.archive; a != nil {
+		fmt.Printf("Checkpoint of %s container %q in %s\n", a.container.Engine, a.container.Name, a.path)
+	}
 	fmt.Printf("Image %v: metadata and %d layers OK\n", d.img.Digest, len(files))
 	if v.pages {
 		if err := checkpointimage.VerifyPages(d.img, readersOf(files)); err != nil {
