@@ -3672,6 +3672,125 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreLeaveRunningClone checks that restoring the checkpoint
+// of a container that kept running (runsc checkpoint --leave-running, or
+// containerd's checkpoint without exit) into a new container gives a clone:
+// both run, under their own container IDs, the clone from the state of the
+// checkpoint. The application appends its host name, which the clone's spec
+// changes, and a counter to a file.
+func TestCheckpointRestoreLeaveRunningClone(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+			imagePath := filepath.Join(dir, "image")
+			if err := os.Mkdir(imagePath, 0777); err != nil {
+				t.Fatalf("os.Mkdir failed: %v", err)
+			}
+			script := fmt.Sprintf(`i=0; while true; do echo "$(uname -n) $i" >> %q; i=$((i+1)); sleep 0.1; done`, outputPath)
+			newContainer := func(hostname string) *Container {
+				t.Helper()
+				spec := testutil.NewSpecWithArgs("bash", "-c", script)
+				spec.Hostname = hostname
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				t.Cleanup(cleanup)
+				cont, err := New(conf, Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      spec,
+					BundleDir: bundleDir,
+				})
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				t.Cleanup(func() { cont.Destroy() })
+				return cont
+			}
+			// counters returns the counters that each host name appended, in
+			// order.
+			counters := func() map[string][]int {
+				t.Helper()
+				data, err := os.ReadFile(outputPath)
+				if err != nil {
+					t.Fatalf("error reading output: %v", err)
+				}
+				cs := make(map[string][]int)
+				for _, line := range strings.Split(string(data), "\n") {
+					hostname, counter, ok := strings.Cut(line, " ")
+					if !ok {
+						continue
+					}
+					i, err := strconv.Atoi(counter)
+					if err != nil {
+						t.Fatalf("invalid output line %q: %v", line, err)
+					}
+					cs[hostname] = append(cs[hostname], i)
+				}
+				return cs
+			}
+
+			original := newContainer("original")
+			if err := original.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+			before := counters()["original"]
+			if err := original.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Resume: true}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+
+			clone := newContainer("clone")
+			if clone.ID == original.ID {
+				t.Fatalf("clone has the original's container ID %q", clone.ID)
+			}
+			if err := clone.Restore(conf, imagePath, nil /* layerPaths */, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			restored := len(counters()["original"])
+
+			// Both append at least 5 more lines.
+			if err := testutil.Poll(func() error {
+				cs := counters()
+				if n := len(cs["original"]) - restored; n < 5 {
+					return fmt.Errorf("original appended %d lines since the restore", n)
+				}
+				if n := len(cs["clone"]); n < 5 {
+					return fmt.Errorf("clone appended %d lines", n)
+				}
+				return nil
+			}, 30*time.Second); err != nil {
+				t.Fatalf("both containers did not run: %v", err)
+			}
+			for _, cont := range []*Container{original, clone} {
+				if running, err := cont.IsSandboxRunning(); err != nil || !running {
+					t.Errorf("sandbox of container %q is not running (err: %v)", cont.ID, err)
+				}
+			}
+			// The clone continues from the checkpoint, after the counters that
+			// the original had appended before it.
+			if first, last := counters()["clone"][0], before[len(before)-1]; first <= last {
+				t.Errorf("clone's first counter is %d, want more than the original's last before the checkpoint, %d", first, last)
+			}
+		})
+	}
+}
+
 // TestUnixDomainSockets checks that Checkpoint/Restore works in cases
 // with filesystem Unix Domain Socket use.
 func TestUnixDomainSockets(t *testing.T) {
