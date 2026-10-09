@@ -131,6 +131,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
+	flagSet.Var(dirtyTrackingModePtr(DirtyTrackingOff), "dirty-tracking", "track the application memory pages written between checkpoints, from the first checkpoint or restore on: off (default); wp (write-protect application memory in the Sentry; works on every platform and host kernel); auto (the best available, currently wp).")
+	flagSet.Uint64("dirty-tracking-unit", 64<<10, "size in bytes, a power of 2 of at least 4096, of the units of application memory in which --dirty-tracking=wp records first writes; larger units fault less often and record more pages. Huge pages are tracked whole.")
+	flagSet.Var(dirtyTrackingVerifyModePtr(DirtyTrackingVerifyOff), "dirty-tracking-verify", "whether checkpoints verify that dirty tracking missed no write: off (default), or hash: every checkpoint checks it by hashing every page, and fails if it did; restores wait for every page to be loaded (for tests and debugging).")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
@@ -193,6 +196,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")
 	flagSet.String("TESTONLY-test-name-env", "", "TEST ONLY; do not ever use! Used for automated tests to improve logging.")
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
+	flagSet.Var(dirtyTrackingBreakPtr(DirtyTrackingBreakNone), "TESTONLY-dirty-tracking-break", "TEST ONLY; do not ever use! Disables one of the paths by which --dirty-tracking marks the pages written, so that tests can check that --dirty-tracking-verify=hash catches the writes it then misses: none (default); mapinternal (the Sentry's writes through its internal mappings); decommit (pages decommitted or released); tmpfs (tmpfs writes to disk-backed filestores); iouring (io_uring's rings); fault (wp: first writes); arm (wp: write-protection of the memory mapped when tracking restarts).")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
 	flagSet.String("TESTONLY-autosave-compression", "flate-best-speed", "TEST ONLY; compression level of auto saves for syscall tests: none|flate-best-speed.")
