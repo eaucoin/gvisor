@@ -67,6 +67,10 @@ func TestIoctlFirstArgumentIsNonNegativeFD(t *testing.T) {
 			Platform:       (&systrap.Systrap{}).SeccompInfo(),
 			HostFilesystem: true,
 		},
+		"internal write tracking": {
+			Platform:              (&kvm.KVM{}).SeccompInfo(),
+			InternalWriteTracking: true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rules, _ := Rules(options)
@@ -124,6 +128,7 @@ func TestOptionsConfigKey(t *testing.T) {
 				opt.VendorSyscalls = nil
 			}
 		},
+		"InternalWriteTracking": func(opt *Options) { opt.InternalWriteTracking = !opt.InternalWriteTracking },
 	}
 
 	// Map of `Options` struct field names mapped to a function to mutate them.
