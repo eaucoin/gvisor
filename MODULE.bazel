@@ -191,6 +191,7 @@ use_repo(
     "com_github_ianlancetaylor_demangle",
     "com_github_imdario_mergo",
     "com_github_josharian_intern",
+    "com_github_klauspost_compress",
     "com_github_mailru_easyjson",
     "com_github_mattbaird_jsonpatch",
     "com_github_matttproud_golang_protobuf_extensions",

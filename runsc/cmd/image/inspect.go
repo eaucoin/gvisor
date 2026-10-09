@@ -51,7 +51,8 @@ func (*inspect) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*inspect) Usage() string {
-	return `inspect [--json] [--layer-path=DIR]... IMAGE - describe the checkpoint image in the directory IMAGE: its identity, format, state file metadata, containers, layers, memory and working set.
+	return `inspect [--json] [--layer-path=DIR]... IMAGE - describe the checkpoint image IMAGE: its identity, format, state file metadata, containers, layers, memory and working set.
+IMAGE is an image directory, or a container engine's checkpoint archive of a runsc container (tar, uncompressed, gzip or zstd), whose container is described too.
 `
 }
 
@@ -67,10 +68,11 @@ func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, err := openImageDir(f.Arg(0), i.layerPaths)
+	d, closeImage, err := openImage(f.Arg(0), i.layerPaths, false /* withPages */)
 	if err != nil {
 		return exitStatus(err)
 	}
+	defer closeImage()
 	info, err := describe(d)
 	if err != nil {
 		return exitStatus(err)
@@ -89,15 +91,22 @@ func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 
 // imageInfo is the output of "image inspect".
 type imageInfo struct {
-	Digest string     `json:"digest"`
-	Format formatInfo `json:"format"`
-	State  stateInfo  `json:"state"`
+	// Archive is set if the image is in a checkpoint archive.
+	Archive *archiveInfo `json:"archive,omitempty"`
+	Digest  string       `json:"digest"`
+	Format  formatInfo   `json:"format"`
+	State   stateInfo    `json:"state"`
 	// Containers are the names of the containers that the checkpoint holds,
 	// sorted: those that a restore of it brings back.
 	Containers  []string         `json:"containers"`
 	Layers      []layerInfo      `json:"layers"`
 	MemoryFiles []memoryFileInfo `json:"memory_files"`
 	WorkingSet  *workingSetInfo  `json:"working_set,omitempty"`
+}
+
+type archiveInfo struct {
+	Path      string        `json:"path"`
+	Container containerInfo `json:"container"`
 }
 
 type formatInfo struct {
@@ -154,8 +163,14 @@ func describe(d *imageDir) (*imageInfo, error) {
 			info.State.Metadata[k] = v
 		}
 	}
+	if a := d.archive; a != nil {
+		info.Archive = &archiveInfo{Path: a.path, Container: a.container}
+	}
 	for i, l := range img.Layers() {
-		li := layerInfo{PagesSize: l.PagesSize, Path: d.pagesPath(i)}
+		li := layerInfo{PagesSize: l.PagesSize}
+		if p := d.pagesPath(i); p != "" {
+			li.Path = d.displayPath(p)
+		}
 		if i != 0 {
 			li.Digest = l.Digest.String()
 		}
@@ -192,6 +207,18 @@ func describe(d *imageDir) (*imageInfo, error) {
 
 func (info *imageInfo) print(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 8, 2, ' ', 0)
+	if a := info.Archive; a != nil {
+		c := a.Container
+		fmt.Fprintf(tw, "Archive:\t%s\n", a.Path)
+		fmt.Fprintf(tw, "Container:\t%s\n", c.Name)
+		if c.Pod != "" {
+			fmt.Fprintf(tw, "Pod:\t%s/%s\n", c.Namespace, c.Pod)
+		}
+		fmt.Fprintf(tw, "Engine:\t%s\n", c.Engine)
+		if c.Runtime != "" {
+			fmt.Fprintf(tw, "Runtime:\t%s\n", c.Runtime)
+		}
+	}
 	fmt.Fprintf(tw, "Image:\t%s\n", info.Digest)
 	fmt.Fprintf(tw, "Format:\t%d.%d\n", info.Format.Major, info.Format.Minor)
 	for _, k := range []string{boot.VersionKey, checkpointimage.FormatMetadataKey, boot.PlatformKey, boot.CPUFeaturesKey, "timestamp"} {

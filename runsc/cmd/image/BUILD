@@ -8,6 +8,7 @@ package(
 go_library(
     name = "image",
     srcs = [
+        "archive.go",
         "files.go",
         "image.go",
         "inspect.go",
@@ -29,6 +30,7 @@ go_library(
         "//runsc/specutils",
         "//runsc/version",
         "@com_github_google_subcommands//:go_default_library",
+        "@com_github_klauspost_compress//zstd:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -37,7 +39,10 @@ go_library(
 go_test(
     name = "image_test",
     size = "small",
-    srcs = ["image_test.go"],
+    srcs = [
+        "archive_test.go",
+        "image_test.go",
+    ],
     data = glob(["testdata/**"]),
     library = ":image",
     deps = [
@@ -49,6 +54,8 @@ go_test(
         "//runsc/version",
         "@com_github_cespare_xxhash_v2//:go_default_library",
         "@com_github_google_subcommands//:go_default_library",
+        "@com_github_klauspost_compress//zstd:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

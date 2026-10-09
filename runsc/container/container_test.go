@@ -15,6 +15,7 @@
 package container
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"encoding/base64"
@@ -2216,6 +2217,97 @@ func testCheckpointRestoreLayers(t *testing.T, conf *config.Config) {
 		t.Errorf("error restoring the compacted image: %v", err)
 	} else {
 		restored.Destroy()
+	}
+
+	// runsc, run as checkpointctl-runsc, is a checkpointctl plugin that reads
+	// the checkpoint archives that container engines make, here containerd's
+	// of the second checkpoint.
+	plugin := filepath.Join(dir, "checkpointctl-runsc")
+	if err := os.Symlink(specutils.ExePath, plugin); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(plugin, "--plugin-description").Output(); !errors.As(err, &exitErr) || exitErr.ExitCode() != 42 || len(out) == 0 {
+		t.Errorf("%s --plugin-description: %v, %q; want a description and exit status 42", plugin, err, out)
+	}
+	archivePath := filepath.Join(dir, "checkpoint.tar")
+	writeCheckpointArchive(t, archivePath, image2Dir, spec)
+	if out, err := exec.Command(plugin, "verify", "--pages", archivePath).CombinedOutput(); err != nil {
+		t.Errorf("%s verify --pages: %v\n%s", plugin, err, out)
+	}
+	out, err = exec.Command(plugin, "inspect", "--json", archivePath).Output()
+	if err != nil {
+		t.Fatalf("%s inspect: %v", plugin, err)
+	}
+	var archiveInfo struct {
+		Archive struct {
+			Container struct {
+				Name   string `json:"name"`
+				Engine string `json:"engine"`
+			} `json:"container"`
+		} `json:"archive"`
+	}
+	if err := json.Unmarshal(out, &archiveInfo); err != nil {
+		t.Fatalf("%s inspect printed %q: %v", plugin, out, err)
+	}
+	if c := archiveInfo.Archive.Container; c.Name != "counter" || c.Engine != "containerd" {
+		t.Errorf("%s inspect described the container as %+v, want containerd's counter", plugin, c)
+	}
+}
+
+// writeCheckpointArchive writes at path a checkpoint archive as containerd
+// makes one of a container with the OCI spec spec: the image in the directory
+// image as its checkpoint/ directory, the spec as spec.dump, and containerd's
+// description of the container as config.dump.
+func writeCheckpointArchive(t *testing.T, path, image string, spec *specs.Spec) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tw := tar.NewWriter(f)
+	add := func(name string, data []byte) {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0600, Size: int64(len(data))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dump := *spec
+	dump.Annotations = map[string]string{"io.kubernetes.cri.container-name": "counter"}
+	for name, v := range map[string]any{
+		"spec.dump":   &dump,
+		"config.dump": map[string]string{"name": "counter", "runtime": "io.containerd.runsc.v1"},
+	} {
+		data, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		add(name, data)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "checkpoint/", Typeflag: tar.TypeDir, Mode: 0700}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{checkpointfiles.StateFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
+		src, err := os.Open(filepath.Join(image, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer src.Close()
+		st, err := src.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: "checkpoint/" + name, Typeflag: tar.TypeReg, Mode: 0600, Size: st.Size()}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(tw, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
