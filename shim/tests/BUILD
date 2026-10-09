@@ -15,6 +15,7 @@ go_test(
     ],
     deps = [
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/shim/v1/taskserver:task_server_go_proto",
         "//pkg/test/testutil",
         "//runsc/checkpointgofer/s3/s3test",
