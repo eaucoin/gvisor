@@ -1,0 +1,116 @@
+# Tier 3 of the fork's CI: the checkpoint/restore bench (tools/fork/bench),
+# weekly on main, for every release, and on demand for any branch or tag.
+# A workload dirtying 512 MiB is checkpointed and restored, from local disk
+# and from a source throttled to 100 MiB/s, plainly and in the background,
+# in C and as a Python REPL; the results are kept as an artifact and compared
+# with the previous weekly run on main, and a measurement more than 20 % worse
+# fails.
+name: Fork bench
+
+"on":
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to measure
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# bash with -o pipefail, so that a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  REF: ${{ inputs.ref || 'main' }}
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: |
+            SERIES
+            tools/fork
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: meta
+        working-directory: src
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+          echo "base=$(sed -n 's/^base \([^ #]*\).*/\1/p' ../fork/SERIES)" >>"${GITHUB_OUTPUT}"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ steps.meta.outputs.base }}-${{ steps.meta.outputs.sha }}
+          restore-keys: bazel-${{ steps.meta.outputs.base }}-
+      - name: Build runsc
+        working-directory: src
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          "${RUNNER_TEMP}/release/runsc" --version | tee -a "${GITHUB_STEP_SUMMARY}"
+      - name: Prepare the workloads
+        run: sudo python3 fork/tools/fork/bench/bench.py prepare
+      - name: Measure
+        run: |
+          bench() {
+            sudo python3 fork/tools/fork/bench/bench.py run --runsc "${RUNNER_TEMP}/release/runsc" \
+              --mib 512 --reps 3 --out "${RUNNER_TEMP}/results.jsonl" "$@"
+          }
+          bench --workload c --restore plain --restore background \
+            --restore plain@100 --restore background@100
+          bench --workload c --checkpoint-flag=--direct --restore plain+direct --restore background+direct
+          bench --workload py --restore plain --restore background --restore background@100
+          {
+            echo '```text'
+            python3 fork/tools/fork/bench/bench.py summary "${RUNNER_TEMP}/results.jsonl"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+      - name: Clean up
+        if: always()
+        run: sudo python3 fork/tools/fork/bench/bench.py clean --all
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-${{ steps.meta.outputs.sha }}
+          path: ${{ runner.temp }}/results.jsonl
+          retention-days: 90
+      - name: Compare with the previous weekly run
+        run: |
+          previous="$(gh run list -R "${GITHUB_REPOSITORY}" --workflow fork-bench.yml --event schedule \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [[ -z "${previous}" ]]; then
+            echo "No previous run to compare with." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          gh run download "${previous}" -R "${GITHUB_REPOSITORY}" --pattern 'bench-*' --dir "${RUNNER_TEMP}/previous"
+          {
+            echo "### Against run ${previous}"
+            echo
+          } >>"${GITHUB_STEP_SUMMARY}"
+          python3 fork/tools/fork/bench/compare.py "${RUNNER_TEMP}"/previous/*/results.jsonl \
+            "${RUNNER_TEMP}/results.jsonl" | tee -a "${GITHUB_STEP_SUMMARY}"
