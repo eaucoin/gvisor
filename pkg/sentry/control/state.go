@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -79,6 +80,13 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		CudaCheckpointSequential:       o.CudaCheckpointSequential,
 		ValidateMetadata:               o.ValidateMetadata,
 		GraphEngine:                    o.GraphEngine,
+	}
+	if o.ParentImageDigest != "" {
+		d, err := checkpointimage.ParseDigest(o.ParentImageDigest)
+		if err != nil {
+			return nil, fmt.Errorf("parent image digest: %w", err)
+		}
+		saveOpts.Parent = &d
 	}
 	if err := setSaveOpts(o, saveOpts); err != nil {
 		saveOpts.Close()
