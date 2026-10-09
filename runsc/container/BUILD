@@ -93,6 +93,7 @@ go_test(
         "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sentry/seccheck/sinks/remote/test",
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/checkpointimage",
         "//pkg/state/statefile",
         "//pkg/sync",
         "//pkg/test/testutil",
