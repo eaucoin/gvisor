@@ -199,6 +199,8 @@ func (k *Kernel) fsSaveLocked(ctx context.Context, bundle *FSSaveBundle, runscVe
 		asyncPageSaveWg.Wait()
 	})
 	defer asyncPageSaveCleanup.Clean()
+	// The pages metadata of a filesystem checkpoint is its MemoryFiles'
+	// records, without page hashes: nothing saves an image relative to it.
 	mfOpts := pgalloc.SaveOpts{
 		PagesFile: apfs,
 	}
@@ -218,7 +220,6 @@ func (k *Kernel) fsSaveLocked(ctx context.Context, bundle *FSSaveBundle, runscVe
 	pagesMetadataWriter := &countingWriter{w: bundle.PagesMetadataFile}
 	prevTarOffset := uint64(0)
 	prevPagesMetadataOffset := uint64(0)
-	prevPagesOffset := uint64(0)
 	// TODO: NOLINT - fss is obtained by iterating a map, so its order -
 	// and thus the order in which filesystems will be saved - is
 	// effectively random. pgalloc.MemoryFile async page loading biases
@@ -283,10 +284,8 @@ func (k *Kernel) fsSaveLocked(ctx context.Context, bundle *FSSaveBundle, runscVe
 			ResourceId:         toProtoResourceID(resourceID),
 			PagesMetadataStart: prevPagesMetadataOffset,
 			PagesMetadataEnd:   pagesMetadataWriter.count,
-			PagesStart:         prevPagesOffset,
 		})
 		prevPagesMetadataOffset = pagesMetadataWriter.count
-		prevPagesOffset = apfs.PagesFileOffset()
 
 		if err := tmpfs.FSCheckpointWrite(ctx, fs, multiTarWriter); err != nil {
 			return fmt.Errorf("failed to write tmpfs with resourceID %s to multi-tar file: %w", resourceID, err)
@@ -306,6 +305,7 @@ func (k *Kernel) fsSaveLocked(ctx context.Context, bundle *FSSaveBundle, runscVe
 			log.Warningf("Filesystem checkpoint target path %v did not match any filesystem", p)
 		}
 	}
+	manifest.PagesSize = apfs.PagesFileOffset()
 	apfs.MemoryFilesDone()
 
 	// Verify that all private MemoryFiles excluded from the Sentry checkpoint
