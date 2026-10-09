@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
@@ -48,6 +49,9 @@ func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {
 	if len(files) != 1 && len(files) != 3 {
 		panic(fmt.Sprintf("Unexpected number of files: %v", len(files)))
 	}
+	if l.root.conf.TestOnlyAutosaveKind == config.AutosaveIncremental && len(files) != 3 {
+		panic("Incremental auto saves require a pages file (--TESTONLY-autosave-compression=none)")
+	}
 
 	var once sync.Once
 	return func(k *kernel.Kernel) {
@@ -60,6 +64,11 @@ func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {
 			if len(files) == 3 {
 				saveOpts.PagesMetadata = stateio.NewBufioWriteCloser(files[1])
 				saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(files[2].Release()))
+				if l.root.conf.TestOnlyAutosaveKind == config.AutosaveIncremental {
+					if parent, ok := k.LastImageDigest(); ok {
+						saveOpts.Parent = &parent
+					}
+				}
 			}
 			defer saveOpts.Close()
 			l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
