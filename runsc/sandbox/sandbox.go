@@ -1766,6 +1766,11 @@ type CheckpointOpts struct {
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecContainerID string
 	SplitFSCheckpointPaths     []checkpoint.ResourceID
+
+	// If ParentImagePath is not empty, the checkpoint is incremental, of the
+	// image in that directory, which must be the image the sandbox was last
+	// saved to or restored from.
+	ParentImagePath string
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1793,6 +1798,13 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			Timeout:     opts.SaveRestoreExecTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
+	}
+	if opts.ParentImagePath != "" {
+		d, err := checkpointimage.FileDigest(filepath.Join(opts.ParentImagePath, checkpointfiles.PagesMetadataFileName))
+		if err != nil {
+			return fmt.Errorf("parent image: %w", err)
+		}
+		opt.ParentImageDigest = d.String()
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
