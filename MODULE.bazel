@@ -138,6 +138,11 @@ go_deps.from_file(go_mod = "//:go.mod")
 use_repo(
     go_deps,
     "co_honnef_go_tools",
+    "com_github_aws_aws_sdk_go_v2",
+    "com_github_aws_aws_sdk_go_v2_config",
+    "com_github_aws_aws_sdk_go_v2_credentials",
+    "com_github_aws_aws_sdk_go_v2_service_s3",
+    "com_github_aws_smithy_go",
     "com_github_burntsushi_toml",
     "com_github_cenkalti_backoff",
     "com_github_cespare_xxhash_v2",
