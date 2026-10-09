@@ -1004,6 +1004,16 @@ type inode struct {
 	// to store file data for save/restore.
 	savedDeletedData []byte
 
+	// If this inode represents a regular file whose cached metadata is
+	// authoritative, savedHostSize and savedHostMtime are the size and
+	// modification time of the remote file when it was saved, against which
+	// restore validates the remote file. The cached size and mtime are the
+	// sandbox's, which the remote file's need not match: the sandbox's clock
+	// sets the cached mtime of a file that it writes, the host's clock the
+	// remote file's.
+	savedHostSize  uint64
+	savedHostMtime int64
+
 	// mmapFile implements memmap.File for mmapFD.
 	//
 	// Note that mmapFile.FD() does not necessarily match mmapFD. The latter
