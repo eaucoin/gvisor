@@ -345,7 +345,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						}
 					}
 					mm.addRSSLocked(allocAR)
-					pseg, pgap = mm.pmas.Insert(pgap, allocAR, pma{
+					newpma := pma{
 						file:           mm.mf,
 						off:            fr.Start,
 						translatePerms: hostarch.AnyAccess,
@@ -356,7 +356,11 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						// copy-on-write.
 						private: true,
 						huge:    huge,
-					}).NextNonEmpty()
+					}
+					newpma.armDirtyIfTracked()
+					// Continue the loop at the new pma to check if writes to it
+					// must be tracked.
+					pseg, pgap = mm.pmas.Insert(pgap, allocAR, newpma), pmaGapIterator{}
 					pstart = pmaIterator{} // iterators invalidated
 				} else {
 					// Other mappings get pmas by translating.
@@ -400,6 +404,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							newpma.maxPerms.Write = false
 							newpma.needCOW = true
 						}
+						newpma.armDirtyIfTracked()
 						mm.addRSSLocked(newpmaAR)
 						t.File.IncRef(t.FileRange(), memCgID)
 						// This is valid because memmap.Mappable.Translate is
@@ -414,7 +419,8 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						return pstart, pgap, err
 					}
 					// Rewind pseg to the first pma inserted and continue the
-					// loop to check if we need to break copy-on-write.
+					// loop to check if we need to break copy-on-write or track
+					// writes.
 					pseg, pgap = mm.findOrSeekPrevUpperBoundPMA(vseg.addrRangeOf(ts[0].Source).Start, pgap), pmaGapIterator{}
 					continue
 				}
@@ -508,6 +514,8 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					oldpma.needCOW = false
 					oldpma.private = true
 					oldpma.huge = huge
+					// The copy was written, and marked dirty, by MapInternal.
+					oldpma.dirtyArmed = false
 					oldpma.internalMappings = safemem.BlockSeq{}
 					// Try to merge the pma with its neighbors.
 					if prev := pseg.PrevSegment(); prev.Ok() {
@@ -577,6 +585,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							newpma.maxPerms.Write = false
 							newpma.needCOW = true
 						}
+						newpma.armDirtyIfTracked()
 						t.File.IncRef(t.FileRange(), memCgID)
 						pseg = mm.pmas.Insert(pgap, newpmaAR, newpma)
 						pgap = pseg.NextGap()
@@ -586,13 +595,15 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					if err != nil && pseg.End() < ar.End {
 						return pstart, pgap, err
 					}
-					// Ensure pseg and pgap are correct for the next iteration
-					// of the loop.
-					if pgap.Range().Length() == 0 {
-						pseg, pgap = pgap.NextSegment(), pmaGapIterator{}
-					} else {
-						pseg = pmaIterator{}
-					}
+					// Rewind pseg to the first pma inserted and continue the
+					// loop to check if we need to track writes.
+					pseg, pgap = mm.findOrSeekPrevUpperBoundPMA(transAR.Start, pgap), pmaGapIterator{}
+				} else if at.Write && oldpma.dirtyArmed {
+					// This is the first write to the pma since it was armed
+					// for dirty tracking.
+					pseg = mm.disarmDirtyLocked(vseg, pseg, ar)
+					pstart = pmaIterator{} // iterators invalidated
+					pseg, pgap = pseg.NextNonEmpty()
 				} else {
 					// We have a usable pma; continue.
 					pseg, pgap = pseg.NextNonEmpty()
@@ -655,6 +666,10 @@ func (mm *MemoryManager) isPMACopyOnWriteLocked(vseg vmaIterator, pseg pmaIterat
 		vma := vseg.ValuePtr()
 		pma.effectivePerms = vma.effectivePerms
 		pma.maxPerms = vma.maxPerms
+		if pma.dirtyArmed {
+			// Writes must still be tracked.
+			pma.armDirty()
+		}
 		return false
 	}
 	return true
@@ -1001,7 +1016,8 @@ func (pmaSetFunctions) Merge(ar1 hostarch.AddrRange, pma1 pma, ar2 hostarch.Addr
 		pma1.maxPerms != pma2.maxPerms ||
 		pma1.needCOW != pma2.needCOW ||
 		pma1.private != pma2.private ||
-		pma1.huge != pma2.huge {
+		pma1.huge != pma2.huge ||
+		pma1.dirtyArmed != pma2.dirtyArmed {
 		return pma{}, false
 	}
 
@@ -1089,6 +1105,11 @@ func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem
 	perms := pma.maxPerms
 	// We will never execute application code through an internal mapping.
 	perms.Execute = false
+	if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
+		// Writes through pmas are tracked by arming them (dirty.go), not by
+		// marking the pages whose internal mappings are obtained.
+		return mf.MapInternalUntracked(pseg.fileRangeOf(ar), perms)
+	}
 	return pma.file.MapInternal(pseg.fileRangeOf(ar), perms)
 }
 
