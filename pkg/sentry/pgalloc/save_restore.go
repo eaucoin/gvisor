@@ -1776,8 +1776,11 @@ type aplOp struct {
 	// reads, of pages that had no waiters when the read was enqueued.
 	tempRef bool
 
-	// issued is the value of aplNanotime() when the read was enqueued.
-	issued int64
+	// issued is the value of aplNanotime() when the read was enqueued, and
+	// bgInflight the number of bytes of background reads in flight then, the
+	// read's own included if it is a background read.
+	issued     int64
+	bgInflight uint64
 }
 
 func (op *aplOp) off() int64 {
@@ -2011,6 +2014,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	if op.tempRef {
 		apfl.bgInflight += op.total
 	}
+	op.bgInflight = apfl.bgInflight
 	if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized read to save an indirection (and possible
 		// userspace-to-kernelspace copy) in the AsyncReader implementation.
@@ -2406,7 +2410,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 			op := &apfl.ops[c.ID]
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
-			apfl.bgBudget.readCompleted(now, c.N, op.issued, op.tempRef && op.total == apfl.maxReadBytes)
+			kind := aplReadAwaited
+			if op.tempRef {
+				kind = aplReadBackground
+				if op.total == apfl.maxReadBytes {
+					kind = aplReadFullBackground
+				}
+			}
+			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight)
 			if op.tempRef {
 				apfl.bgInflight -= op.total
 				// Delay f.DecRef(fr) until after dropping locks. This is
