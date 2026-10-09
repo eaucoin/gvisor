@@ -97,6 +97,7 @@ go_test(
         "//pkg/sync",
         "//pkg/test/testutil",
         "//pkg/unet",
+        "//runsc/boot",
         "//runsc/boot/procfs",
         "//runsc/boot/sentryapi",
         "//runsc/cgroup",
