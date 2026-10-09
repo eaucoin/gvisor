@@ -6,6 +6,68 @@
 [![gVisor chat](https://badges.gitter.im/gvisor/community.png)](https://gitter.im/gvisor/community)
 [![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
 
+## This fork
+
+This is [eaucoin/gvisor](https://github.com/eaucoin/gvisor), a fork of
+[google/gvisor](https://github.com/google/gvisor) that adds checkpoint and
+restore features to gVisor, as general-purpose features of `runsc`:
+
+*   **Fault-first lazy restore**: `runsc restore --background` serves a page
+    fault from the image before the background reads behind it.
+*   **An S3-compatible checkpoint gofer**, beside the GCS one, to save and
+    restore images straight from an object store.
+*   **Restore into a new Kubernetes pod** through containerd's task service.
+*   **Incremental checkpoints**: dirty-page tracking (by write-protection in the
+    Sentry, or by userfaultfd), a checkpoint image format whose layers refer to
+    their parent's, and saves that write only what changed since.
+*   **Pre-copy**: checkpoints taken while the sandbox runs, with a short final
+    pause.
+*   **Working-set recording and prefetch**, and `runsc image` tools to inspect,
+    verify, flatten and compact images.
+
+Each lands as a series, a branch of its own on top of the base; the
+[`SERIES`](SERIES) file lists those that `main` carries, and each release's
+notes list those it contains. Their documentation is gVisor's own, updated with
+them: see [Checkpoint/Restore](g3doc/user_guide/checkpoint_restore.md).
+
+**How it relates to upstream.** `main`, the default branch, is an upstream
+gVisor release (the base, named in `SERIES`) plus the series listed there, as
+far as they pass the fork's tests, rebuilt from scratch whenever one changes; it
+moves to a newer upstream release deliberately, by rebasing every series onto
+it. `master` and `go` mirror upstream's, untouched. The fork's changes are not
+proposed upstream; they keep gVisor's license, style and tests. Report problems
+with them in this repository's issues, not upstream's.
+
+**Using it.** Releases are on this repository's
+[Releases](https://github.com/eaucoin/gvisor/releases) page, built from `main`
+with upstream's release rules, with SHA-512 sums and build provenance
+attestations, for x86_64 (aarch64 follows once a restore works on the aarch64
+machines the fork is tested on). They are installed as upstream's are:
+
+```sh
+ARCH=$(uname -m)
+URL=https://github.com/eaucoin/gvisor/releases/download/<release>
+curl -fsSL -O "${URL}/gvisor-${ARCH}.tar.zstd" -O "${URL}/gvisor-${ARCH}.tar.zstd.sha512"
+sha512sum -c "gvisor-${ARCH}.tar.zstd.sha512"
+gh attestation verify "gvisor-${ARCH}.tar.zstd" --repo eaucoin/gvisor
+sudo tar -C /usr/local/bin --zstd -xf "gvisor-${ARCH}.tar.zstd"
+```
+
+A release is tagged `release-<upstream release>-eaucoin.<n>`, which is also
+what `runsc --version` reports. A checkpoint restores only under the build that
+took it, never under upstream's build of the same release, so keep a release
+for as long as you keep its checkpoints. To build from source, build `main` as
+described below.
+
+**Working on it.** A series is a branch `series/<NN>-<name>` holding one work
+item as a clean stack of commits on the base, or on the series it builds on:
+no merge commits, amended rather than fixed up, subjects in gVisor's
+`area: summary` style. [`tools/fork/series.sh`](tools/fork/series.sh) checks
+each series and builds `main` from them, and the fork's workflows
+(`.github/workflows/fork-*.yml`) test every series alone and `main` with
+gVisor's own Bazel tests on GitHub's runners, keep `master` and `go` in sync,
+and cut the releases.
+
 ## What is gVisor?
 
 **gVisor** provides a strong layer of isolation between running applications and
