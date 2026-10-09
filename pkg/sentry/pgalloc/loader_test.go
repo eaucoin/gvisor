@@ -87,69 +87,156 @@ func receive(t *testing.T, ch <-chan error, what string) error {
 	}
 }
 
-// TestAsyncLoadAwaitedPageWaitsBehindQueuedReads reproduces, in virtual time,
-// how long a page fault waits for its page during a background restore: the
-// loader keeps the reader's queue full of sequential reads, so a fault's read
-// is issued only when one of them completes, and then waits behind every byte
-// still queued on the device. The test pins down today's behavior; changes to
-// the loader that shorten the wait must update the expected times.
-func TestAsyncLoadAwaitedPageWaitsBehindQueuedReads(t *testing.T) {
-	const (
-		maxParallel  = 4
-		maxReadBytes = 256 << 10
-		bandwidth    = 100 << 20 // bytes per second
-		latency      = time.Millisecond
-	)
-	fr, gens, img := loaderTestImage(t, 8<<20)
-	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
-		maxReadBytes: maxReadBytes,
-		maxParallel:  maxParallel,
-		bandwidth:    bandwidth,
-		latency:      latency,
-		manual:       true,
-	})
+// Pages file models for the loader's timing tests: reads of 256 KiB from a
+// disk throttled to 100 MiB/s (experiment 07's bench), from a local disk at
+// 1.5 GiB/s, and reads of 4 MiB from an object store serving 8 at a time, each
+// at 64 MiB/s with 1 ms of latency.
+var (
+	testDisk = testPagesFileOpts{
+		maxReadBytes: 256 << 10,
+		maxParallel:  128,
+		bandwidth:    100 << 20,
+		latency:      100 * time.Microsecond,
+	}
+	testFastDisk = testPagesFileOpts{
+		maxReadBytes: 256 << 10,
+		maxParallel:  128,
+		bandwidth:    1536 << 20,
+		latency:      100 * time.Microsecond,
+	}
+	testObjectStore = testPagesFileOpts{
+		maxReadBytes: 4 << 20,
+		maxParallel:  8,
+		channels:     8,
+		bandwidth:    64 << 20,
+		latency:      time.Millisecond,
+	}
+)
+
+// transferTime returns how long opts's device takes to transfer n bytes.
+func (opts testPagesFileOpts) transferTime(n uint64) time.Duration {
+	return time.Duration(n * uint64(time.Second) / opts.bandwidth)
+}
+
+// waitOnlyReader hides the WaitOr method of a stateio.WaitOrAsyncReader.
+type waitOnlyReader struct {
+	stateio.AsyncReader
+}
+
+// TestAsyncLoadFaultWait checks how long a page fault waits for its page in
+// the middle of a background restore: its read is enqueued at once, although
+// the loader is waiting for background reads to complete, and the background
+// reads in flight ahead of it are bounded: on a disk, which serves reads in
+// order, to about one read and aplQueueDelay; on an object store, which serves
+// them in parallel, to none, since a slot and a channel are left for it.
+// Before these bounds, the fault waited for every background read in flight:
+// 128 reads of 256 KiB at 100 MiB/s, 320 ms.
+func TestAsyncLoadFaultWait(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts testPagesFileOpts
+		size uint64
+		// at is when the fault happens, once loading is steady.
+		at time.Duration
+		// maxWait is the longest the fault may wait for its page.
+		maxWait time.Duration
+	}{
+		{
+			name: "disk",
+			opts: testDisk,
+			size: 16 << 20,
+			at:   50 * time.Millisecond,
+			// The background reads in flight, at most a read and
+			// aplQueueDelay, then the fault's own read.
+			maxWait: testDisk.transferTime(testDisk.maxReadBytes) + aplQueueDelay +
+				testDisk.transferTime(hostarch.PageSize) + 2*testDisk.latency,
+		},
+		{
+			name:    "object store",
+			opts:    testObjectStore,
+			size:    64 << 20,
+			at:      60 * time.Millisecond,
+			maxWait: testObjectStore.transferTime(hostarch.PageSize) + testObjectStore.latency,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr, gens, img := loaderTestImage(t, tc.size)
+			opts := tc.opts
+			opts.manual = true
+			r := newTestPagesFile(t, img.pages, opts)
+			r.useClock()
+			restored := newTestMemoryFile(t, testMemoryFileOpts{})
+			l := startLoad(t, img, r, restored)
+			t.Cleanup(func() { releaseAll(t, restored) })
+
+			for r.advanceToNext().completed < tc.at {
+			}
+			r.waitPending()
+			last := memmap.FileRange{fr.End - hostarch.PageSize, fr.End}
+			lastOff := int64(last.Start - fr.Start)
+			if _, ok := r.readAt(lastOff); ok {
+				t.Fatalf("the last page was read before the fault; load a larger image")
+			}
+			faultAt := time.Duration(r.nanotime())
+			done := awaitAsync(restored, last)
+			waitForWaiters(t, l.apfl, 1)
+			// The loader may still be blocked in the wait that the fault's
+			// wake interrupts: virtual time must not move before it has
+			// submitted the fault's read.
+			r.waitSubmitted(lastOff)
+			for rd := r.advanceToNext(); rd.off != lastOff; rd = r.advanceToNext() {
+			}
+			if err := receive(t, done, "the awaited page"); err != nil {
+				t.Fatalf("MapInternal(%v): %v", last, err)
+			}
+
+			awaited, _ := r.readAt(lastOff)
+			if awaited.submitted != faultAt {
+				t.Errorf("awaited read submitted at %v, want at once, at the fault's %v", awaited.submitted, faultAt)
+			}
+			if awaited.len != hostarch.PageSize {
+				t.Errorf("awaited read is %d bytes, want one page", awaited.len)
+			}
+			waited := awaited.completed - faultAt
+			t.Logf("the fault waited %v for its page", waited)
+			if waited > tc.maxWait {
+				t.Errorf("the fault waited %v for its page, want at most %v", waited, tc.maxWait)
+			}
+
+			r.finish()
+			if err := l.wait(t); err != nil {
+				t.Fatalf("async page loading: %v", err)
+			}
+			gens.checkPages(t, restored, fr)
+			checkInvariants(t, restored)
+		})
+	}
+}
+
+// TestAsyncLoadFaultWaitWithoutWaitOr checks that a pages file that cannot
+// interrupt its waits still serves faults first, at its next completion.
+func TestAsyncLoadFaultWaitWithoutWaitOr(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 4<<20)
+	opts := testDisk
+	opts.manual = true
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
 	restored := newTestMemoryFile(t, testMemoryFileOpts{})
-	l := startLoad(t, img, r, restored)
+	l := startLoad(t, img, waitOnlyReader{r}, restored)
 	t.Cleanup(func() { releaseAll(t, restored) })
 
-	// The loader fills the queue with background reads of the image's first
-	// pages.
-	r.waitInflight(maxParallel)
-	// The application touches the last page.
+	next := r.waitPending()
 	last := memmap.FileRange{fr.End - hostarch.PageSize, fr.End}
 	lastOff := int64(last.Start - fr.Start)
 	done := awaitAsync(restored, last)
 	waitForWaiters(t, l.apfl, 1)
-
-	for r.advanceToNext().off != lastOff {
+	for rd := r.advanceToNext(); rd.off != lastOff; rd = r.advanceToNext() {
 	}
 	if err := receive(t, done, "the awaited page"); err != nil {
 		t.Fatalf("MapInternal(%v): %v", last, err)
 	}
-
-	awaited, _ := r.readAt(lastOff)
-	transfer := func(n uint64) time.Duration { return time.Duration(n * uint64(time.Second) / bandwidth) }
-	// The awaited read is issued when the first background read completes...
-	if want := transfer(maxReadBytes) + latency; awaited.submitted != want {
-		t.Errorf("awaited read submitted at %v, want %v (when the first queued read completes)", awaited.submitted, want)
-	}
-	if awaited.len != hostarch.PageSize {
-		t.Errorf("awaited read is %d bytes, want one page", awaited.len)
-	}
-	// ... and completes after the device has transferred every byte queued
-	// before it.
-	if want := transfer(maxParallel*maxReadBytes+hostarch.PageSize) + latency; awaited.completed != want {
-		t.Errorf("awaited read completed at %v, want %v", awaited.completed, want)
-	}
-	if waited, own := awaited.completed-awaited.submitted, transfer(hostarch.PageSize)+latency; waited <= own {
-		t.Errorf("awaited read took %v, no longer than its own %v", waited, own)
-	}
-
-	l.apfl.mu.Lock()
-	totalWaiters, bytesWaited := l.apfl.totalWaiters, l.apfl.bytesWaited
-	l.apfl.mu.Unlock()
-	if totalWaiters != 1 || bytesWaited != hostarch.PageSize {
-		t.Errorf("waiter accounting: %d waiters for %d bytes, want 1 for %d", totalWaiters, bytesWaited, hostarch.PageSize)
+	if awaited, _ := r.readAt(lastOff); awaited.submitted != next.completed {
+		t.Errorf("awaited read submitted at %v, want at the next completion, %v", awaited.submitted, next.completed)
 	}
 
 	r.finish()
@@ -157,7 +244,57 @@ func TestAsyncLoadAwaitedPageWaitsBehindQueuedReads(t *testing.T) {
 		t.Fatalf("async page loading: %v", err)
 	}
 	gens.checkPages(t, restored, fr)
-	checkInvariants(t, restored)
+}
+
+// TestAsyncLoadBackgroundThroughput checks that bounding background reads
+// does not slow loading: the whole image loads within 10% of the time the
+// pages file takes to deliver it with every read it can have in flight but
+// one. The cases include a pages file so slow that its bandwidth-delay
+// product is less than one read, which loading still keeps busy.
+func TestAsyncLoadBackgroundThroughput(t *testing.T) {
+	slowDisk := testDisk
+	slowDisk.bandwidth = 1 << 20
+	for _, tc := range []struct {
+		name string
+		opts testPagesFileOpts
+		size uint64
+	}{
+		{"disk", testDisk, 16 << 20},
+		{"fast disk", testFastDisk, 16 << 20},
+		{"slow disk", slowDisk, 2 << 20},
+		{"object store", testObjectStore, 64 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr, gens, img := loaderTestImage(t, tc.size)
+			r := newTestPagesFile(t, img.pages, tc.opts)
+			r.useClock()
+			restored := newTestMemoryFile(t, testMemoryFileOpts{})
+			l := startLoad(t, img, r, restored)
+			t.Cleanup(func() { releaseAll(t, restored) })
+			if err := l.wait(t); err != nil {
+				t.Fatalf("async page loading: %v", err)
+			}
+			gens.checkPages(t, restored, fr)
+
+			var took time.Duration
+			for _, rd := range r.readsSnapshot() {
+				took = max(took, rd.completed)
+			}
+			// Reads are served in rounds of as many as the pages file
+			// transfers at once, background reads leaving a slot free.
+			reads := tc.size / tc.opts.maxReadBytes
+			parallel := uint64(min(max(tc.opts.channels, 1), tc.opts.maxParallel-1))
+			rounds := (reads + parallel - 1) / parallel
+			ideal := time.Duration(rounds)*tc.opts.transferTime(tc.opts.maxReadBytes) + tc.opts.latency
+			if parallel == 1 {
+				ideal = tc.opts.transferTime(tc.size) + tc.opts.latency
+			}
+			t.Logf("loading took %v, ideally %v", took, ideal)
+			if took > ideal*11/10 {
+				t.Errorf("loading took %v, want at most 10%% more than %v", took, ideal)
+			}
+		})
+	}
 }
 
 // TestAsyncLoadAwaitedReadsInArrivalOrder checks that awaited ranges are read
@@ -368,10 +505,10 @@ func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
 	fr, gens, img := loaderTestImage(t, 2*hostarch.PageSize)
 	// Both reads complete at the same virtual time, so that the loader gets
 	// both completions from one Wait: first page 0's, then page 1's, which
-	// fails.
+	// fails. (Background reads leave one of the three slots free.)
 	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
 		maxReadBytes: hostarch.PageSize,
-		maxParallel:  2,
+		maxParallel:  3,
 		latency:      time.Millisecond,
 		manual:       true,
 	})
