@@ -1,12 +1,13 @@
 # Tier 3 of the fork's CI: the checkpoint/restore bench (tools/fork/bench),
 # weekly on main, for every release, and on demand for any branch or tag.
-# A workload dirtying 512 MiB is checkpointed and restored, from local disk
-# and from a source throttled to 100 MiB/s, plainly and in the background,
-# in C and as a Python REPL. A baseline, by default the upstream release that
-# main is based on, is built and measured on the same runner, its repetitions
-# interleaved with the measured build's, since runners differ more than the
-# builds do. The results are kept as an artifact and compared with the
-# previous weekly run on main, and a measurement more than 20 % worse fails.
+# tools/fork/bench/measure.sh lists what it measures (about 28 minutes): a
+# workload dirtying 512 MiB checkpointed and restored in many ways, and the
+# fork's incremental checkpoints, pre-copy, S3 store and working sets. A
+# baseline, by default the upstream release that main is based on, is built
+# and measured on the same runner, its repetitions interleaved with the
+# measured build's, since runners differ more than the builds do. The results
+# are kept as an artifact and compared with the previous weekly run on main,
+# and a measurement more than 20 % worse fails.
 name: Fork bench
 
 "on":

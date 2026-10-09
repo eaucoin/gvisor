@@ -49,23 +49,35 @@ def ticker(gap_ms: float) -> None:
         prev = t
 
 
-def dirtier(buf: bytearray, dirty_pct: float, burst_hz: int) -> None:
+class Position:
+    """The dirtier's position: the next page it writes, in pass gen. Its lock is
+    held by the dirtier for each burst."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.next, self.gen = 0, 1
+
+
+def dirtier(buf: bytearray, pos: Position, dirty_pct: float, burst_hz: int) -> None:
     npages = len(buf) // PAGE
     per_burst = int(npages * dirty_pct / 100 / burst_hz)
     if per_burst == 0:
         return
     period = 1000 / burst_hz
-    nxt, gen, lat, pages = 0, 1, [], 0
+    lat, pages = [], 0
     start = now_ms()
     report = start + 1000
     while True:
-        t0 = now_ms()
-        for _ in range(per_burst):
-            buf[nxt * PAGE + (gen % 64) * 8] = gen
-            nxt += 1
-            if nxt == npages:
-                nxt, gen = 0, (gen + 1) % 256 or 1
-        t1 = now_ms()
+        with pos.lock:
+            t0 = now_ms()
+            nxt, gen = pos.next, pos.gen
+            for _ in range(per_burst):
+                buf[nxt * PAGE + (gen % 64) * 8] = gen % 256
+                nxt += 1
+                if nxt == npages:
+                    nxt, gen = 0, gen + 1
+            pos.next, pos.gen = nxt, gen
+            t1 = now_ms()
         lat.append((t1 - t0) * 1e3)
         pages += per_burst
         if t1 >= report:
@@ -82,6 +94,21 @@ def dirtier(buf: bytearray, dirty_pct: float, burst_hz: int) -> None:
             start = now_ms()
 
 
+def verify(buf: bytearray, pos: Position) -> tuple[int, int]:
+    """Counts the pages that hold the dirtier's last write to them, and those that
+    do not: pages before pos.next were last written in pass pos.gen, the others
+    in the pass before (or never, in the first pass)."""
+    checked = wrong = 0
+    with pos.lock:
+        for p in range(len(buf) // PAGE):
+            g = pos.gen if p < pos.next else pos.gen - 1
+            if g == 0:
+                continue
+            checked += 1
+            wrong += buf[p * PAGE + (g % 64) * 8] != g % 256
+    return checked, wrong
+
+
 def main() -> None:
     mib, dirty_pct = int(sys.argv[1]), float(sys.argv[2])
     burst_hz = int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -92,7 +119,8 @@ def main() -> None:
     buf = bytearray(os.urandom(1048576)) * mib
     out(f"READY {now_ms() - t0:.0f}")
     threading.Thread(target=ticker, args=(gap_ms,), daemon=True).start()
-    threading.Thread(target=dirtier, args=(buf, dirty_pct, burst_hz), daemon=True).start()
+    pos = Position()
+    threading.Thread(target=dirtier, args=(buf, pos, dirty_pct, burst_hz), daemon=True).start()
     env: dict = {"buf": buf}
     for line in sys.stdin:
         if line.startswith("ping"):
@@ -102,6 +130,8 @@ def main() -> None:
             for off in range(PAGE - 1, len(buf), PAGE):
                 buf[off] = (buf[off] + 1) & 0xFF
             out(f"TOUCHED {now_ms() - s:.1f}")
+        elif line.startswith("verify"):
+            out("VERIFIED {} {}".format(*verify(buf, pos)))
         elif line.startswith("eval "):
             out(f"VALUE {eval(line[5:], env)!r}")
         elif line.startswith("quit"):
