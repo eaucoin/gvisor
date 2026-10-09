@@ -426,6 +426,126 @@ func TestWritev(t *testing.T) {
 	}
 }
 
+// testPipeReadServer implements AsyncFileServerImpl by serving the read end of
+// a pipe, whose reads block until the pipe has data.
+type testPipeReadServer struct {
+	path string
+	fd   int32
+}
+
+// Destroy implements AsyncFileServerImpl.Destroy.
+func (s *testPipeReadServer) Destroy() {}
+
+// OpenRead implements AsyncFileServerImpl.OpenRead.
+func (s *testPipeReadServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	if path == s.path {
+		return stateio.NewFDReader(s.fd, 4096, 2 /* maxRanges */, 1 /* maxParallel */), nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+// OpenWrite implements AsyncFileServerImpl.OpenWrite.
+func (s *testPipeReadServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// TestReadWaitOr checks that a client's WaitOr returns when its wake channel
+// becomes readable while it waits for a read that the server's reader has not
+// completed, and returns the read's completion later.
+func TestReadWaitOr(t *testing.T) {
+	const testPath = "pipe"
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		t.Fatalf("Pipe failed: %v", err)
+	}
+	defer unix.Close(fds[1])
+
+	// The destination file.
+	const dataLen = 8
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestReadWaitOr", 4096)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	// Set up the server, which takes ownership of the pipe's read end, and
+	// the client.
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&testPipeReadServer{path: testPath, fd: int32(fds[0])})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	wr, ok := ar.(stateio.WaitOrAsyncReader)
+	if !ok {
+		t.Fatalf("client reader %T does not implement stateio.WaitOrAsyncReader", ar)
+	}
+	df, err := ar.RegisterDestinationFD(memfd, 4096, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+
+	// A read at the current offset of the pipe (two ranges, since the server
+	// submits single-range reads with pread(2), which pipes refuse).
+	frs := []memmap.FileRange{{0, dataLen / 2}, {dataLen / 2, dataLen}}
+	ar.AddReadv(0 /* id */, -1 /* off */, dataLen, df, frs, []unix.Iovec{
+		{Base: &buf[0], Len: dataLen / 2},
+		{Base: &buf[dataLen/2], Len: dataLen / 2},
+	})
+	wake := make(chan struct{}, 1)
+	type result struct {
+		cs  []stateio.Completion
+		err error
+	}
+	results := make(chan result, 1)
+	go func() {
+		cs, err := wr.WaitOr(nil, wake)
+		results <- result{cs, err}
+	}()
+	select {
+	case r := <-results:
+		t.Fatalf("WaitOr returned (%v, %v) before the read completed or a wake", r.cs, r.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	wake <- struct{}{}
+	select {
+	case r := <-results:
+		if r.err != nil || len(r.cs) != 0 {
+			t.Fatalf("WaitOr woken returned (%v, %v), want no completions", r.cs, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("WaitOr did not return after a wake")
+	}
+
+	if _, err := unix.Write(fds[1], []byte("complete")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	cs, err := wr.WaitOr(nil, wake)
+	if err != nil || len(cs) != 1 || cs[0].ID != 0 || cs[0].N != dataLen || cs[0].Err != nil {
+		t.Fatalf("WaitOr returned (%v, %v), want the completion of read 0 of %d bytes", cs, err, dataLen)
+	}
+	if string(buf[:dataLen]) != "complete" {
+		t.Errorf("read %q, want %q", buf[:dataLen], "complete")
+	}
+}
+
 func TestClientWatchdog(t *testing.T) {
 	// Create random data.
 	const testPath = "testfile"
