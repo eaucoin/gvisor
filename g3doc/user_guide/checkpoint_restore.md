@@ -342,6 +342,45 @@ of its first image, when one incremental checkpoint exceeds half of the image
 (a full checkpoint then costs about as much), or when the chain is deeper than
 16 images.
 
+### Tracking writes with the host kernel
+
+With `--dirty-tracking=uffd`, the host kernel records the writes instead
+(userfaultfd write-protection in asynchronous mode, read with `PAGEMAP_SCAN`;
+Linux 6.7 or later), at 4 KiB. On systrap, a first write after a checkpoint
+costs about 1.5 µs per page, against about 25 µs at 4 KiB and 3 µs per page
+at 64 KiB with `wp`. Its other costs grow with the sandbox's memory: page
+tables for the whole tracked memory (2 MiB per GiB), and reading what was
+written, about 3 ms per GiB in each checkpoint. Write-protection also splits
+huge pages. It is available on the KVM and systrap platforms;
+`--dirty-tracking=auto` selects it on KVM, when the host supports it and
+without `--app-huge-pages`, and `wp` otherwise.
+
+On systrap, the application runs in host processes (stubs) whose page tables
+the host kernel tracks for the sandbox. `uffd` widens what the sandbox's
+kernel (the Sentry) may ask of the host, which is why `auto` does not select
+it there. Application code cannot use either grant: it runs in stub threads
+whose seccomp filter traps every system call to the Sentry.
+
+-   The stubs may call `userfaultfd(2)` and `mprotect(2)` when the Sentry
+    makes them: `userfaultfd` only with exactly the flags `O_CLOEXEC |
+    O_NONBLOCK | UFFD_USER_MODE_ONLY`, so that the host kernel never stalls on
+    a fault it takes itself, which is what makes userfaultfds an aid to
+    kernel exploits; `mprotect` only to `PROT_NONE` or to a protection that
+    includes `PROT_WRITE`, as the Sentry makes a tracked mapping writable
+    once it is write-protected, and inaccessible before it reads what was
+    written through it and unmaps it.
+-   The Sentry keeps a descriptor of the procfs it starts with (that of the
+    sandbox's PID namespace, unless the sandbox runs without its own root) and
+    may open files through it, read-only: it opens the stubs'
+    `/proc/PID/pagemap`, but seccomp cannot check paths, so it could open any
+    file of that procfs, or of its own root (an empty, read-only directory).
+    `/proc` itself is not mounted in the sandbox, as without dirty tracking.
+    Where that procfs is of an ancestor PID namespace, the Sentry may also
+    open pidfds, to find its stubs' PIDs there.
+
+[Dirty tracking with userfaultfd write-protection](../proposals/uffd_wp_dirty_tracking.md)
+describes the design, the reasoning behind each grant, and the measurements.
+
 ## Pre-copy
 
 A checkpoint pauses the container while it writes its memory. With
@@ -372,7 +411,8 @@ at a quarter of the write speed measured, and the processes that write faster
 are delayed after the page faults that record their first writes, as QEMU's
 dirty-limit does for vCPUs. The rounds then converge, at the cost of slowing
 those processes during the checkpoint. Throttling requires
-`--dirty-tracking=wp`.
+`--dirty-tracking=wp`: with `uffd`, which records writes without faults that
+could delay them, a checkpoint with `--precopy-throttle=on` fails.
 
 `--dirty-tracking=wp` records first writes to huge pages whole, a write
 dirtying 2 MiB (see `--dirty-tracking-unit`). Where the application's memory

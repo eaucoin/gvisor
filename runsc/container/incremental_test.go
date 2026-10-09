@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -42,27 +43,98 @@ import (
 // tested with, with the marking paths of its own that negative controls
 // disable.
 type incrementalDirtySource struct {
-	name   string
-	mode   config.DirtyTrackingMode
-	breaks []config.DirtyTrackingBreak
+	name string
+	mode config.DirtyTrackingMode
+
+	// breaks are the source's own marking paths, and platformBreaks those
+	// that it has on some platforms only, by platform.
+	breaks         []config.DirtyTrackingBreak
+	platformBreaks map[string][]config.DirtyTrackingBreak
+
+	// storeBreaks are, by platform ("" for every platform), those of the
+	// source's own marking paths whose loss loses the application's stores
+	// to memory that it keeps mapped, the only writes that mem_touch makes;
+	// remapBreaks are those whose loss loses the writes made before the
+	// application's mappings change, as forks change them. The others lose
+	// writes that workloads make only incidentally, such as the Sentry's
+	// writes to application memory.
+	storeBreaks map[string][]config.DirtyTrackingBreak
+	remapBreaks map[string][]config.DirtyTrackingBreak
+
+	// tracksMapInternal is true if the source also records the writes that
+	// MapInternal marks, so that disabling MapInternal's marks loses none.
+	tracksMapInternal bool
+}
+
+// breaksOn returns the source's own marking paths on platform.
+func (src incrementalDirtySource) breaksOn(platform string) []config.DirtyTrackingBreak {
+	return append(slices.Clone(src.breaks), src.platformBreaks[platform]...)
+}
+
+// storeBreaksOn returns the source's own marking paths on platform whose
+// loss loses the application's stores to memory that it keeps mapped.
+func (src incrementalDirtySource) storeBreaksOn(platform string) []config.DirtyTrackingBreak {
+	return append(slices.Clone(src.storeBreaks[""]), src.storeBreaks[platform]...)
+}
+
+// remapBreaksOn returns the source's own marking paths on platform whose loss
+// loses the writes made before the application's mappings change.
+func (src incrementalDirtySource) remapBreaksOn(platform string) []config.DirtyTrackingBreak {
+	return append(slices.Clone(src.remapBreaks[""]), src.remapBreaks[platform]...)
+}
+
+// sharedBreaks returns the marking paths that src shares with every source
+// and whose writes it does not also record otherwise: MapInternal's, and
+// tmpfs writes to disk-backed filestores.
+func (src incrementalDirtySource) sharedBreaks() []config.DirtyTrackingBreak {
+	if src.tracksMapInternal {
+		return []config.DirtyTrackingBreak{config.DirtyTrackingBreakTmpfs}
+	}
+	return []config.DirtyTrackingBreak{config.DirtyTrackingBreakMapInternal, config.DirtyTrackingBreakTmpfs}
 }
 
 // incrementalDirtySources are the dirty sources that incremental checkpoints
 // are tested with. The negative controls also disable, with every source, the
-// marking paths that all sources share (MapInternal, and tmpfs writes to
-// disk-backed filestores).
+// marking paths that all sources share (sharedBreaks).
 var incrementalDirtySources = []incrementalDirtySource{
 	{
 		name:   "wp",
 		mode:   config.DirtyTrackingWriteProtect,
 		breaks: []config.DirtyTrackingBreak{config.DirtyTrackingBreakFault, config.DirtyTrackingBreakArm},
+		storeBreaks: map[string][]config.DirtyTrackingBreak{
+			"": {config.DirtyTrackingBreakFault, config.DirtyTrackingBreakArm},
+		},
+	},
+	{
+		// The host's userfaultfd write-protection records the writes
+		// through the Sentry's mappings, MapInternal's included, which
+		// the application's are on kvm, and on systrap through the stubs'
+		// mappings, which are harvested before they are unmapped.
+		name:   "uffd",
+		mode:   config.DirtyTrackingUFFD,
+		breaks: []config.DirtyTrackingBreak{config.DirtyTrackingBreakUffdInternal},
+		platformBreaks: map[string][]config.DirtyTrackingBreak{
+			"systrap": {config.DirtyTrackingBreakUffdUnmap},
+		},
+		storeBreaks: map[string][]config.DirtyTrackingBreak{
+			"kvm": {config.DirtyTrackingBreakUffdInternal},
+		},
+		remapBreaks: map[string][]config.DirtyTrackingBreak{
+			"systrap": {config.DirtyTrackingBreakUffdUnmap},
+		},
+		tracksMapInternal: true,
 	},
 }
 
 // incrementalConf returns a copy of conf that tracks dirty pages with src, at
 // its default unit, verifies tracking at every checkpoint if verify is true,
-// and disables the marking path brk.
-func incrementalConf(conf *config.Config, src incrementalDirtySource, verify bool, brk config.DirtyTrackingBreak) *config.Config {
+// and disables the marking path brk. It ends the test if the host cannot
+// track dirty pages with src.
+func incrementalConf(t *testing.T, conf *config.Config, src incrementalDirtySource, verify bool, brk config.DirtyTrackingBreak) *config.Config {
+	t.Helper()
+	if src.mode == config.DirtyTrackingUFFD {
+		requireWriteTracking(t)
+	}
 	c := *conf
 	c.DirtyTracking = src.mode
 	c.DirtyTrackingVerify = config.DirtyTrackingVerifyOff
@@ -528,7 +600,7 @@ func TestCheckpointIncrementalNoEscapes(t *testing.T) {
 			for _, overlay := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/overlay=%t", name, src.name, overlay), func(t *testing.T) {
 					start := time.Now()
-					if e := runEscapes(t, incrementalConf(conf, src, true /* verify */, config.DirtyTrackingBreakNone), overlay); e != nil {
+					if e := runEscapes(t, incrementalConf(t, conf, src, true /* verify */, config.DirtyTrackingBreakNone), overlay); e != nil {
 						t.Errorf("writes escaped dirty tracking %s", e)
 					} else {
 						t.Logf("%d steps in %v", len(escapesSteps), time.Since(start))
@@ -547,7 +619,7 @@ func TestCheckpointIncrementalNoEscapes(t *testing.T) {
 func TestCheckpointIncrementalNoEscapesNegativeControls(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		for _, src := range incrementalDirtySources {
-			breaks := append([]config.DirtyTrackingBreak{config.DirtyTrackingBreakMapInternal, config.DirtyTrackingBreakTmpfs}, src.breaks...)
+			breaks := append(src.sharedBreaks(), src.breaksOn(conf.Platform)...)
 			for _, brk := range breaks {
 				// Only tmpfs on a disk-backed filestore, which the
 				// root filesystem's overlay is, writes without
@@ -555,7 +627,7 @@ func TestCheckpointIncrementalNoEscapesNegativeControls(t *testing.T) {
 				overlay := brk == config.DirtyTrackingBreakTmpfs
 				for _, verify := range []bool{true, false} {
 					t.Run(fmt.Sprintf("%s/%s/%v/verify=%t", name, src.name, brk, verify), func(t *testing.T) {
-						e := runEscapes(t, incrementalConf(conf, src, verify, brk), overlay)
+						e := runEscapes(t, incrementalConf(t, conf, src, verify, brk), overlay)
 						switch {
 						case e == nil:
 							t.Errorf("no write escaped dirty tracking with %v disabled", brk)
@@ -661,8 +733,9 @@ func runMemTouch(t *testing.T, conf *config.Config) ([]string, error) {
 // without pause and checks it against a shadow table, under a chain of
 // incremental checkpoints with dirty tracking verified at every checkpoint,
 // and restores of the chain: after every restore, the check must pass. As a
-// negative control, with each of the dirty source's own marking paths
-// disabled, and no verification, a check must fail, or mem_touch stop: its
+// negative control, with each of the dirty source's own marking paths whose
+// loss loses the application's stores (storeBreaksOn) disabled, and no
+// verification, a check must fail, or mem_touch stop: its
 // stack loses writes too, so that it may return into the wrong caller. (With
 // MapInternal's disabled, restores fail before any check, on the VDSO
 // parameter page, which TestCheckpointIncrementalNoEscapesNegativeControls
@@ -671,7 +744,7 @@ func TestCheckpointIncrementalMemTouch(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		for _, src := range incrementalDirtySources {
 			t.Run(fmt.Sprintf("%s/%s", name, src.name), func(t *testing.T) {
-				results, err := runMemTouch(t, incrementalConf(conf, src, true /* verify */, config.DirtyTrackingBreakNone))
+				results, err := runMemTouch(t, incrementalConf(t, conf, src, true /* verify */, config.DirtyTrackingBreakNone))
 				if err != nil {
 					t.Errorf("mem_touch: %v", err)
 				}
@@ -681,9 +754,9 @@ func TestCheckpointIncrementalMemTouch(t *testing.T) {
 					}
 				}
 			})
-			for _, brk := range src.breaks {
+			for _, brk := range src.storeBreaksOn(conf.Platform) {
 				t.Run(fmt.Sprintf("%s/%s/%v", name, src.name, brk), func(t *testing.T) {
-					results, err := runMemTouch(t, incrementalConf(conf, src, false /* verify */, brk))
+					results, err := runMemTouch(t, incrementalConf(t, conf, src, false /* verify */, brk))
 					for _, result := range results {
 						if strings.Contains(result, ": FAIL ") {
 							t.Logf("mem_touch's check %s", result)
