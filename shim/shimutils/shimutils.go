@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -306,9 +307,29 @@ func NewMockContainerdWithSuffix(t *testing.T, suffix string, shimArgs, runscArg
 		server.Close()
 		s.eventListener.Close()
 		os.RemoveAll(eventWd)
+		removeSockets(t, s.wd)
 	})
 
 	return s
+}
+
+// removeSockets removes the Unix domain sockets under dir: those that shims
+// and sandboxes leave in their state directories when they are killed rather
+// than deleted. dir is in the test's outputs, which Bazel refuses to archive
+// with sockets in them.
+func removeSockets(t *testing.T, dir string) {
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSocket != 0 {
+			return os.Remove(path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("failed to remove sockets under %q: %v", dir, err)
+	}
 }
 
 // NewMockContainerd creates a new MockContainerd.
