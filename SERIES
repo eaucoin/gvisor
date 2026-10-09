@@ -1,0 +1,33 @@
+# The series that make up this fork's main branch.
+#
+# main is the base below plus the commits of the series listed here, applied in
+# this order by tools/fork/series.sh, which also checks each series, as far as
+# the series' tips pass tier 1 (.github/workflows/fork-integrate.yml). Each
+# series is a branch holding one work item as a clean stack of commits on the
+# base, or on the series it is declared "on" when it builds on them or
+# conflicts with them. Moving to a newer upstream release means changing the
+# base and rebasing every series onto it.
+#
+# Lines: "base TAG", then "BRANCH [on BRANCH...]"; "#" starts a comment.
+
+base release-20260921.0
+
+series/fork-infra
+# Fixes to the base: upstream's own bugs, here its tests' races.
+series/00-base-fixes
+# Carries google/gvisor#14430 (pgalloc's first save/restore tests) by its author.
+series/10-pgalloc-save-restore-tests
+series/17-image-format-v2 on series/10-pgalloc-save-restore-tests
+series/18-image-tooling on series/17-image-format-v2
+series/11-fault-first-restore on series/18-image-tooling
+series/14-dirty-tracking-framework on series/11-fault-first-restore
+series/15-dirty-source-write-protection on series/14-dirty-tracking-framework
+series/19-incremental-save on series/15-dirty-source-write-protection
+series/20-precopy on series/19-incremental-save
+series/16-dirty-source-uffd-wp on series/20-precopy
+# Carries google/gvisor#14760 (restore through the shim's task service) by its author.
+series/13-pod-restore on series/16-dirty-source-uffd-wp
+series/12-s3-checkpoint-gofer on series/13-pod-restore
+series/21-working-set on series/12-s3-checkpoint-gofer
+series/22-shim-incremental-checkpoints on series/21-working-set
+series/03-release-versions on series/22-shim-incremental-checkpoints
