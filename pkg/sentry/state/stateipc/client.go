@@ -372,12 +372,52 @@ func (rw *asyncReadWriter) AddWritev(id int, total uint64, srcFile stateio.Sourc
 
 // Wait implements stateio.AsyncReader.Wait and stateio.AsyncWriter.Wait.
 func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
+	return rw.wait(cs, minCompletions, nil)
+}
+
+// WaitOr implements stateio.WaitOrAsyncReader.WaitOr.
+//
+// While it waits, a wake is forwarded to the server with AsyncFileServer.Wake,
+// which makes the server's wait return if the server's reader implements
+// stateio.WaitOrAsyncReader.
+func (rw *asyncReadWriter) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]stateio.Completion, error) {
+	select {
+	case <-wake:
+		return cs, nil
+	default:
+	}
+	return rw.wait(cs, 1, wake)
+}
+
+// wait waits for minCompletions completions or, if wake is not nil, for wake
+// to be readable.
+func (rw *asyncReadWriter) wait(cs []stateio.Completion, minCompletions int, wake <-chan struct{}) ([]stateio.Completion, error) {
 	if err := rw.ensureConnected(); err != nil {
 		return cs, err
 	}
 	minCompletions32 := uint32(max(minCompletions, 0))
 	if rw.isReader {
-		*rw.ioep.readRequestHeader() = readRequestHeader{MinCompletions: minCompletions32}
+		var wakeable uint32
+		if wake != nil {
+			wakeable = 1
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() {
+				select {
+				case <-wake:
+					req := WakeRequest{Handle: rw.handle}
+					var resp WakeResponse
+					if err := rw.client.uc.Call("AsyncFileServer.Wake", &req, &resp); err != nil {
+						log.Warningf("stateipc.asyncReadWriter(%d): AsyncFileServer.Wake failed: %v", rw.handle, err)
+					}
+				case <-stop:
+				}
+			}()
+		}
+		*rw.ioep.readRequestHeader() = readRequestHeader{
+			MinCompletions: minCompletions32,
+			Wakeable:       wakeable,
+		}
 	} else {
 		*rw.ioep.writeRequestHeader() = writeRequestHeader{
 			MinCompletions: minCompletions32,
@@ -408,7 +448,7 @@ func (rw *asyncReadWriter) Wait(cs []stateio.Completion, minCompletions int) ([]
 	if respErrno != 0 {
 		return cs, ioErrorFromErrno(respErrno, "I/O response")
 	}
-	if numCompletions < minCompletions32 {
+	if numCompletions < minCompletions32 && wake == nil {
 		return cs, fmt.Errorf("server returned %d completions (want %d)", numCompletions, minCompletions32)
 	}
 	return cs, nil
