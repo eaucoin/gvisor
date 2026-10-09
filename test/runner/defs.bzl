@@ -84,6 +84,7 @@ def _syscall_test(
         netstack_sr = False,
         dirty_tracking_verify = False,
         dirty_tracking_unit = 0,
+        save_incremental = False,
         nftables = False,
         kvm_use_cpu_nums = True,
         in_sandbox_cgroup = "v1",
@@ -115,6 +116,8 @@ def _syscall_test(
         name += "_verify"
     if dirty_tracking_unit:
         name += "_%dk" % (dirty_tracking_unit // 1024)
+    if save_incremental:
+        name += "_incremental"
     if nftables:
         name += "_nftables"
 
@@ -130,7 +133,9 @@ def _syscall_test(
     if save or save_resume:
         tags.append("allsave")
         if platform in save_restore_platforms:
-            if dirty_tracking_verify:
+            if save_incremental:
+                tags.append("save_incremental")
+            elif dirty_tracking_verify:
                 tags.append("save_verify")
             elif save:
                 tags.append("save_restore")
@@ -194,6 +199,7 @@ def _syscall_test(
         "--netstack-sr=" + str(netstack_sr),
         "--dirty-tracking-verify=" + str(dirty_tracking_verify),
         "--dirty-tracking-unit=" + str(dirty_tracking_unit),
+        "--save-incremental=" + str(save_incremental),
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
@@ -679,6 +685,39 @@ def syscall_test(
             in_sandbox_cgroup = in_sandbox_cgroup,
             **kwargs
         )
+
+        # Add a save variant on every platform in which saves are
+        # incremental, of the image the sandbox was restored from, in chains
+        # of 16 images that each start with a full save (the runner's
+        # incrementalChainLength), and restores read the chain of images.
+        # Saves verify tracking too: a write that escaped it fails the save,
+        # which names the pages, and so the test.
+        for platform, platform_tags in all_platforms():
+            _syscall_test(
+                test = test,
+                platform = platform,
+                use_tmpfs = use_tmpfs,
+                add_host_uds = add_host_uds,
+                add_host_connector = add_host_connector,
+                add_host_fifo = add_host_fifo,
+                add_host_tty = add_host_tty,
+                tags = platform_tags + tags,
+                iouring = iouring,
+                directfs = add_directfs and platform == default_platform,
+                debug = debug,
+                container = container,
+                one_sandbox = one_sandbox,
+                leak_check = leak_check,
+                save = True,
+                dirty_tracking_verify = True,
+                save_incremental = True,
+                size = "large",
+                timeout = "long",
+                nftables = nftables,
+                kvm_use_cpu_nums = kvm_use_cpu_nums,
+                in_sandbox_cgroup = in_sandbox_cgroup,
+                **kwargs
+            )
 
         # Add save resume variant to all other variants generated above.
         syscall_test_variants(
