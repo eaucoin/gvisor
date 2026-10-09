@@ -1,0 +1,17 @@
+{{ template "base" . }}
+
+# k3s's containerd configuration with runsc as the runtime "runsc", for
+# pod_restore_test.sh's node; mounted at
+# /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl.
+#
+# pod_annotations passes the pods' restore annotations on to the OCI specs of
+# the sandbox and of its containers, where the shim reads them
+# (g3doc/user_guide/checkpoint_restore.md, "Restore into a new pod").
+# ConfigPath holds the shim's options for every container of this runtime.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+  pod_annotations = ["dev.gvisor.internal.restore.*"]
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
+  TypeUrl = "io.containerd.runsc.v1.options"
+  ConfigPath = "/etc/containerd/runsc/runsc.toml"

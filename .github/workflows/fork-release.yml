@@ -9,7 +9,9 @@
 # a dry run, which builds and checks but neither tags nor publishes. main must
 # have passed tiers 1 and 2. The binaries are built with Bazel as upstream
 # builds its releases, natively for x86_64 (aarch64 once checkpoint and
-# restore work there), checked by the smoke test, and published as upstream
+# restore work there), checked by the smoke test and by a pod checkpointed and
+# restored through the containerd shim in a one-node Kubernetes cluster, and
+# published as upstream
 # publishes them (gvisor-<arch>.tar.{bz2,zstd}: runsc, its gvisor-bin/
 # sidecars, the checkpoint gofer among them, and the containerd shim), with
 # SHA-512 sums and GitHub build provenance attestations.
@@ -154,6 +156,8 @@ jobs:
             exit 1
           fi
           tools/fork/smoke_test.sh "${RUNNER_TEMP}/install/runsc"
+      - name: Restore a pod through the shim
+        run: tools/fork/pod_restore_test.sh "${RUNNER_TEMP}/install"
       - name: Name the assets by architecture
         run: |
           mkdir -p assets
