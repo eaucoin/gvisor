@@ -37,21 +37,41 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
-// recordingAddressSpace is a platform.AddressSpace that records the ranges
-// mapped into it, and maps nothing.
+// recordingAddressSpace is a platform.AddressSpace that records the calls
+// made to it, and maps nothing.
 type recordingAddressSpace struct {
 	platform.NoAddressSpaceIO
+
+	// mapped records the ranges of the calls to MapFile, in order.
 	mapped []hostarch.AddrRange
+
+	// pages records, for each page mapped and not unmapped since, the access
+	// type it was mapped with.
+	pages map[hostarch.Addr]hostarch.AccessType
+
+	// unmaps counts the calls to Unmap.
+	unmaps int
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (as *recordingAddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	as.mapped = append(as.mapped, hostarch.AddrRange{Start: addr, End: addr + hostarch.Addr(fr.Length())})
+	if as.pages == nil {
+		as.pages = make(map[hostarch.Addr]hostarch.AccessType)
+	}
+	for off := uint64(0); off < fr.Length(); off += hostarch.PageSize {
+		as.pages[addr+hostarch.Addr(off)] = at
+	}
 	return nil
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
-func (*recordingAddressSpace) Unmap(addr hostarch.Addr, length uint64) {}
+func (as *recordingAddressSpace) Unmap(addr hostarch.Addr, length uint64) {
+	as.unmaps++
+	for off := uint64(0); off < length; off += hostarch.PageSize {
+		delete(as.pages, addr+hostarch.Addr(off))
+	}
+}
 
 // Release implements platform.AddressSpace.Release.
 func (*recordingAddressSpace) Release() {}
