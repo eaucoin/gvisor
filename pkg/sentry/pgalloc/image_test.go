@@ -126,6 +126,31 @@ func saveTestImage(t *testing.T, f *MemoryFile, parent *testImage, clean func(ui
 // BaseLayers and PagesFile it sets.
 func saveTestImageOpts(t *testing.T, f *MemoryFile, parent *testImage, opts SaveOpts) *testImage {
 	t.Helper()
+	return newTestPagesWriter(t).save(t, f, parent, opts)
+}
+
+// testPagesWriter is async page saving to a pages file in memory.
+type testPagesWriter struct {
+	apfs *AsyncPagesFileSave
+	buf  bytes.Buffer
+	done chan error
+}
+
+func newTestPagesWriter(t *testing.T) *testPagesWriter {
+	t.Helper()
+	pw := &testPagesWriter{done: make(chan error, 1)}
+	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&pw.buf, 64<<10, 16, 4), func(err error) { pw.done <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave: %v", err)
+	}
+	pw.apfs = apfs
+	return pw
+}
+
+// save saves f as an image whose pages file pw writes, as saveTestImageOpts
+// does, and completes pw.
+func (pw *testPagesWriter) save(t *testing.T, f *MemoryFile, parent *testImage, opts SaveOpts) *testImage {
+	t.Helper()
 	ip := &pgallocpb.ImageProto{
 		Layers:   []*pgallocpb.LayerProto{{}},
 		PageHash: checkpointimage.PageHashXXH64,
@@ -138,28 +163,22 @@ func saveTestImageOpts(t *testing.T, f *MemoryFile, parent *testImage, opts Save
 		}
 	}
 
-	var pagesBuf bytes.Buffer
-	saveDone := make(chan error, 1)
-	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&pagesBuf, 64<<10, 16, 4), func(err error) { saveDone <- err })
-	if err != nil {
-		t.Fatalf("StartAsyncPagesFileSave: %v", err)
-	}
-	opts.PagesFile = apfs
+	opts.PagesFile = pw.apfs
 	var metaBuf bytes.Buffer
 	w := checkpointimage.NewWriter(&metaBuf, ip)
 	saveErr := f.SaveTo(context.Background(), w, &opts)
-	apfs.MemoryFilesDone()
-	if err := <-saveDone; err != nil {
+	pw.apfs.MemoryFilesDone()
+	if err := <-pw.done; err != nil {
 		t.Fatalf("async page saving: %v", err)
 	}
 	if saveErr != nil {
 		t.Fatalf("SaveTo: %v", saveErr)
 	}
-	img, err := w.Finish(apfs.PagesFileOffset())
+	img, err := w.Finish(pw.apfs.PagesFileOffset())
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	ti := &testImage{meta: metaBuf.Bytes(), pages: pagesBuf.Bytes(), img: img}
+	ti := &testImage{meta: metaBuf.Bytes(), pages: pw.buf.Bytes(), img: img}
 	// Find the pages files of the layers that the image kept.
 	ti.layers = [][]byte{ti.pages}
 	if parent != nil {
