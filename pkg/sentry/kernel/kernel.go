@@ -777,9 +777,12 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 }
 
 // savePrivateMFs saves the private MemoryFiles in mfsToSave, in the order of
-// owners.
-func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.ResourceID, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, mfOpts *pgalloc.SaveOpts) error {
+// owners, as deltas of the parent image if delta is not nil.
+func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.ResourceID, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, mfOpts *pgalloc.SaveOpts, delta *incrementalSave) error {
 	for _, fsID := range owners {
+		if delta != nil {
+			delta.setBase(mfOpts, mfsToSave[fsID], &fsID)
+		}
 		if err := mfsToSave[fsID].SaveTo(ctx, w, mfOpts); err != nil {
 			return err
 		}
@@ -792,10 +795,15 @@ func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.Resour
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
 //
+// If parent is not nil, the save is incremental: it writes only the pages
+// written since the image k was last saved to or restored from, whose digest
+// *parent must be, and refers to that image for the others. Incremental saves
+// require dirty tracking and a pages file.
+//
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool, parent *checkpointimage.Digest) error {
 	// The bypass is part of the saved task state, so it is armed before the
 	// state is written and covers both resuming after the save and restoring.
 	k.armSeccompRestartSyscallBypasses()
@@ -827,14 +835,14 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 			state.EnableGraphEngine(*graphEngine)
 			defer state.EnableGraphEngine(prevGraphEngine)
 		}
-		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, parent, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
 }
 
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, parent *checkpointimage.Digest, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
@@ -867,6 +875,18 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfsToSaveActual = filterMFsToSave(mfsToSave, matchCtxs)
 	}
 
+	var (
+		delta *incrementalSave
+		image *checkpointimage.Image
+	)
+	if parent != nil {
+		if !k.DirtyTrackingEnabled() {
+			return fmt.Errorf("incremental save requires dirty tracking")
+		}
+		if pagesMetadata == nil {
+			return fmt.Errorf("incremental save requires a pages file")
+		}
+	}
 	if k.DirtyTrackingEnabled() {
 		dirtyEpoch, err := k.beginDirtySave(ctx)
 		if err != nil {
@@ -879,8 +899,13 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		// This must run after k.saveMemoryFiles() completes, so it must be
 		// deferred before the wait for it below.
 		defer func() {
-			retErr = k.endDirtySave(ctx, dirtyEpoch, saved, retErr)
+			retErr = k.endDirtySave(ctx, dirtyEpoch, saved, image, retErr)
 		}()
+		if parent != nil {
+			if delta, err = k.beginIncrementalSave(*parent, dirtyEpoch); err != nil {
+				return err
+			}
+		}
 	}
 
 	parallelMFSave := pagesMetadata != nil
@@ -893,7 +918,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume) // transfers ownership
+			image, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, delta) // transfers ownership
 		}()
 		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -958,7 +983,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return mfSaveErr
 		}
 	} else {
-		mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume)
+		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, nil /* delta */)
 		if mfSaveErr != nil {
 			return mfSaveErr
 		}
@@ -986,13 +1011,16 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
 // pagesMetadata and pagesFile (even if it returns a non-nil error), and
 // MemoryFile state will be saved to pagesMetadata and pagesFile.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, resume bool) error {
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, resume bool, delta *incrementalSave) (*checkpointimage.Image, error) {
 	memoryStart := time.Now()
 
 	// Private MemoryFiles are saved after the application MemoryFile, in the
 	// order the image records.
 	image := &pgallocpb.ImageProto{
 		Layers: []*pgallocpb.LayerProto{{}},
+	}
+	if delta != nil {
+		image.Layers = append(image.Layers, delta.layers()...)
 	}
 	owners := make([]checkpoint.ResourceID, 0, len(mfsToSave))
 	for fsID := range mfsToSave {
@@ -1014,7 +1042,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		pmw = imageWriter
 		pmwCleanup.Add(func() { pagesMetadata.Close() })
 	} else if err := checkpointimage.WriteRecord(w, image); err != nil {
-		return fmt.Errorf("failed to write image metadata: %w", err)
+		return nil, fmt.Errorf("failed to write image metadata: %w", err)
 	}
 	defer pmwCleanup.Clean()
 
@@ -1036,7 +1064,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 			asyncPageSaveErr = err
 		}) // transfers ownership
 		if err != nil {
-			return fmt.Errorf("failed to start async pages file saving: %w", err)
+			return nil, fmt.Errorf("failed to start async pages file saving: %w", err)
 		}
 		asyncPageSaveCleanup.Add(func() {
 			apfs.MemoryFilesDone()
@@ -1045,19 +1073,24 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		mfOpts.PagesFile = apfs
 	}
 
+	if delta != nil {
+		delta.setBase(&mfOpts, k.mf, nil /* owner */)
+	}
 	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
-		return err
+		return nil, err
 	}
 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
 	// usage behavior, but not necessarily usage of private MemoryFiles.
 	mfOpts.ExcludeCommittedZeroPages = false
-	if err := savePrivateMFs(ctx, pmw, owners, mfsToSave, &mfOpts); err != nil {
-		return err
+	if err := savePrivateMFs(ctx, pmw, owners, mfsToSave, &mfOpts, delta); err != nil {
+		return nil, err
 	}
+	var img *checkpointimage.Image
 	if pagesMetadata != nil {
-		img, err := imageWriter.Finish(mfOpts.PagesFile.PagesFileOffset())
+		var err error
+		img, err = imageWriter.Finish(mfOpts.PagesFile.PagesFileOffset())
 		if err != nil {
-			return fmt.Errorf("failed to write pages metadata file: %w", err)
+			return nil, fmt.Errorf("failed to write pages metadata file: %w", err)
 		}
 		log.Infof("Saved image %v: %d layers, %d bytes of pages", img.Digest, len(img.Proto.Layers), img.Proto.Layers[0].PagesSize)
 		// Close pagesMetadata while async MemoryFile saving is in progress to
@@ -1065,17 +1098,17 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		err = pagesMetadata.Close()
 		pmwCleanup.Release()
 		if err != nil {
-			return fmt.Errorf("failed to close pages metadata file: %w", err)
+			return nil, fmt.Errorf("failed to close pages metadata file: %w", err)
 		}
 	}
 
 	// Wait for page saving to complete and report errors.
 	asyncPageSaveCleanup.Release()()
 	if asyncPageSaveErr != nil {
-		return fmt.Errorf("failed to save MemoryFile pages: %w", asyncPageSaveErr)
+		return nil, fmt.Errorf("failed to save MemoryFile pages: %w", asyncPageSaveErr)
 	}
 	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
-	return nil
+	return img, nil
 }
 
 // armSeccompRestartSyscallBypasses arms Task.bypassSeccompRestartSyscall for
@@ -1226,6 +1259,9 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 		mfs := []*pgalloc.MemoryFile{k.mf}
 		for _, mf := range pgalloc.MemoryFileMapFromContext(ctx) {
 			mfs = append(mfs, mf)
+		}
+		if asyncMFLoader != nil {
+			k.dirty.last = asyncMFLoader.Image()
 		}
 		if err := k.trackDirty(ctx, mfs); err != nil {
 			return fmt.Errorf("starting dirty tracking: %w", err)
