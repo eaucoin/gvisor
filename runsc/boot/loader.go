@@ -63,6 +63,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
@@ -392,6 +393,23 @@ type Loader struct {
 	// hostinetPortRange is read before restore installs seccomp filters. A nil
 	// value means no destination host configuration is awaiting transfer.
 	hostinetPortRange *[2]uint16
+
+	// writeTrackingProcFS is the procfs FD that the platform tracks writes
+	// with (platform.Options.WriteTrackingProcFS), or nil. It is immutable.
+	writeTrackingProcFS *fd.FD
+
+	// uffdDirtyTracking is true if dirty tracking uses the uffd dirty
+	// source. It is immutable.
+	uffdDirtyTracking bool
+}
+
+// WriteTrackingProcFD returns the procfs directory FD that the platform
+// tracks writes with, or -1 if it does not.
+func (l *Loader) WriteTrackingProcFD() int {
+	if l.writeTrackingProcFS == nil {
+		return -1
+	}
+	return l.writeTrackingProcFS.FD()
 }
 
 // noRootContainer is the state of a sandbox with no root container.
@@ -814,6 +832,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create kernel and platform.
+	if err := l.setUpDirtyTracking(args.Conf); err != nil {
+		return nil, err
+	}
 	l.pinRing.FD = args.PinRingFD
 	if args.CPUDMALatencyFD >= 0 {
 		if l.pinRing.Exists() {
@@ -823,7 +844,7 @@ func New(args Args) (*Loader, error) {
 		}
 		unix.Close(args.CPUDMALatencyFD)
 	}
-	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing, 0 /* tscOffset */)
+	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing, 0 /* tscOffset */, l.writeTrackingProcFS)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
@@ -839,7 +860,13 @@ func New(args Args) (*Loader, error) {
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
 	}
-	configureDirtyTracking(l.k, args.Conf)
+	tracker, err := l.writeTracker(p)
+	if err != nil {
+		return nil, err
+	}
+	if err := configureDirtyTracking(l.k, args.Conf, l.uffdDirtyTracking, tracker); err != nil {
+		return nil, err
+	}
 
 	// Create memory file.
 	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
@@ -1221,7 +1248,7 @@ func (l *Loader) Destroy() {
 	refs.OnExit()
 }
 
-func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing, tscOffset uint64) (platform.Platform, error) {
+func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing, tscOffset uint64, writeTrackingProcFS *fd.FD) (platform.Platform, error) {
 	platformName := conf.Platform
 	p, err := platform.Lookup(conf.Platform)
 	if err != nil {
@@ -1239,6 +1266,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 		SandboxID:              sandboxID,
 		StartupTimer:           startupTimer,
 		PinRing:                pinRing,
+		WriteTrackingProcFS:    writeTrackingProcFS,
 	})
 	if err != nil {
 		return nil, err
@@ -1322,38 +1350,99 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 }
 
 // configureDirtyTracking configures the dirty tracking of k, a new Kernel, as
-// conf requests.
-func configureDirtyTracking(k *kernel.Kernel, conf *config.Config) {
-	var sources []kernel.DirtySource
-	switch conf.DirtyTracking {
-	case config.DirtyTrackingOff:
-		return
-	case config.DirtyTrackingAuto, config.DirtyTrackingWriteProtect:
-		sources = append(sources, kernel.NewWriteProtectDirtySource(k, conf.DirtyTrackingUnit))
-	default:
-		panic(fmt.Sprintf("unknown dirty tracking mode %v", conf.DirtyTracking))
+// conf requests. uffd is true if the host side of the uffd dirty source was
+// set up (Loader.setUpDirtyTracking), and tracker is then the platform's
+// write tracker, if it tracks writes itself.
+func configureDirtyTracking(k *kernel.Kernel, conf *config.Config, uffd bool, tracker platform.WriteTracker) error {
+	if conf.DirtyTracking == config.DirtyTrackingOff {
+		return nil
 	}
-	log.Infof("Dirty tracking: %v, unit %d bytes, verification %v", conf.DirtyTracking, conf.DirtyTrackingUnit, conf.DirtyTrackingVerify)
+	var source kernel.DirtySource
+	switch {
+	case conf.DirtyTracking == config.DirtyTrackingWriteProtect, !uffd:
+		// Loader.setUpDirtyTracking did not set up uffd for auto.
+		source = kernel.NewWriteProtectDirtySource(k, conf.DirtyTrackingUnit)
+		log.Infof("Dirty tracking: %v, source wp, unit %d bytes, verification %v", conf.DirtyTracking, conf.DirtyTrackingUnit, conf.DirtyTrackingVerify)
+	default:
+		var err error
+		if source, err = kernel.NewUffdDirtySource(k, tracker); err != nil {
+			return err
+		}
+		log.Infof("Dirty tracking: %v, source uffd, verification %v", conf.DirtyTracking, conf.DirtyTrackingVerify)
+	}
 	if b := conf.TestOnlyDirtyTrackingBreak; b != config.DirtyTrackingBreakNone {
 		log.Warningf("TESTONLY-dirty-tracking-break=%v: dirty tracking misses the writes of a disabled path, for tests only", b)
 		pgalloc.TestOnlyDisableDirtyMarkPath(dirtyMarkPaths[b])
 	}
 	k.SetDirtyTracking(kernel.DirtyTrackingOpts{
-		Sources: sources,
+		Sources: []kernel.DirtySource{source},
 		Verify:  conf.DirtyTrackingVerify == config.DirtyTrackingVerifyHash,
 	})
+	return nil
+}
+
+// writeTracker returns the platform's write tracker if it tracks writes
+// itself (Loader.setUpDirtyTracking created it with a procfs FD), or nil.
+func (l *Loader) writeTracker(p platform.Platform) (platform.WriteTracker, error) {
+	if l.writeTrackingProcFS == nil {
+		return nil, nil
+	}
+	tracker, ok := p.(platform.WriteTracker)
+	if !ok {
+		return nil, fmt.Errorf("platform %T does not implement platform.WriteTracker", p)
+	}
+	return tracker, nil
+}
+
+// setUpDirtyTracking prepares the host side of dirty tracking, before the
+// platform and any MemoryFile are created: with --dirty-tracking=uffd, or
+// with =auto on a platform whose application writes go through the Sentry's
+// mappings (kvm) and without application huge pages, where the host supports
+// it, it sets up write tracking for the uffd dirty source.
+//
+// auto does not select uffd on platforms that track writes through their own
+// mappings (systrap), where it relaxes the Sentry's and the stubs' seccomp
+// filters (see the user guide), nor with application huge pages, which
+// write-protection splits.
+func (l *Loader) setUpDirtyTracking(conf *config.Config) error {
+	switch conf.DirtyTracking {
+	case config.DirtyTrackingUFFD:
+	case config.DirtyTrackingAuto:
+		p, err := platformdesc.Lookup(conf.Platform)
+		if err != nil {
+			return err
+		}
+		if p.Requirements.WriteTracking != platformdesc.WriteTrackingInternalMappings || conf.AppHugePages {
+			return nil
+		}
+	default:
+		return nil
+	}
+	procFS, err := setUpWriteTracking(conf.Platform)
+	if err != nil {
+		if conf.DirtyTracking == config.DirtyTrackingUFFD {
+			return fmt.Errorf("dirty tracking with uffd: %w", err)
+		}
+		log.Infof("Dirty tracking: uffd is unavailable, using wp: %v", err)
+		return nil
+	}
+	l.writeTrackingProcFS = procFS
+	l.uffdDirtyTracking = true
+	return nil
 }
 
 // dirtyMarkPaths maps the values of --TESTONLY-dirty-tracking-break to the
 // paths they disable.
 var dirtyMarkPaths = map[config.DirtyTrackingBreak]pgalloc.DirtyMarkPath{
-	config.DirtyTrackingBreakNone:        pgalloc.DirtyMarkNone,
-	config.DirtyTrackingBreakMapInternal: pgalloc.DirtyMarkMapInternal,
-	config.DirtyTrackingBreakDecommit:    pgalloc.DirtyMarkDecommit,
-	config.DirtyTrackingBreakTmpfs:       pgalloc.DirtyMarkTmpfsWrite,
-	config.DirtyTrackingBreakIOUring:     pgalloc.DirtyMarkIOUring,
-	config.DirtyTrackingBreakFault:       pgalloc.DirtyMarkWriteProtectFault,
-	config.DirtyTrackingBreakArm:         pgalloc.DirtyMarkWriteProtectArm,
+	config.DirtyTrackingBreakNone:         pgalloc.DirtyMarkNone,
+	config.DirtyTrackingBreakMapInternal:  pgalloc.DirtyMarkMapInternal,
+	config.DirtyTrackingBreakDecommit:     pgalloc.DirtyMarkDecommit,
+	config.DirtyTrackingBreakTmpfs:        pgalloc.DirtyMarkTmpfsWrite,
+	config.DirtyTrackingBreakIOUring:      pgalloc.DirtyMarkIOUring,
+	config.DirtyTrackingBreakFault:        pgalloc.DirtyMarkWriteProtectFault,
+	config.DirtyTrackingBreakArm:          pgalloc.DirtyMarkWriteProtectArm,
+	config.DirtyTrackingBreakUffdInternal: pgalloc.DirtyMarkUffdInternal,
+	config.DirtyTrackingBreakUffdUnmap:    pgalloc.DirtyMarkUffdUnmap,
 }
 
 // installSeccompFilters installs sandbox seccomp filters with the host.
@@ -1394,6 +1483,7 @@ func (l *Loader) installSeccompFilters() error {
 			CgoEnabled:            config.CgoEnabled,
 			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
 			VendorSyscalls:        filter.HostVendorSyscalls(),
+			InternalWriteTracking: pgalloc.InternalWriteTrackingEnabled(),
 		}
 		if err := filter.Install(opts, l.startupTimer); err != nil {
 			return fmt.Errorf("installing seccomp filters: %w", err)
