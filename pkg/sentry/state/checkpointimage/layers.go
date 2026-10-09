@@ -72,9 +72,9 @@ func FileDigest(path string) (Digest, error) {
 // it found nowhere.
 var ErrLayerNotFound = errors.New("layer not found")
 
-// FindLayers returns the directories of the images that are layers 1 to n of
-// img, whose own directory is imageDir. It looks for the layer with digest d
-// in:
+// LocateLayers returns the directories of the images that are layers 1 to n
+// of img, whose own directory is imageDir, or "" for each layer it does not
+// find. It looks for the layer with digest d in:
 //
 //   - imageDir/layers/d;
 //   - for each directory p of searchPaths, in order: p itself, if it is an
@@ -82,30 +82,29 @@ var ErrLayerNotFound = errors.New("layer not found")
 //
 // A candidate is a layer only if the digest of its pages metadata file is d;
 // its pages file must then have the size that img records for it.
-func FindLayers(img *Image, imageDir string, searchPaths []string) ([]string, error) {
+func LocateLayers(img *Image, imageDir string, searchPaths []string) ([]string, error) {
 	layers := img.Layers()
 	dirs := make([]string, len(layers)-1)
-	// Image directories in searchPaths, by digest; computed once, since a
-	// directory may hold any of the layers.
-	searchDigests := make(map[string]Digest)
+	// The digests of the candidate directories, computed once, since a
+	// directory in searchPaths may hold any of the layers.
+	digests := make(map[string]Digest)
 	for i, l := range layers[1:] {
 		candidates := []string{filepath.Join(imageDir, LayersDir, l.Digest.String())}
 		for _, p := range searchPaths {
 			candidates = append(candidates, p, filepath.Join(p, l.Digest.String()))
 		}
 		for _, dir := range candidates {
-			metaPath := filepath.Join(dir, checkpointfiles.PagesMetadataFileName)
-			d, ok := searchDigests[dir]
+			d, ok := digests[dir]
 			if !ok {
 				var err error
-				d, err = FileDigest(metaPath)
+				d, err = FileDigest(filepath.Join(dir, checkpointfiles.PagesMetadataFileName))
 				if errors.Is(err, fs.ErrNotExist) {
 					continue
 				}
 				if err != nil {
 					return nil, fmt.Errorf("layer %d (%v): %w", i+1, l.Digest, err)
 				}
-				searchDigests[dir] = d
+				digests[dir] = d
 			}
 			if d != l.Digest {
 				continue
@@ -121,8 +120,19 @@ func FindLayers(img *Image, imageDir string, searchPaths []string) ([]string, er
 			dirs[i] = dir
 			break
 		}
-		if dirs[i] == "" {
-			return nil, fmt.Errorf("layer %d (%v): %w in %s or the layer paths %q", i+1, l.Digest, ErrLayerNotFound, filepath.Join(imageDir, LayersDir), searchPaths)
+	}
+	return dirs, nil
+}
+
+// FindLayers is LocateLayers, but fails if a layer is not found.
+func FindLayers(img *Image, imageDir string, searchPaths []string) ([]string, error) {
+	dirs, err := LocateLayers(img, imageDir, searchPaths)
+	if err != nil {
+		return nil, err
+	}
+	for i, dir := range dirs {
+		if dir == "" {
+			return nil, fmt.Errorf("layer %d (%v): %w in %s or the layer paths %q", i+1, img.Layers()[i+1].Digest, ErrLayerNotFound, filepath.Join(imageDir, LayersDir), searchPaths)
 		}
 	}
 	return dirs, nil
