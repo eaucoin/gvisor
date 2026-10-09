@@ -239,6 +239,9 @@ type Manifest struct {
 	// Information about filesystems stored in the checkpoint, in order of
 	// increasing file offsets in the multi-tar file.
 	Tmpfs []Tmpfs `json:"tmpfs"`
+
+	// PagesSize is the size of the pages file in bytes.
+	PagesSize uint64 `json:"pages_size"`
 }
 
 // MemoryFile represents a pgalloc.MemoryFile stored in a filesystem
@@ -252,10 +255,6 @@ type MemoryFile struct {
 	// end respectively.
 	PagesMetadataStart uint64 `json:"pages_metadata_start"`
 	PagesMetadataEnd   uint64 `json:"pages_metadata_end"`
-
-	// PagesStart is the offset in the pages file at which the pages for this
-	// MemoryFile begin.
-	PagesStart uint64 `json:"pages_start"`
 }
 
 // Tmpfs represents a tmpfs filesystem stored in a filesystem checkpoint.
@@ -279,6 +278,7 @@ func FromProto(pb *fspb.Manifest) Manifest {
 		RunscVersion: pb.RunscVersion,
 		PageSize:     pb.PageSize,
 		Endian:       pb.Endian,
+		PagesSize:    pb.PagesSize,
 	}
 	if len(pb.MemoryFiles) > 0 {
 		m.MemoryFiles = make([]MemoryFile, len(pb.MemoryFiles))
@@ -287,7 +287,6 @@ func FromProto(pb *fspb.Manifest) Manifest {
 				ResourceID:         fromProtoResourceID(mf.ResourceId),
 				PagesMetadataStart: mf.PagesMetadataStart,
 				PagesMetadataEnd:   mf.PagesMetadataEnd,
-				PagesStart:         mf.PagesStart,
 			}
 		}
 	}
