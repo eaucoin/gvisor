@@ -281,6 +281,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 			if err == nil {
 				// The fault was handled appropriately.
 				// We can resume running the application.
+				t.throttleDirtying()
 				return (*runApp)(nil)
 			}
 
