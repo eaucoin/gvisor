@@ -184,6 +184,16 @@ func (s *DirtySet) next(page, limit uint64, in bool) uint64 {
 	return limit
 }
 
+// Union adds every page in o to s.
+func (s *DirtySet) Union(o *DirtySet) {
+	if len(o.words) > len(s.words) {
+		s.words = append(s.words, make([]uint64, len(o.words)-len(s.words))...)
+	}
+	for i, w := range o.words {
+		s.words[i] |= w
+	}
+}
+
 // add adds every page in fr to s.
 func (s *DirtySet) add(fr memmap.FileRange) {
 	for page := fr.Start / hostarch.PageSize; page*hostarch.PageSize < fr.End; page++ {
@@ -358,6 +368,27 @@ func (f *MemoryFile) SwapDirty(paused bool) *DirtySet {
 	return s
 }
 
+// DirtyBytes returns the number of bytes in the pages that the next call to
+// SwapDirty would return if it were called now.
+//
+// Preconditions: Dirty tracking must be enabled.
+func (f *MemoryFile) DirtyBytes() uint64 {
+	f.dirty.swapMu.Lock()
+	defer f.dirty.swapMu.Unlock()
+	written := f.dirty.written.load()
+	s := &DirtySet{words: make([]uint64, len(written)*dirtyChunkWords)}
+	for c, chunk := range written {
+		for i := range chunk {
+			s.words[c*dirtyChunkWords+i] = chunk[i].Load()
+		}
+	}
+	s.Union(&DirtySet{words: f.dirty.carried})
+	for _, fr := range f.dirty.always {
+		s.add(fr)
+	}
+	return s.Bytes()
+}
+
 // UnswapDirty returns the pages in s, which a call to SwapDirty returned, to
 // f's dirty set, so that the next swap reports them again. It is used when
 // the save that consumed s failed, so that no dirty page is lost.
@@ -416,28 +447,50 @@ func (h *pageHashes) set(off, hash uint64) {
 	h.chunks[c][(off%chunkSize)/hostarch.PageSize] = hash
 }
 
-// hashPagesLocked returns the hashes of every known-committed page of f;
-// other pages are zero.
+// hashPagesLocked returns the hashes of every allocated page of f that may
+// hold data: its known-committed pages and the data ranges of the backing
+// file in its other allocated ranges, so that holes are not read (and
+// committed); other pages are zero.
 //
 // Preconditions:
 //   - f.mu must be locked.
 //   - No page of f is being loaded asynchronously.
-//   - Every allocated page of f is either known-committed or zero.
-func (f *MemoryFile) hashPagesLocked() *pageHashes {
+func (f *MemoryFile) hashPagesLocked() (*pageHashes, error) {
 	h := &pageHashes{chunks: make([][]uint64, len(f.chunksLoad()))}
-	for seg := f.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		if !seg.ValuePtr().knownCommitted {
-			continue
-		}
-		off := seg.Start()
-		f.forEachMappingSlice(seg.Range(), func(bs []byte) {
+	hash := func(fr memmap.FileRange) {
+		off := fr.Start
+		f.forEachMappingSlice(fr, func(bs []byte) {
 			for i := 0; i < len(bs); i += hostarch.PageSize {
 				h.set(off, maphash.Bytes(pageHashSeed, bs[i:i+hostarch.PageSize]))
 				off += hostarch.PageSize
 			}
 		})
 	}
-	return h
+	seeker := f.newHostFileDataSeeker()
+	for seg := f.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		ma := seg.ValuePtr()
+		if ma.wasteOrReleasing {
+			continue
+		}
+		fr := seg.Range()
+		if ma.knownCommitted || seeker == nil {
+			hash(fr)
+			continue
+		}
+		for fr.Length() != 0 {
+			data, err := seeker.dataAtOrAfter(fr.Start)
+			if err != nil {
+				return nil, err
+			}
+			data = data.Intersect(fr)
+			if data.Length() == 0 {
+				break
+			}
+			hash(data)
+			fr.Start = data.End
+		}
+	}
+	return h, nil
 }
 
 // RecordPageHashes records a hash of every page of f, starting an epoch that
@@ -446,15 +499,16 @@ func (f *MemoryFile) hashPagesLocked() *pageHashes {
 // Preconditions:
 //   - Dirty tracking must be enabled.
 //   - No writer may run concurrently.
-//   - Every allocated page of f is either known-committed or zero, as after
-//     SaveTo or LoadFrom.
 func (f *MemoryFile) RecordPageHashes() error {
 	if err := f.AwaitLoadAll(); err != nil {
 		return err
 	}
 	f.mu.Lock()
-	h := f.hashPagesLocked()
+	h, err := f.hashPagesLocked()
 	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	f.dirty.swapMu.Lock()
 	defer f.dirty.swapMu.Unlock()
 	f.dirty.hashes = h
@@ -502,9 +556,7 @@ const maxDirtyEscapesReported = 64
 // Preconditions:
 //   - RecordPageHashes was called.
 //   - No writer may run concurrently.
-//   - Every allocated page of f is either known-committed or zero, as after
-//     SaveTo.
-func (f *MemoryFile) VerifyDirty(s *DirtySet) *DirtyVerification {
+func (f *MemoryFile) VerifyDirty(s *DirtySet) (*DirtyVerification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dirty.swapMu.Lock()
@@ -513,9 +565,13 @@ func (f *MemoryFile) VerifyDirty(s *DirtySet) *DirtyVerification {
 	if old == nil {
 		panic(fmt.Sprintf("MemoryFile(%p).VerifyDirty() called without a previous RecordPageHashes()", f))
 	}
+	hashes, err := f.hashPagesLocked()
+	if err != nil {
+		return nil, err
+	}
 	v := &DirtyVerification{
 		f:      f,
-		hashes: f.hashPagesLocked(),
+		hashes: hashes,
 	}
 	for seg := f.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		ma := seg.ValuePtr()
@@ -532,7 +588,7 @@ func (f *MemoryFile) VerifyDirty(s *DirtySet) *DirtyVerification {
 			}
 		}
 	}
-	return v
+	return v, nil
 }
 
 // Commit starts the next verification epoch from the page contents hashed by
