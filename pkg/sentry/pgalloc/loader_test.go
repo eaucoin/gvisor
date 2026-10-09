@@ -113,6 +113,19 @@ var (
 	}
 )
 
+// testContendedObjectStore models an object store sharing its CPUs between
+// requests, as SeaweedFS on 4 shared vCPUs did on the bench: reads of 1 MiB,
+// each at 128 MiB/s alone with 1 ms of latency, n of which transfer at
+// sqrt(n) times one read's bandwidth, each taking sqrt(n) times as long.
+var testContendedObjectStore = testPagesFileOpts{
+	maxReadBytes: 1 << 20,
+	maxParallel:  16,
+	channels:     16,
+	bandwidth:    128 << 20,
+	latency:      time.Millisecond,
+	contention:   0.5,
+}
+
 // transferTime returns how long opts's device takes to transfer n bytes.
 func (opts testPagesFileOpts) transferTime(n uint64) time.Duration {
 	return time.Duration(n * uint64(time.Second) / opts.bandwidth)
@@ -157,6 +170,16 @@ func TestAsyncLoadFaultWait(t *testing.T) {
 			size:    64 << 20,
 			at:      60 * time.Millisecond,
 			maxWait: testObjectStore.transferTime(hostarch.PageSize) + testObjectStore.latency,
+		},
+		{
+			// While probing raises the reads in flight, which slows each
+			// read but not the fault's much: it transfers at a quarter of
+			// its bandwidth alone with 16 reads in flight.
+			name:    "contended object store",
+			opts:    testContendedObjectStore,
+			size:    64 << 20,
+			at:      60 * time.Millisecond,
+			maxWait: testContendedObjectStore.transferTime(4*hostarch.PageSize) + testContendedObjectStore.latency,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -294,6 +317,39 @@ func TestAsyncLoadBackgroundThroughput(t *testing.T) {
 				t.Errorf("loading took %v, want at most 10%% more than %v", took, ideal)
 			}
 		})
+	}
+}
+
+// TestAsyncLoadProbesParallelPagesFile checks that loading from a pages file
+// whose reads slow down as more are in flight, but which delivers more with
+// more in flight, probes for the reads that it delivers the most with.
+func TestAsyncLoadProbesParallelPagesFile(t *testing.T) {
+	const size = 64 << 20
+	opts := testContendedObjectStore
+	fr, gens, img := loaderTestImage(t, size)
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+
+	var took time.Duration
+	for _, rd := range r.readsSnapshot() {
+		took = max(took, rd.completed)
+	}
+	// One read at a time, and every slot but one at once.
+	one := opts.transferTime(size) + opts.latency
+	parallel := float64(opts.maxParallel - 1)
+	all := time.Duration(float64(opts.transferTime(size))/math.Pow(parallel, 1-opts.contention)) + opts.latency
+	t.Logf("loading took %v: %v with one read at a time, %v with %v at once; %v", took, one, all, parallel, &l.apfl.bgBudget)
+	// Without probing, the budget settled at one read after the slow start,
+	// and loading took 492 ms.
+	if took > 2*all {
+		t.Errorf("loading took %v, want at most twice the %v that %v reads at once take", took, all, parallel)
 	}
 }
 
