@@ -472,7 +472,10 @@ func TestDirtyTrackingNegativeControls(t *testing.T) {
 				if err := mm.mf.SaveTo(ctx, io.Discard, &pgalloc.SaveOpts{}); err != nil {
 					t.Fatalf("SaveTo: %v", err)
 				}
-				v := mm.mf.VerifyDirty(mm.mf.SwapDirty(true /* paused */))
+				v, err := mm.mf.VerifyDirty(mm.mf.SwapDirty(true /* paused */))
+				if err != nil {
+					t.Fatalf("VerifyDirty: %v", err)
+				}
 				want := uint64(0)
 				if disabled {
 					want = 2
