@@ -187,7 +187,7 @@ func loadImage(t *testing.T, ctx context.Context, img *checkpointimage.Image, im
 		t.Fatalf("NewMemoryFile: %v", err)
 	}
 	t.Cleanup(mf.Destroy)
-	mfl := NewAsyncMFLoader(img, pagesFiles, mf, nil /* timeline */)
+	mfl := NewAsyncMFLoader(img, pagesFiles, mf, pgalloc.PrefetchAuto, nil /* timeline */)
 	mfl.KickoffPrivate(ctx, nil)
 	if err := mfl.Wait(); err != nil {
 		t.Fatalf("loading %v: %v", img.Digest, err)
