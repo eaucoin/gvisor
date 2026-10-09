@@ -109,6 +109,14 @@ const (
 // state file metadata, without parsing anything else.
 const FormatMetadataKey = "image_format"
 
+// ParentMetadataKey is the key of the entry of a checkpoint's state file
+// metadata that holds the digest (Digest.String) of the image that the
+// checkpoint was saved as a delta of, if it is incremental. It records how the
+// checkpoint was made: the images its memory needs are the layers its pages
+// metadata file lists, which rewriting the image (flattening, compacting,
+// rebasing) changes while the state file stays as it was saved.
+const ParentMetadataKey = "parent_id"
+
 // FormatVersion returns the version of the format that this package writes,
 // as "<major>.<minor>".
 func FormatVersion() string {
