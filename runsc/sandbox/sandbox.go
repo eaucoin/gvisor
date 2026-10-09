@@ -1771,6 +1771,12 @@ type CheckpointOpts struct {
 	// image in that directory, which must be the image the sandbox was last
 	// saved to or restored from.
 	ParentImagePath string
+
+	// Precopy, PrecopyBudget and PrecopyMaxRounds configure pre-copy; see
+	// control.SaveOpts.
+	Precopy          string
+	PrecopyBudget    time.Duration
+	PrecopyMaxRounds int
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1798,6 +1804,9 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			Timeout:     opts.SaveRestoreExecTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
+		Precopy:          opts.Precopy,
+		PrecopyBudget:    opts.PrecopyBudget,
+		PrecopyMaxRounds: opts.PrecopyMaxRounds,
 	}
 	if opts.ParentImagePath != "" {
 		d, err := checkpointimage.FileDigest(filepath.Join(opts.ParentImagePath, checkpointfiles.PagesMetadataFileName))
