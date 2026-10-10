@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -141,6 +142,29 @@ func (as *addressSpace) mapLocked(addr hostarch.Addr, m hostMapEntry, at hostarc
 	return inv
 }
 
+// untrackedMapper is implemented by memmap.Files whose MapInternal records
+// the pages that it maps writable as written, for dirty tracking
+// (pgalloc.MemoryFile).
+type untrackedMapper interface {
+	// MapInternalUntracked is MapInternal without that record.
+	MapInternalUntracked(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error)
+}
+
+// mapInternal returns the Sentry's mappings of fr of f, through which the
+// guest accesses it, without recording them as written. The application's
+// writes through them are tracked by dirty tracking's source: the memory
+// manager maps a write-protected pma writable only after the fault of a first
+// write, which it records. Recording every page mapped writable, as
+// MapInternal does, would report pages that the application did not write,
+// and carry them into the next dirty tracking epoch when the epoch ends while
+// tasks run (pre-copy).
+func mapInternal(f memmap.File, fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if u, ok := f.(untrackedMapper); ok {
+		return u.MapInternalUntracked(fr, at)
+	}
+	return f.MapInternal(fr, at)
+}
+
 // MapFile implements platform.AddressSpace.MapFile.
 func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	as.mu.Lock()
@@ -156,7 +180,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	// We don't execute from application file-mapped memory, and guest page
 	// tables don't care if we have execute permission (but they do need pages
 	// to be readable).
-	bs, err := f.MapInternal(fr, hostarch.AccessType{
+	bs, err := mapInternal(f, fr, hostarch.AccessType{
 		Read:  at.Read || at.Execute || precommit,
 		Write: at.Write,
 	})
