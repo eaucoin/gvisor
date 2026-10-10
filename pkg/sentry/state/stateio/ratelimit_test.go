@@ -100,3 +100,48 @@ func TestRateLimitedReaderWaitOr(t *testing.T) {
 		t.Errorf("read completed after %v, want at least %v", elapsed, want)
 	}
 }
+
+// TestRateLimitedWriter checks that writes issued together complete in the
+// order they were issued, each once the bytes of the writes before it and its
+// own have been stored at the writer's rate, and write their data.
+func TestRateLimitedWriter(t *testing.T) {
+	const (
+		writeBytes = 256 << 10
+		writes     = 4
+		rate       = 8 << 20 // 31.25 ms per write
+	)
+	data := make([]byte, writes*writeBytes)
+	_, _ = rand.Read(data)
+	var file bytes.Buffer
+	w := NewRateLimitedWriter(NewIOWriter(&file, writeBytes, 1 /* maxRanges */, writes /* maxParallel */), rate)
+	defer w.Close()
+
+	start := time.Now()
+	for i := range writes {
+		w.AddWrite(i, nil, memmap.FileRange{}, data[i*writeBytes:(i+1)*writeBytes])
+	}
+	var cs []Completion
+	for i := range writes {
+		var err error
+		cs, err = w.Wait(cs[:0], 1 /* minCompletions */)
+		if err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		elapsed := time.Since(start)
+		if len(cs) != 1 {
+			t.Fatalf("Wait returned %d completions, want 1", len(cs))
+		}
+		if c := cs[0]; c.ID != i || c.N != writeBytes || c.Err != nil {
+			t.Errorf("completion %d is %+v, want write %d of %d bytes", i, c, i, writeBytes)
+		}
+		if want := time.Duration((i + 1) * writeBytes * int(time.Second) / rate); elapsed < want {
+			t.Errorf("write %d completed after %v, want at least %v", i, elapsed, want)
+		}
+	}
+	if err := w.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if !bytes.Equal(file.Bytes(), data) {
+		t.Errorf("written data differs from the data written")
+	}
+}
