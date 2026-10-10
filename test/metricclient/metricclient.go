@@ -299,7 +299,13 @@ func (c *MetricClient) GetMetrics(ctx context.Context, urlParams map[string]stri
 	return MetricData(buf.String()), nil
 }
 
-// GetPrometheusInteger returns the integer value of a Prometheus metric with given name and labels.
+// ErrNoData is returned when no data point of a metric has the requested
+// labels, or the metric has none. The metric server does not export counters
+// that are 0.
+var ErrNoData = errors.New("no data")
+
+// GetPrometheusInteger returns the integer value of a Prometheus metric with given name and labels:
+// the value of a counter or gauge, or the number of samples of a histogram.
 func (m MetricData) GetPrometheusInteger(metricName string, wantLabels map[string]string) (int64, time.Time, error) {
 	// Parse raw Prometheus-formatted data.
 	var buf bytes.Buffer
@@ -311,7 +317,7 @@ func (m MetricData) GetPrometheusInteger(metricName string, wantLabels map[strin
 	// See if there is any data for the given metric name.
 	metricData, found := parsed[metricName]
 	if !found {
-		return 0, time.Time{}, fmt.Errorf("metric %q not found", metricName)
+		return 0, time.Time{}, fmt.Errorf("metric %q: %w", metricName, ErrNoData)
 	}
 	// See if we can find exactly one data point for which the labels match `wantLabels`.
 	// foundIndex is the index within `metricData.Metric` of the most-recently-found data point
@@ -346,16 +352,19 @@ func (m MetricData) GetPrometheusInteger(metricName string, wantLabels map[strin
 		foundIndex = i
 	}
 	if foundIndex == -1 {
-		return 0, time.Time{}, fmt.Errorf("no metric data matching requested labels %v", wantLabels)
+		return 0, time.Time{}, fmt.Errorf("metric %q, labels %v: %w", metricName, wantLabels, ErrNoData)
 	}
 	// We've found exactly one data point.
 	data := metricData.GetMetric()[foundIndex]
 	// Convert the value of this data point to an int regardless of its underlying Prometheus type.
+	// The value of a histogram is its number of samples.
 	var floatValue float64
 	if data.GetCounter() != nil && data.GetCounter().Value != nil {
 		floatValue = data.GetCounter().GetValue()
 	} else if data.GetGauge() != nil && data.GetGauge().Value != nil {
 		floatValue = data.GetGauge().GetValue()
+	} else if data.GetHistogram() != nil && data.GetHistogram().SampleCount != nil {
+		floatValue = float64(data.GetHistogram().GetSampleCount())
 	} else {
 		return 0, time.Time{}, fmt.Errorf("metric is not numerical: %v", data)
 	}
