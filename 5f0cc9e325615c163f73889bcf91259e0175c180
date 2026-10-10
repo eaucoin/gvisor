@@ -1,0 +1,17 @@
+base release-20260921.0
+series/fork-infra 5e0e42f9e3a37bf0bd0f53119ddc4d1c151b9209 14
+series/00-base-fixes 0e08a84b5f092866474ec477b87ae58418928f2d 1
+series/10-pgalloc-save-restore-tests 19122d496f7137c5e167ff73ff00edf53b18daf5 2
+series/17-image-format-v2 148061805e3bf03024fc3ca9a1571bbfe13570b5 6
+series/18-image-tooling a371f42222706c3b6d07549ac58b3af0328a8074 3
+series/11-fault-first-restore c35b3df857f2690642e83a5f342c4e8ea3907873 7
+series/14-dirty-tracking-framework 257fb3c4bf85252d2e5127eded1e193497b3e2ed 3
+series/15-dirty-source-write-protection d9d5f9f75ca3e6b2c38e6b2f47b25ceb4bfa9093 2
+series/19-incremental-save df4258b23c890d978ff9ab93ff80eda4ed0ae386 3
+series/20-precopy 06fd0be79ec8aa3a29c43a655c48c172c2560ac6 3
+series/16-dirty-source-uffd-wp cfe89c6fed6fdf689d6bd45a0735ae34a8f985f7 4
+series/13-pod-restore eb9e4644a4f40527ce4d4381d51d3e1d93f7ba39 14
+series/12-s3-checkpoint-gofer 7078112529b5fbf141b6c8ff9369389681084afb 4
+series/21-working-set a1fea40ae1a692aed6b7107ab87f1ea16bd8b997 2
+series/22-shim-incremental-checkpoints 178f58b22f59a4a008e6d140abd712246064c29e 1
+series/03-release-versions 9e6d454813e31656a7f5949399b121f2e784b772 1
