@@ -16,6 +16,7 @@ package prometheus
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1954,4 +1955,107 @@ func TestNumberPackerCapacity(t *testing.T) {
 			packer.pack(&Number{Int: int64(maxDirectUint)})
 		})
 	})
+}
+
+// TestNumberJSON checks that Numbers, infinities and NaN included, and
+// snapshots of histograms, whose last bucket is bounded by +Inf, survive JSON
+// encoding, in which the Sentry exports metrics.
+func TestNumberJSON(t *testing.T) {
+	for _, n := range []Number{
+		{},
+		{Int: 42},
+		{Int: -7},
+		{Float: 1.5},
+		{Float: math.Inf(1)},
+		{Float: math.Inf(-1)},
+		{Float: math.NaN()},
+	} {
+		b, err := json.Marshal(n)
+		if err != nil {
+			t.Errorf("json.Marshal(%v): %v", n, err)
+			continue
+		}
+		var got Number
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Errorf("json.Unmarshal(%s): %v", b, err)
+			continue
+		}
+		if got.Int != n.Int || (got.Float != n.Float && !(math.IsNaN(got.Float) && math.IsNaN(n.Float))) {
+			t.Errorf("%v encoded as %s decodes as %v", n, b, got)
+		}
+	}
+
+	when := time.Unix(1, 0).UTC()
+	snapshot := &Snapshot{
+		When: when,
+		Data: []*Data{{
+			Metric: &Metric{Name: "histogram", Type: TypeHistogram},
+			HistogramValue: &Histogram{
+				Total: Number{Int: 5},
+				Min:   Number{Int: 2},
+				Max:   Number{Int: 3},
+				Buckets: []Bucket{
+					{UpperBound: Number{Int: 0}},
+					{UpperBound: Number{Int: 4}, Samples: 2},
+					{UpperBound: Number{Float: math.Inf(1)}},
+				},
+			},
+		}},
+	}
+	b, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal of a histogram snapshot: %v", err)
+	}
+	var got Snapshot
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("json.Unmarshal(%s): %v", b, err)
+	}
+	if diff := cmp.Diff(snapshot, &got); diff != "" {
+		t.Errorf("histogram snapshot changed through JSON (-want +got):\n%s", diff)
+	}
+}
+
+// TestVerifyHistogramIntegralDeviations checks that the verifier accepts
+// successive snapshots of a histogram whose sum of squared deviations, a
+// floating-point number, has an integral value, as it has for samples that
+// are multiples of a page.
+func TestVerifyHistogramIntegralDeviations(t *testing.T) {
+	v, cleanup, err := NewVerifier(&pb.MetricRegistration{
+		Metrics: []*pb.MetricMetadata{{
+			Name:                          "/histogram",
+			PrometheusName:                "histogram",
+			Description:                   "A histogram.",
+			Type:                          pb.MetricMetadata_TYPE_DISTRIBUTION,
+			DistributionBucketLowerBounds: []int64{0, 8192},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	defer cleanup()
+	// Samples 4096 and 12288, then a third, 8192.
+	for i, h := range []Histogram{
+		{Total: Number{Int: 16384}, Min: Number{Int: 4096}, Max: Number{Int: 12288}, SumOfSquaredDeviations: Number{Float: 33554432}},
+		{Total: Number{Int: 24576}, Min: Number{Int: 4096}, Max: Number{Int: 12288}, SumOfSquaredDeviations: Number{Float: 33554432}},
+	} {
+		samples := []uint64{1, 1, 0}
+		if i == 1 {
+			samples[2] = 1
+		}
+		h.Buckets = []Bucket{
+			{UpperBound: Number{Int: 0}},
+			{UpperBound: Number{Int: 8192}, Samples: samples[0]},
+			{UpperBound: Number{Float: math.Inf(1)}, Samples: samples[1] + samples[2]},
+		}
+		snapshot := &Snapshot{
+			When: time.Now(),
+			Data: []*Data{{
+				Metric:         &Metric{Name: "histogram", Type: TypeHistogram, Help: "A histogram."},
+				HistogramValue: &h,
+			}},
+		}
+		if err := v.Verify(snapshot); err != nil {
+			t.Fatalf("snapshot %d: %v", i, err)
+		}
+	}
 }
