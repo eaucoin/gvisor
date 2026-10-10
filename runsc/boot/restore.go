@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -734,6 +735,9 @@ func (l *Loader) save(o *control.SaveOpts) error {
 		return err
 	}
 	defer saveOpts.Close()
+	if rate := l.root.conf.TestOnlyCheckpointWriteRate; rate != 0 && saveOpts.PagesFile != nil {
+		saveOpts.PagesFile = stateio.NewRateLimitedWriter(saveOpts.PagesFile, rate)
+	}
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
