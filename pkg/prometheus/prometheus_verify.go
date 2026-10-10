@@ -348,14 +348,14 @@ func (p *numberPacker) mustUnpackInt(n packedNumber) int64 {
 	return num.Int
 }
 
-// mustUnpackFloat unpacks a floating-point number.
+// mustUnpackFloat unpacks a floating-point number, whose value may be integral.
 // It panics if the packedNumber is not an floating-point number.
 func (p *numberPacker) mustUnpackFloat(n packedNumber) float64 {
 	num := p.unpack(n)
 	if *num == zero {
 		return 0.0
 	}
-	if num.IsInteger() {
+	if uint32(n)&typeField != typeFieldFloat {
 		panic("not a float")
 	}
 	return num.Float
