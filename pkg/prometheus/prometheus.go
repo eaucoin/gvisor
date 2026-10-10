@@ -21,12 +21,14 @@ package prometheus
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -137,6 +139,50 @@ type Number struct {
 	// Int is the integer value of this number.
 	// Mutually exclusive with Float.
 	Int int64 `json:"int,omitempty"`
+}
+
+// finiteNumber is a Number with the default JSON encoding.
+type finiteNumber Number
+
+// MarshalJSON implements json.Marshaler.MarshalJSON. JSON has no infinities
+// nor NaN, which a Number may be (the upper bound of the last bucket of every
+// histogram is +Inf), so the Float of such a Number is encoded as the string
+// that strconv.ParseFloat reads back: "+Inf", "-Inf" or "NaN".
+func (n Number) MarshalJSON() ([]byte, error) {
+	if math.IsInf(n.Float, 0) || math.IsNaN(n.Float) {
+		return json.Marshal(struct {
+			Float string `json:"float"`
+		}{strconv.FormatFloat(n.Float, 'g', -1, 64)})
+	}
+	return json.Marshal(finiteNumber(n))
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON.
+func (n *Number) UnmarshalJSON(b []byte) error {
+	var v struct {
+		Float json.RawMessage `json:"float"`
+		Int   int64           `json:"int"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	*n = Number{Int: v.Int}
+	if len(v.Float) == 0 {
+		return nil
+	}
+	if v.Float[0] != '"' {
+		return json.Unmarshal(v.Float, &n.Float)
+	}
+	var s string
+	if err := json.Unmarshal(v.Float, &s); err != nil {
+		return err
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("invalid number %q: %w", s, err)
+	}
+	n.Float = f
+	return nil
 }
 
 // Common numbers which are reused and don't need their own memory allocations.
