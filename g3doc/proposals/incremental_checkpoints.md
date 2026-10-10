@@ -415,7 +415,20 @@ Measured on systrap, with Sentry write-protection at its 64 KiB unit:
     experiment 06's model, saves completing pre-copies (full, delta, private
     MemoryFiles, a delta's MemoryFile left uncopied), a pre-copy failing in
     round 0 or 1 that loses no dirty page, and `--precopy=auto`, with a store
-    slowed by `stateio.RateLimitedWriter`.
+    slowed by `stateio.RateLimitedWriter`. In `runsc/container`, experiment
+    06's A-B writer (`test/cmd/precopy/abwriter`: each page carries its
+    index and a generation, which a table records) is pre-copied while it
+    rewrites random pages at 1, 4 and 64 MiB/s, against a store that
+    `--TESTONLY-checkpoint-write-rate` slows to 16 MiB/s, then restored, and
+    every page must match the table: the 64 MiB/s writer must stop the
+    rounds by the halving rule after the first, and the metrics describe
+    the rounds. With memory churning during verified rounds (allocations,
+    frees, `MADV_DONTNEED`, `fork`), verification must find no escape, and
+    must find them with the source's marking paths disabled. A buffer on the
+    root filesystem's disk-backed overlay is written by the rounds rather
+    than in the pause, and restores from a pre-copied delta; and
+    `--precopy=auto` skips the rounds after measuring a fast store, not a
+    slow one.
 
 ## Prior art
 
@@ -427,6 +440,7 @@ Measured on systrap, with Sentry write-protection at its 64 KiB unit:
 -   containerd's `parent_checkpoint`, which the shim maps.
 -   QEMU's pre-copy migration: its stop rule (pending bytes at the measured
     bandwidth within the downtime budget) and round cap; Cloud Hypervisor's
-    same rule and its timeout that completes rather than aborts.
+    same rule and its timeout that completes rather than aborts; QEMU's
+    "A-B" migration test guest, which `abwriter` follows.
 -   CRIU's pre-dump iterations, each a delta of the previous, which pre-copy
     folds into one image.
