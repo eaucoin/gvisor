@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/capability.h>
+#include <linux/futex.h>
 #include <linux/limits.h>
 #include <linux/prctl.h>
 #include <sched.h>
@@ -22,6 +23,7 @@
 #include <stdio.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -247,6 +249,10 @@ TEST(SetnsTest, ChangeUserNamespaceRejectsMultithreadedCaller) {
                   char stack[1024] __attribute__((aligned(16)));
                   char stack_ptr[0];
                 } ca;
+                // The thread runs on ca and reads args, both in this frame,
+                // until it exits: the kernel stores its TID in thread_tid
+                // and clears it, waking its futex, once the thread is gone.
+                pid_t thread_tid = 0;
                 pid_t tid = clone(
                     +[](void* arg) {
                       ThreadArgs* args = static_cast<ThreadArgs*>(arg);
@@ -262,8 +268,10 @@ TEST(SetnsTest, ChangeUserNamespaceRejectsMultithreadedCaller) {
                       TEST_PCHECK(close(args->done_write_fd) == 0);
                       return 0;
                     },
-                    ca.stack_ptr, CLONE_SIGHAND | CLONE_THREAD | CLONE_VM,
-                    &args);
+                    ca.stack_ptr,
+                    CLONE_SIGHAND | CLONE_THREAD | CLONE_VM |
+                        CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID,
+                    &args, &thread_tid, nullptr, &thread_tid);
                 TEST_PCHECK(tid >= 0);
                 TEST_PCHECK(close(ready_fds[1]) == 0);
                 TEST_PCHECK(close(stop_fds[0]) == 0);
@@ -277,6 +285,14 @@ TEST(SetnsTest, ChangeUserNamespaceRejectsMultithreadedCaller) {
                 TEST_PCHECK(close(stop_fds[1]) == 0);
                 TEST_PCHECK(read(done_fds[0], &buf, 1) == 1);
                 TEST_PCHECK(close(done_fds[0]) == 0);
+                // Returning reuses ca and args: wait for the thread to exit
+                // first, or it may return through a clobbered stack.
+                for (pid_t t; (t = __atomic_load_n(&thread_tid,
+                                                   __ATOMIC_ACQUIRE)) != 0;) {
+                  TEST_PCHECK(syscall(SYS_futex, &thread_tid, FUTEX_WAIT, t,
+                                      nullptr, nullptr, 0) == 0 ||
+                              errno == EAGAIN || errno == EINTR);
+                }
               }),
               IsPosixErrorOkAndHolds(0));
 }
