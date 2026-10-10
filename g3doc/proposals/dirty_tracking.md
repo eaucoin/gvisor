@@ -242,10 +242,11 @@ Nothing is platform-specific: a first write is a guest page fault, the same
 `mmap(2)` and no host re-fault, so it should cost less than on systrap. kvm's
 `MapUnit` is 16 MiB, but an isolated unit's pma bounds what a fault maps.
 Arming invalidates the guest TLBs once per unmapped range, so coalescing
-unmaps matters there too. kvm's `AddressSpace.MapFile` obtains host addresses
-with `MapInternal`, so mapping a disarmed unit writable marks it again
-(harmless) and, when the epoch ends while tasks run (pre-copy), carries it
-into the next epoch.
+unmaps matters there too. kvm's `AddressSpace.MapFile` obtains the host
+addresses it maps into the guest with `MapInternalUntracked`: with
+`MapInternal`, mapping a disarmed unit writable would mark it again and, when
+the epoch ends while tasks run (pre-copy), carry it into the next epoch, so
+that every round of a pre-copy would find more to write than was written.
 
 ### Configuration
 
