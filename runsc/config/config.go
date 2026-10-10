@@ -465,6 +465,11 @@ type Config struct {
 	// for tests that cannot throttle a device.
 	TestOnlyRestoreReadRate uint64 `flag:"TESTONLY-restore-read-rate"`
 
+	// TestOnlyCheckpointWriteRate, if not 0, limits the rate at which a
+	// checkpoint writes its pages file, in bytes per second, as a throttled
+	// disk or a remote store does, for tests that cannot throttle a device.
+	TestOnlyCheckpointWriteRate uint64 `flag:"TESTONLY-checkpoint-write-rate"`
+
 	// RestoreSpecValidation indicates the level of spec validation to be
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
