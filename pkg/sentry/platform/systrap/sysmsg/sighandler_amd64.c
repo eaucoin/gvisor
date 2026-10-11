@@ -250,6 +250,7 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
   long fs_base = 0;
   long gs_base = (uint64_t)sysmsg;
+  bool resuming = false;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
     // Find a new context and exit to restore it.
@@ -294,8 +295,9 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
   // syshandler sets THREAD_STATE_NONE right before it starts resuming a
   // context. It means the context contains the actual state, and the state of
   // the stub thread is incomplete.
-  if (signo != SIGCHLD ||
-      ucontext->uc_mcontext.gregs[REG_RIP] < __export_stub_start) {
+  resuming = signo == SIGCHLD &&
+             ucontext->uc_mcontext.gregs[REG_RIP] >= __export_stub_start;
+  if (!resuming) {
     ctx->ptregs.fs_base = fs_base;
     // If ctx->gs_used_by_app is non-zero, then we are in a context where the GS
     // register is used by the application. Thus, set the GS base to the
@@ -397,7 +399,12 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
       return;
   }
 
-  atomic_store(&ctx->fpstate_changed, 0);
+  // Unless the stub was resuming ctx, ctx->fpstate has just been copied from
+  // the signal frame, from which sigreturn restores the FPU state. If it was
+  // resuming ctx, it may not have restored ctx->fpstate yet, and the signal
+  // frame may hold the FPU state of the context it ran before: ctx->fpstate
+  // has to be restored when ctx is resumed, by this thread too.
+  atomic_store(&ctx->fpstate_changed, resuming ? 1 : 0);
 
 init:
   ctx = switch_context_amd64(sysmsg, ctx, ctx_state);
