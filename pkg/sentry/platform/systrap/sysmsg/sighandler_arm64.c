@@ -184,6 +184,16 @@ init:
   for (;;) {
     ctx = switch_context(sysmsg, ctx, ctx_state);
 
+    // This thread holds the FPU state old_ctx had when it last switched to the
+    // Sentry here. ctx resumes with that state only if it is old_ctx and has
+    // not run on another thread since; otherwise ctx->fpstate is restored.
+    // Decide this before ctx may be handed back to the Sentry below, which
+    // makes this thread the last one ctx switched from although ctx did not
+    // run here.
+    if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
+      ctx->fpstate_changed = 1;
+    }
+
     if (atomic_load(&ctx->interrupt) != 0) {
       // This context got interrupted while it was waiting in the queue.
       // Setup all the necessary bits to let the sentry know this context has
@@ -197,9 +207,6 @@ init:
     }
   }
 
-  if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
-    ctx->fpstate_changed = 1;
-  }
   restore_state(sysmsg, ctx, _ucontext);
 }
 
