@@ -172,6 +172,16 @@ struct thread_context* switch_context_amd64(
   for (;;) {
     ctx = switch_context(sysmsg, ctx, new_context_state);
 
+    // This thread holds the FPU state old_ctx had when it last switched to the
+    // Sentry here. ctx resumes with that state only if it is old_ctx and has
+    // not run on another thread since; otherwise ctx->fpstate is restored.
+    // Decide this before ctx may be handed back to the Sentry below, which
+    // makes this thread the last one ctx switched from although ctx did not
+    // run here.
+    if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
+      ctx->fpstate_changed = 1;
+    }
+
     // After setting THREAD_STATE_NONE, syshandled can be interrupted by
     // SIGCHLD. In this case, we consider that the current context contains
     // the actual state and sighandler can take control on it.
@@ -189,9 +199,6 @@ struct thread_context* switch_context_amd64(
     } else {
       break;
     }
-  }
-  if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
-    ctx->fpstate_changed = 1;
   }
   return ctx;
 }
