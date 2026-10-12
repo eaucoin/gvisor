@@ -113,7 +113,7 @@ func TestSignalUnkillablePolicyRestore(t *testing.T) {
 				}
 				defer cont2.Destroy()
 
-				if err := cont2.Restore(&testConf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				if err := cont2.Restore(&testConf, dir, sandbox.RestoreOpts{}); err != nil {
 					t.Fatalf("error restoring container: %v", err)
 				}
 
@@ -202,7 +202,7 @@ func TestSignalUnkillablePolicyRestore(t *testing.T) {
 				}
 				defer cont2.Destroy()
 
-				if err := cont2.Restore(&testConf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				if err := cont2.Restore(&testConf, dir, sandbox.RestoreOpts{}); err != nil {
 					t.Fatalf("error restoring container: %v", err)
 				}
 
@@ -322,7 +322,7 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -373,7 +373,7 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 	}
 	defer cont3.Destroy()
 
-	if err := cont3.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont3.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -590,7 +590,7 @@ func testCheckpointRestoreLayers(t *testing.T, conf *config.Config) {
 			t.Fatalf("error creating container: %v", err)
 		}
 		t.Cleanup(func() { cont.Destroy() })
-		if err := cont.Restore(conf, imageDir, layerPaths, sandbox.DirectIOOff, background, nil /* networkArgs */); err != nil {
+		if err := cont.Restore(conf, imageDir, sandbox.RestoreOpts{LayerPaths: layerPaths, Background: background}); err != nil {
 			cont.Destroy()
 			return nil, err
 		}
@@ -852,7 +852,7 @@ func TestCheckpointRestoreClocks(t *testing.T) {
 				t.Fatalf("error creating container: %v", err)
 			}
 			defer cont2.Destroy()
-			if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 			if err := waitForFileExist(afterPath); err != nil {
@@ -1048,7 +1048,7 @@ func TestCheckpointRestoreBackground(t *testing.T) {
 				t.Fatalf("error creating container: %v", err)
 			}
 			defer cont2.Destroy()
-			if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, true /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{Background: true}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 			if err := waitForFileNotEmpty(outputFile2); err != nil {
@@ -1177,7 +1177,7 @@ done`, 64<<20, sumPath, checkPath, answersPath)
 			}
 			defer cont2.Destroy()
 			start := time.Now()
-			if err := cont2.Restore(conf, imagePath, nil /* layerPaths */, sandbox.DirectIOOff, true /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, imagePath, sandbox.RestoreOpts{Background: true}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 			if err := waitForFileNotEmpty(answers); err != nil {
@@ -1301,7 +1301,7 @@ done`, 32<<20, sumPath, checkPath)
 					t.Fatalf("error creating container: %v", err)
 				}
 				t.Cleanup(func() { cont.Destroy() })
-				if err := cont.Restore(conf, imageDir, layerPaths, sandbox.DirectIOOff, true /* background */, nil /* networkArgs */); err != nil {
+				if err := cont.Restore(conf, imageDir, sandbox.RestoreOpts{LayerPaths: layerPaths, Background: true}); err != nil {
 					t.Fatalf("error restoring container: %v", err)
 				}
 				if got := sum(true, loadTime+time.Minute); got != want {
@@ -1481,7 +1481,7 @@ func testCheckpointRestorePrecopy(t *testing.T, conf *config.Config, incremental
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(&restoreConf, imageDir, layerPaths, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(&restoreConf, imageDir, sandbox.RestoreOpts{LayerPaths: layerPaths}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 	if err := waitForFileNotEmpty(outputFile2); err != nil {
@@ -1587,7 +1587,7 @@ func TestCheckpointRestoreHostname(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false, nil); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring: %v", err)
 			}
 
@@ -1716,7 +1716,7 @@ func testCheckpointRestoreHostinet(t *testing.T, conf *config.Config, app string
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 	if !cont2.Sandbox.Restored {
@@ -1878,7 +1878,7 @@ func TestCheckpointHostinetRestoreNetworkMismatch(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	err = cont2.Restore(&restoreConf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
+	err = cont2.Restore(&restoreConf, dir, sandbox.RestoreOpts{})
 	if err == nil {
 		t.Fatalf("restore with mismatched network type succeeded, want error")
 	}
@@ -1986,7 +1986,7 @@ func TestCheckpointRestoreExecKilled(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -2071,7 +2071,7 @@ func TestCheckpointRestoreCreateMountPoint(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -2149,7 +2149,7 @@ func TestCheckpointRestoreInodeNumbers(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -2312,7 +2312,7 @@ func TestUsageDiskBackedOverlay(t *testing.T) {
 	cont2 := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 		args.CheckpointDirPath = dir
 	})
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 	waitForGuestFiles(t, conf, cont2, file)
@@ -2438,7 +2438,7 @@ func TestSplitFSCheckpointRestore(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -2747,7 +2747,7 @@ func TestPartialSplitFSCheckpointRestore(t *testing.T) {
 			cont2 := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 				args.CheckpointDirPath = checkpointDir
 			})
-			if err := cont2.Restore(conf, checkpointDir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, checkpointDir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -2847,7 +2847,7 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 					args.FSRestoreImagePaths = []string{onlyFSDir}
 				})
-				if err := contRestore.Restore(conf, sentryOnlyDir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.RestoreOpts{}); err != nil {
 					t.Fatalf("error restoring container with isolated fs checkpoint: %v", err)
 				}
 
@@ -2860,7 +2860,7 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 					args.FSRestoreImagePaths = []string{filepath.Join(onlyFSDir, tc.wantPrefix)}
 				})
-				if err := contRestore.Restore(conf, sentryOnlyDir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.RestoreOpts{}); err != nil {
 					t.Fatalf("error restoring container with explicit <dir>/<prefix> fs checkpoint: %v", err)
 				}
 
@@ -2938,7 +2938,7 @@ func TestCheckpointRestoreTUN(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, checkpointDir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, checkpointDir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -2980,7 +2980,7 @@ func TestCheckpointRestoreTUN(t *testing.T) {
 			}
 			defer cont3.Destroy()
 
-			if err := cont3.Restore(conf, checkpointDir2, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := cont3.Restore(conf, checkpointDir2, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container a second time: %v", err)
 			}
 
@@ -3163,7 +3163,7 @@ func (e *splitFSTestEnv) restore(t *testing.T, imagePath string, mutateArgs func
 	restoreOne := func(spec *specs.Spec, mutateArgs func(*Args)) *Container {
 		t.Helper()
 		c := newContainer(t, e.conf, spec, newBundleDir(t, spec), mutateArgs)
-		if err := c.Restore(e.conf, imagePath, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+		if err := c.Restore(e.conf, imagePath, sandbox.RestoreOpts{}); err != nil {
 			t.Fatalf("error restoring container: %v", err)
 		}
 		return c
@@ -3415,7 +3415,7 @@ func runAdjustedTSCTest(t *testing.T, conf *config.Config, count int, offsetCycl
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir1, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir1, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring second container: %v", err)
 	}
 
@@ -3458,7 +3458,7 @@ func runAdjustedTSCTest(t *testing.T, conf *config.Config, count int, offsetCycl
 	}
 	defer cont3.Destroy()
 
-	if err := cont3.Restore(conf, dir2, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont3.Restore(conf, dir2, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring third container: %v", err)
 	}
 
@@ -3722,7 +3722,7 @@ func runActiveWorkloadChain(t *testing.T, conf *config.Config, overlay string, i
 		}
 		curCont = nextCont
 
-		if err := curCont.Restore(&restoreConf, ckptDir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+		if err := curCont.Restore(&restoreConf, ckptDir, sandbox.RestoreOpts{}); err != nil {
 			t.Fatalf("hop %d Restore (saveEngine=%s, restoreEngine=%s): %v\nworkload log:\n%s", hopIdx, hop.saveEngine, hop.restoreEngine, err, readWorkloadLog())
 		}
 
@@ -4013,7 +4013,7 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 					t.Fatalf("error creating container: %v", err)
 				}
 				defer cont2.Destroy()
-				err = cont2.Restore(conf, imagePath, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
+				err = cont2.Restore(conf, imagePath, sandbox.RestoreOpts{})
 				switch {
 				case tc.wantErr == "" && err != nil:
 					t.Fatalf("restore after changing %q failed: %v", changed, err)
@@ -4114,7 +4114,7 @@ func TestCheckpointRestoreLeaveRunningClone(t *testing.T) {
 			if clone.ID == original.ID {
 				t.Fatalf("clone has the original's container ID %q", clone.ID)
 			}
-			if err := clone.Restore(conf, imagePath, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := clone.Restore(conf, imagePath, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 			restored := len(counters()["original"])
@@ -4141,6 +4141,143 @@ func TestCheckpointRestoreLeaveRunningClone(t *testing.T) {
 			// the original had appended before it.
 			if first, last := counters()["clone"][0], before[len(before)-1]; first <= last {
 				t.Errorf("clone's first counter is %d, want more than the original's last before the checkpoint, %d", first, last)
+			}
+		})
+	}
+}
+
+// TestCheckpointRestorePaused checks that a container restored paused is
+// Paused and runs nothing until it is resumed, and that the save/restore exec
+// hook runs at its resume, in its restore mode.
+func TestCheckpointRestorePaused(t *testing.T) {
+	// Skip overlay because test requires writing to host file.
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+
+			// The hook logs the mode it runs in.
+			hookLogPath := filepath.Join(dir, "hook-log")
+			hookLog, err := createWriteableOutputFile(hookLogPath)
+			if err != nil {
+				t.Fatalf("error creating hook log: %v", err)
+			}
+			hookLog.Close()
+			hookPath := filepath.Join(dir, "hook.sh")
+			if err := os.WriteFile(hookPath, []byte(fmt.Sprintf("echo $GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE >> %q\n", hookLogPath)), 0755); err != nil {
+				t.Fatalf("error writing hook: %v", err)
+			}
+			checkHookLog := func(want string) {
+				t.Helper()
+				got, err := os.ReadFile(hookLogPath)
+				if err != nil {
+					t.Fatalf("error reading hook log: %v", err)
+				}
+				if string(got) != want {
+					t.Errorf("hook log: got %q, want %q", got, want)
+				}
+			}
+
+			script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 0.1; i=$((i+1)); done", outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{
+				SaveRestoreExecArgv:        "/bin/bash " + hookPath,
+				SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+				SaveRestoreExecContainerID: cont.ID,
+			}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			checkHookLog("save\n")
+			lastNum, err := readOutputNum(outputPath, -1)
+			if err != nil {
+				t.Fatalf("error with outputFile: %v", err)
+			}
+			cont.Destroy()
+
+			// Delete and recreate file before restoring.
+			if err := os.Remove(outputPath); err != nil {
+				t.Fatalf("error removing file")
+			}
+			outputFile2, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile2.Close()
+
+			cont2, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{Paused: true}); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			if got, want := cont2.State().Status, Paused; got != want {
+				t.Fatalf("restored container status: got %v, want %v", got, want)
+			}
+
+			// The application writes a number every 100ms when it runs.
+			time.Sleep(time.Second)
+			if fi, err := outputFile2.Stat(); err != nil {
+				t.Fatalf("error with outputFile: %v", err)
+			} else if fi.Size() != 0 {
+				t.Fatalf("container restored paused ran: it wrote %d bytes", fi.Size())
+			}
+			checkHookLog("save\n")
+
+			if err := cont2.Resume(); err != nil {
+				t.Fatalf("error resuming container: %v", err)
+			}
+			if got, want := cont2.State().Status, Running; got != want {
+				t.Errorf("resumed container status: got %v, want %v", got, want)
+			}
+			// Resume returns once the hook has run.
+			checkHookLog("save\nrestore\n")
+			firstNum, err := readOutputNum(outputPath, 0)
+			if err != nil {
+				t.Fatalf("error with outputFile: %v", err)
+			}
+			if lastNum+1 != firstNum {
+				t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
 			}
 		})
 	}

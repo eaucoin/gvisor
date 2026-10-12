@@ -270,6 +270,7 @@ type RestoreOpts struct {
 	Detach     bool
 	Direct     bool
 	Background bool
+	Paused     bool
 }
 
 func (o *RestoreOpts) args() []string {
@@ -288,6 +289,9 @@ func (o *RestoreOpts) args() []string {
 	}
 	if o.Background {
 		out = append(out, "--background")
+	}
+	if o.Paused {
+		out = append(out, "--paused")
 	}
 	return out
 }
