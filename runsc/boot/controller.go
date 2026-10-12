@@ -294,6 +294,15 @@ type containerManager struct {
 	// restorer is set when the sandbox in being restored. It stores the state
 	// of all containers and perform all actions required by restore.
 	restorer *restorer
+
+	// pauseMu serializes pausing and resuming the kernel.
+	pauseMu sync.Mutex
+
+	// postRestorePending is true if the kernel was restored paused and has
+	// not been resumed since: its first resume does the post-restore work.
+	//
+	// +checklocks:pauseMu
+	postRestorePending bool
 }
 
 // StartRoot will start the root container process.
@@ -572,6 +581,10 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// Paused leaves the restored kernel paused, as containerManager.Pause
+	// does, until containerManager.Resume.
+	Paused bool `json:"paused"`
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
@@ -643,6 +656,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	cm.restorer = &restorer{
 		cm:         cm,
 		background: o.Background,
+		paused:     o.Paused,
 		timer:      timer,
 	}
 
@@ -1001,13 +1015,44 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
 	cm.l.k.Pause()
 	return nil
 }
 
-// Resume resumes all tasks.
+// pauseRestored pauses the restored kernel before it starts, so that its
+// tasks start stopped, and leaves the post-restore work to Resume.
+func (cm *containerManager) pauseRestored() {
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	cm.l.k.Pause()
+	cm.postRestorePending = true
+}
+
+// Resume resumes all tasks. It does nothing if they are not paused: pausing
+// and resuming apply to the whole sandbox, and each container of a sandbox
+// restored paused is resumed, the first of them resuming the sandbox.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
+	cm.l.mu.Lock()
+	state := cm.l.state
+	cm.l.mu.Unlock()
+	if state == restoringUnstarted {
+		// Until then, the kernel is the one that the restore replaces, which
+		// Restore paused.
+		return fmt.Errorf("cannot resume a sandbox before all of its containers are restored: state=%s", state)
+	}
+
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	if !cm.l.k.IsPaused() {
+		return nil
+	}
 	cm.l.k.Unpause()
+	if cm.postRestorePending {
+		cm.postRestorePending = false
+		return postRestoreResumed(cm.l.k)
+	}
 	return control.PostResume(cm.l.k, nil)
 }
 

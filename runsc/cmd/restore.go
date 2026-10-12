@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -62,6 +63,10 @@ type Restore struct {
 	// uncompressed for background to work; if the checkpoint is compressed,
 	// background has no effect.
 	background bool
+
+	// paused leaves the restored container paused, as "runsc pause" does,
+	// until "runsc resume".
+	paused bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -87,6 +92,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
+	f.BoolVar(&r.paused, "paused", false, "leave the restored container paused, as 'runsc pause' does, until 'runsc resume'; restore every container of the sandbox with it")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -193,7 +199,12 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.layerPaths, r.direct, r.background, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, sandbox.RestoreOpts{
+		LayerPaths: r.layerPaths,
+		Direct:     r.direct,
+		Background: r.background,
+		Paused:     r.paused,
+	})
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}

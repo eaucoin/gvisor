@@ -267,7 +267,7 @@ func restoreContainers(conf *config.Config, specs []*specs.Spec, ids []string, i
 		cu.Add(func() { cont.Destroy() })
 		containers = append(containers, cont)
 
-		if err := cont.Restore(conf, imagePath, nil /* layerPaths */, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		if err := cont.Restore(conf, imagePath, sandbox.RestoreOpts{}); err != nil {
 			return nil, nil, fmt.Errorf("error restoring container: %v", err)
 		}
 
@@ -3220,6 +3220,152 @@ func testMultiContainerCheckpointRestore(t *testing.T, conf *config.Config, comp
 		// Future restores will reuse newIds. It requires the other containers
 		// using those IDs to cease to exist because they share the same identity.
 		cleanup2()
+	}
+}
+
+// TestMultiContainerCheckpointRestorePaused checks that a sandbox restored
+// paused runs nothing until one of its containers is resumed, which resumes
+// the sandbox, and that resuming each of the others then succeeds.
+func TestMultiContainerCheckpointRestorePaused(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	script := fmt.Sprintf("for ((i=0; ;i++)); do echo $i >> %q; sleep 0.1; done", outputPath)
+	testSpecs, ids := createSpecs(
+		sleepCmd,
+		[]string{"bash", "-c", script},
+		sleepCmd,
+	)
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+
+	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	lastNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+
+	// Restore into new containers with different IDs.
+	newIDs := make([]string, 0, len(ids))
+	for range ids {
+		newIDs = append(newIDs, testutil.RandomContainerID())
+	}
+	for _, spec := range testSpecs[1:] {
+		spec.Annotations[specutils.ContainerdSandboxIDAnnotation] = newIDs[0]
+	}
+
+	// Delete and recreate file before restoring.
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("error removing file")
+	}
+	outputFile2, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile2.Close()
+
+	var restored []*Container
+	for i, spec := range testSpecs {
+		bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
+		if err != nil {
+			t.Fatalf("error setting up container: %v", err)
+		}
+		defer cleanup()
+		cont, err := New(conf, Args{
+			ID:        newIDs[i],
+			Spec:      spec,
+			BundleDir: bundleDir,
+		})
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+		defer cont.Destroy()
+		if err := cont.Restore(conf, dir, sandbox.RestoreOpts{Paused: true}); err != nil {
+			t.Fatalf("error restoring container %d: %v", i, err)
+		}
+		restored = append(restored, cont)
+
+		// The sandbox's kernel is restored with its last container.
+		if i == 0 {
+			if err := cont.Resume(); err == nil {
+				t.Errorf("resuming the root container before the others are restored succeeded, want an error")
+			}
+		}
+	}
+	for i, cont := range restored {
+		if got, want := cont.State().Status, Paused; got != want {
+			t.Errorf("restored container %d status: got %v, want %v", i, got, want)
+		}
+	}
+
+	// The application writes a number every 100ms when it runs.
+	time.Sleep(time.Second)
+	if fi, err := outputFile2.Stat(); err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	} else if fi.Size() != 0 {
+		t.Fatalf("sandbox restored paused ran: it wrote %d bytes", fi.Size())
+	}
+
+	// A subcontainer resumes the sandbox; the others are resumed after it.
+	for _, i := range []int{1, 0, 2} {
+		if err := restored[i].Resume(); err != nil {
+			t.Fatalf("error resuming container %d: %v", i, err)
+		}
+		if got, want := restored[i].State().Status, Running; got != want {
+			t.Errorf("resumed container %d status: got %v, want %v", i, got, want)
+		}
+	}
+	firstNum, err := readOutputNum(outputPath, 0)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	if lastNum+1 != firstNum {
+		t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
+	}
+
+	// The application still runs after the containers resumed after the
+	// first, which resumed nothing.
+	wantNum := firstNum + 5
+	if err := testutil.Poll(func() error {
+		num, err := readOutputNum(outputPath, -1)
+		if err != nil {
+			return &backoff.PermanentError{Err: err}
+		}
+		if num < wantNum {
+			return fmt.Errorf("last number %d, want at least %d", num, wantNum)
+		}
+		return nil
+	}, 10*time.Second); err != nil {
+		t.Errorf("application stopped after the resumes: %v", err)
 	}
 }
 

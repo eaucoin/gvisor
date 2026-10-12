@@ -450,23 +450,34 @@ func (c *Container) createSubcontainer(conf *config.Config, spec *specs.Spec) er
 // Start starts running the containerized process inside the sandbox.
 func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container, cid: %s", c.ID)
-	return c.startImpl(conf, "start", c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
+	return c.startImpl(conf, "start", Running, c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
 }
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file. The image at imagePath may
-// have layers in imagePath/layers or in layerPaths (see
+// have layers in imagePath/layers or in opts.LayerPaths (see
 // checkpointimage.FindLayers).
-func (c *Container) Restore(conf *config.Config, imagePath string, layerPaths []string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+//
+// With opts.Paused, the container is Paused once restored, until Resume. The
+// sandbox is restored with the root container's options: every container of
+// a sandbox restored paused is to be restored with opts.Paused, so that its
+// status says so.
+func (c *Container) Restore(conf *config.Config, imagePath string, opts sandbox.RestoreOpts) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, layerPaths, direct, background, networkArgs)
+		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, opts)
 	}
-	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+	status := Running
+	if opts.Paused {
+		status = Paused
+	}
+	return c.startImpl(conf, "restore", status, restore, c.Sandbox.RestoreSubcontainer)
 }
 
-func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
+// startImpl starts the container with startRoot or startSub, and leaves it in
+// status.
+func (c *Container) startImpl(conf *config.Config, action string, status Status, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
 	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
@@ -540,7 +551,7 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 		}
 	}
 
-	c.changeStatus(Running)
+	c.changeStatus(status)
 	if err := c.saveLocked(); err != nil {
 		return err
 	}
@@ -1841,7 +1852,8 @@ func (c *Container) changeStatus(s Status) {
 		}
 
 	case Paused:
-		if c.Status != Running {
+		// A container restored paused is Paused from Created.
+		if c.Status != Created && c.Status != Running {
 			panic(fmt.Sprintf("invalid state transition: %v => %v", c.Status, s))
 		}
 		if c.Sandbox == nil {

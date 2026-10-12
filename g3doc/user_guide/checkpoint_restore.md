@@ -54,6 +54,45 @@ runsc restore --image-path=<path> <container id>
 > Note: All top-level runsc flags needed when calling run must be provided to
 > `restore`.
 
+### Restoring paused
+
+With `--paused`, `runsc restore` leaves the restored sandbox paused, as `runsc
+pause` leaves a sandbox: its kernel is restored, and with `--background` its
+memory keeps loading, but its application runs nothing until `runsc resume`.
+`runsc state` reports the container `paused` until then. An orchestrator can so
+finish preparing what the restored application needs before it runs, such as the
+network policy of the sandbox's new address, so that the application never sends
+or answers a packet before it is in place.
+
+```bash
+runsc restore --image-path=<path> --paused <container id>
+# ...
+runsc resume <container id>
+```
+
+Pausing and resuming apply to the whole sandbox. Restore each container of the
+sandbox with `--paused`, so that each reports `paused`: the first `runsc resume`
+of any of them resumes the sandbox, and resuming the others then only reports
+them `running`. The sandbox cannot be resumed before all of its containers are
+restored.
+
+The save/restore exec binary (see
+[Application-Driven Checkpoint/Restore](#application-driven-checkpointrestore))
+runs at the first resume, in its `restore` mode, rather than once the restore
+is done: it runs in the restored application's containers, which run nothing
+before. `runsc resume` returns once it has run, and fails, killing the sandbox,
+if it fails. `runsc wait --restore` does not wait for the resume: it returns
+once the kernel and its memory are restored.
+
+Until the sandbox is resumed:
+
+-   Nothing in it answers, so health checks that run in it or connect to it,
+    such as Kubernetes' liveness and readiness probes, fail. Resume it before
+    they fail too often, or delay them.
+-   Its containers cannot be signalled: `runsc kill` fails on a paused
+    container, as it does after `runsc pause`. `runsc delete --force` destroys
+    it.
+
 ## Optimizations
 
 gVisor supports several performance optimizations during checkpoint and restore.
@@ -567,6 +606,15 @@ instead, once containerd passes them to the containers' specs:
 -   `dev.gvisor.internal.restore.direct`: `true` restores with `--direct`.
 -   `dev.gvisor.internal.restore.background`: `true` restores with
     `--background`.
+-   `dev.gvisor.internal.restore.paused`: `true` restores with `--paused` (see
+    [Restoring paused](#restoring-paused)). The pod's containers are `PAUSED`
+    once started, and its sandbox runs nothing until they are resumed through
+    the task service's `Resume` (`ctr task resume`); resume each of them. The
+    kubelet never resumes them: something else must, such as a node agent
+    that does once the pod's network policy is programmed for its new address.
+    If containerd restarts while a task is paused, CRI reports its container's
+    state as unknown. Stopping a paused container signals it, which fails
+    until it is resumed.
 
 The shim removes these annotations from the specs it passes to runsc, and
 refuses any other annotation with the `dev.gvisor.internal.restore.` prefix.

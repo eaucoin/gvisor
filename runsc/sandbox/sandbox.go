@@ -542,8 +542,31 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	return nil
 }
 
+// RestoreOpts contains the options for restoring a sandbox.
+type RestoreOpts struct {
+	// LayerPaths are where to look for the images that are layers of the image
+	// restored from, besides its layers directory (see
+	// checkpointimage.FindLayers).
+	LayerPaths []string
+
+	// Direct reads the checkpoint pages file with O_DIRECT.
+	Direct bool
+
+	// Background lets the checkpoint pages file be read after Restore returns.
+	// It has no effect on a compressed checkpoint.
+	Background bool
+
+	// Paused leaves the restored sandbox paused, as Pause does, until Resume:
+	// its application runs nothing until then.
+	Paused bool
+
+	// NetworkArgs, if not nil, configures the restored network stack instead
+	// of the network that the sandbox's network namespace holds.
+	NetworkArgs *boot.CreateLinksAndRoutesArgs
+}
+
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, layerPaths []string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, opts RestoreOpts) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -559,7 +582,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	opt := boot.RestoreOpts{
-		Background:     background,
+		Background:     opts.Background,
+		Paused:         opts.Paused,
 		SplitFSRestore: s.FSRestore,
 	}
 	defer func() {
@@ -567,7 +591,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 			_ = f.Close()
 		}
 	}()
-	if err := s.setRestoreOpts(conf, imagePath, layerPaths, direct, &opt); err != nil {
+	if err := s.setRestoreOpts(conf, imagePath, opts.LayerPaths, opts.Direct, &opt); err != nil {
 		return err
 	}
 
@@ -586,7 +610,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	if networkArgs == nil {
+	if opts.NetworkArgs == nil {
 		var disableIPv6 bool
 		disableIPv6, err = getDisableIPv6(spec)
 		if err != nil {
@@ -600,8 +624,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	} else {
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
-		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+		log.Debugf("Setting up network args, config: %+v", opts.NetworkArgs)
+		if err := conn.Call(boot.ContMgrSetNetworkArgs, opts.NetworkArgs, nil); err != nil {
 			return fmt.Errorf("setting network args: %w", err)
 		}
 	}
