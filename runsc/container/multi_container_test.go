@@ -17,12 +17,14 @@ package container
 import (
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -3218,6 +3220,109 @@ func testMultiContainerCheckpointRestore(t *testing.T, conf *config.Config, comp
 		// Future restores will reuse newIds. It requires the other containers
 		// using those IDs to cease to exist because they share the same identity.
 		cleanup2()
+	}
+}
+
+// TestMultiContainerCheckpointDestroyedContainer checks that a checkpoint holds
+// only the containers that its sandbox still has. A container destroyed before
+// the checkpoint, as a Kubernetes init container is once it has run, is not in
+// it, and a container of its name created at restore is refused rather than
+// counted in for one that is.
+func TestMultiContainerCheckpointDestroyedContainer(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	// The root container, an init container that exits at once, and an
+	// application container, named as containerd names them.
+	testSpecs, ids := createSpecs(sleepCmd, []string{"/bin/true"}, sleepCmd)
+	for i, name := range []string{"sandbox", "init", "app"} {
+		testSpecs[i].Annotations[specutils.ContainerdContainerNameAnnotation] = name
+	}
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+	if ws, err := conts[1].Wait(); err != nil || ws.ExitStatus() != 0 {
+		t.Fatalf("init container: Wait() = %v, %v, want exit status 0", ws, err)
+	}
+	if err := conts[1].Destroy(); err != nil {
+		t.Fatalf("error destroying init container: %v", err)
+	}
+
+	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	md, err := readStateFileMetadata(filepath.Join(dir, checkpointfiles.StateFileName))
+	if err != nil {
+		t.Fatalf("error reading state file metadata: %v", err)
+	}
+	if got, want := md[boot.ContainerCountKey], "2"; got != want {
+		t.Errorf("checkpoint's container count: got %q, want %q", got, want)
+	}
+	checkpointedSpecs, err := specutils.GetSpecsFromString(md[boot.ContainerSpecsKey])
+	if err != nil {
+		t.Fatalf("error reading checkpoint's container specs: %v", err)
+	}
+	if got, want := slices.Sorted(maps.Keys(checkpointedSpecs)), []string{"app", "sandbox"}; !slices.Equal(got, want) {
+		t.Errorf("checkpoint's containers: got %q, want %q", got, want)
+	}
+
+	// Restore into new containers with different IDs, first with the init
+	// container, then as the checkpoint holds them.
+	for _, tc := range []struct {
+		specs   []*specs.Spec
+		wantErr string
+	}{
+		{
+			specs:   testSpecs,
+			wantErr: `container "init" is not in the checkpoint`,
+		},
+		{
+			specs: []*specs.Spec{testSpecs[0], testSpecs[2]},
+		},
+	} {
+		newIDs := make([]string, 0, len(tc.specs))
+		for range tc.specs {
+			newIDs = append(newIDs, testutil.RandomContainerID())
+		}
+		for _, spec := range tc.specs[1:] {
+			spec.Annotations[specutils.ContainerdSandboxIDAnnotation] = newIDs[0]
+		}
+		restored, cleanup, err := restoreContainers(conf, tc.specs, newIDs, dir)
+		if tc.wantErr != "" {
+			if err == nil {
+				cleanup()
+				t.Fatalf("restoring %d containers succeeded, want an error", len(tc.specs))
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("restoring %d containers: got error %v, want it to contain %q", len(tc.specs), err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("error restoring containers: %v", err)
+		}
+		defer cleanup()
+		for _, cont := range restored {
+			if state := cont.State(); state.Status != Running {
+				t.Errorf("container %v is not running: %v", cont.ID, state.Status)
+			}
+		}
 	}
 }
 
