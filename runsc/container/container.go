@@ -533,7 +533,7 @@ func (c *Container) createSubcontainer(conf *config.Config, spec *specs.Spec) er
 // Start starts running the containerized process inside the sandbox.
 func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container, cid: %s", c.ID)
-	return c.startImpl(conf, "start", c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
+	return c.startImpl(conf, "start", Running, c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
 }
 
 // endSandboxCreation marks the sandbox as having been created.
@@ -557,20 +557,31 @@ func (c *Container) endSandboxCreation() error {
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file. The image at imagePath may
-// have layers in imagePath/layers or in layerPaths (see
+// have layers in imagePath/layers or in opts.LayerPaths (see
 // checkpointimage.FindLayers).
-func (c *Container) Restore(conf *config.Config, imagePath string, layerPaths []string, directIO sandbox.DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+//
+// With opts.Paused, the container is Paused once restored, until Resume. The
+// sandbox is restored with the root container's options: every container of
+// a sandbox restored paused is to be restored with opts.Paused, so that its
+// status says so.
+func (c *Container) Restore(conf *config.Config, imagePath string, opts sandbox.RestoreOpts) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, layerPaths, directIO, background, networkArgs)
+		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, opts)
 	}
-	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+	status := Running
+	if opts.Paused {
+		status = Paused
+	}
+	return c.startImpl(conf, "restore", status, restore, c.Sandbox.RestoreSubcontainer)
 }
 
-func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
+// startImpl starts the container with startRoot or startSub, and leaves it in
+// status.
+func (c *Container) startImpl(conf *config.Config, action string, status Status, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
 	if err := c.modify(func() error {
-		return c.startLocked(conf, action, startRoot, startSub)
+		return c.startLocked(conf, action, status, startRoot, startSub)
 	}); err != nil {
 		return err
 	}
@@ -586,10 +597,11 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 	return c.adjustGoferOOMScoreAdj()
 }
 
-// startLocked starts the container with startRoot or startSub.
+// startLocked starts the container with startRoot or startSub, and leaves it
+// in status.
 //
 // Preconditions: c.Saver is locked.
-func (c *Container) startLocked(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
+func (c *Container) startLocked(conf *config.Config, action string, status Status, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
 	if err := c.requireStatus(action, Created); err != nil {
 		if c.Status == Stopped && c.IsSandboxRoot() {
 			if running, runErr := c.IsSandboxRunning(); runErr == nil && !running {
@@ -698,7 +710,7 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 		}
 	}
 
-	c.changeStatus(Running)
+	c.changeStatus(status)
 	return nil
 }
 
@@ -929,21 +941,28 @@ func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
 // TODO(b/113680494): Distinguish different error types.
 func (c *Container) SignalContainer(sig unix.Signal, all bool) error {
 	log.Debugf("Signal container, cid: %s, signal: %v (%d)", c.ID, sig, sig)
-	if c.Status == Created {
+	switch {
+	case c.Status == Created:
 		return c.signalCreated(sig, all)
+	case c.Status == Paused && sig == unix.SIGKILL:
+		return c.killPaused(all)
 	}
 	return c.signalRunning(sig, all)
 }
 
-// signalRunning delivers a signal to the processes of a Running (or Stopped)
-// container via the sandbox.
+// signalRunning delivers a signal to the processes of a Running, Paused, or
+// Stopped container via the sandbox.
 func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 	// Signaling container in Stopped state is allowed. When all=false,
 	// an error will be returned anyway; when all=true, this allows
 	// sending signal to other processes inside the container even
 	// after the init process exits. This is especially useful for
 	// container cleanup.
-	if err := c.requireStatus("signal", Running, Stopped); err != nil {
+	//
+	// A signal sent to a Paused container takes effect once it runs again,
+	// as it does for a container of runc's that is paused in a frozen
+	// cgroup. SIGKILL takes effect at once (see killPaused).
+	if err := c.requireStatus("signal", Running, Paused, Stopped); err != nil {
 		return err
 	}
 	if err := c.CheckSandboxRunning(); err != nil {
@@ -955,14 +974,63 @@ func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 	return c.Sandbox.SignalContainer(c.ID, sig, all)
 }
 
+// killPaused sends SIGKILL to a Paused container, and resumes its sandbox so
+// that the signal takes effect: the processes killed run nothing more. If the
+// container is the root container, or if the sandbox was restored paused and
+// has not been resumed since, and so has not started yet, every process of
+// the sandbox is killed, and every container of the sandbox ends. Each other
+// container of the sandbox that is Paused is then Running, as it is once the
+// sandbox is resumed with Resume, until it is found Stopped.
+func (c *Container) killPaused(all bool) error {
+	resumed := false
+	// modify reloads the status, which may be stale.
+	err := c.modify(func() error {
+		if c.Status != Paused {
+			return c.signalRunning(unix.SIGKILL, all)
+		}
+		var err error
+		resumed, err = c.killPausedLocked(all)
+		return err
+	})
+	if resumed {
+		if rerr := c.sandboxResumed(); err == nil {
+			err = rerr
+		}
+	}
+	return err
+}
+
+// killPausedLocked does killPaused's work on c, and returns whether it
+// resumed the sandbox. Once c's lock is released, the caller must mark the
+// sandbox's other containers resumed with sandboxResumed.
+//
+// Precondition: c's lock is held, within modify, and c is Paused.
+func (c *Container) killPausedLocked(all bool) (bool, error) {
+	if err := c.CheckSandboxRunning(); err != nil {
+		return false, err
+	}
+	if err := c.Sandbox.KillPaused(c.ID, all); err != nil {
+		return false, err
+	}
+	c.changeStatus(Running)
+	return true, nil
+}
+
 // signalCreated handles a signal sent to a container that appears to be in the
 // Created state (start was never called). Such a container has no process to
 // receive the signal, so a terminating signal (SIGKILL/SIGTERM) is honored by
 // stopping the container.
 func (c *Container) signalCreated(sig unix.Signal, all bool) error {
+	resumed := false
 	// modify reloads the status, which a concurrent start could have moved
-	// to Running (or a kill/delete to Stopped).
-	return c.modify(func() error {
+	// to Running (or a kill/delete to Stopped), or a concurrent restore to
+	// Paused.
+	err := c.modify(func() error {
+		if c.Status == Paused && sig == unix.SIGKILL {
+			var err error
+			resumed, err = c.killPausedLocked(all)
+			return err
+		}
 		if c.Status != Created {
 			// The container now has a process (or has already stopped), so
 			// deliver the signal normally.
@@ -984,6 +1052,12 @@ func (c *Container) signalCreated(sig unix.Signal, all bool) error {
 		c.changeStatus(Stopped)
 		return nil
 	})
+	if resumed {
+		if rerr := c.sandboxResumed(); err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
 
 // SignalProcess sends sig to a specific process in the container.
@@ -1065,19 +1139,73 @@ func (c *Container) Pause() error {
 }
 
 // Resume unpauses the container and its kernel.
-// The call only succeeds if the container's status is paused.
+// The call only succeeds if the container's status is paused or running.
+//
+// Pausing and resuming apply to the whole sandbox: once the sandbox is
+// resumed, each other container of the sandbox that is Paused is Running too,
+// and resuming a Running container resumes its sandbox if it is paused, and
+// otherwise does nothing.
 func (c *Container) Resume() error {
 	log.Debugf("Resuming container, cid: %s", c.ID)
-	return c.modify(func() error {
-		if c.Status != Paused {
+	if err := c.modify(func() error {
+		if c.Status != Paused && c.Status != Running {
 			return fmt.Errorf("cannot resume container %q in state %v", c.ID, c.Status)
 		}
 		if err := c.Sandbox.Resume(c.ID); err != nil {
 			return fmt.Errorf("resuming container: %v", err)
 		}
-		c.changeStatus(Running)
+		if c.Status == Paused {
+			c.changeStatus(Running)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return c.sandboxResumed()
+}
+
+// sandboxResumed marks each container of c's sandbox other than c that is
+// Paused Running, once the sandbox is resumed: a container's Paused status
+// must not outlive its sandbox's pause, or nothing could signal it.
+//
+// Precondition: c's lock is not held. sandboxResumed takes the lock of each
+// other container in turn, never two at once, so it cannot deadlock with an
+// operation that holds one container's lock while it waits for another's,
+// such as the resume of another container of the sandbox.
+func (c *Container) sandboxResumed() error {
+	containers, err := LoadSandbox(c.Saver.RootDir, c.sandboxID(), LoadOpts{})
+	if err != nil {
+		return fmt.Errorf("container %q resumed its sandbox, but: %w", c.ID, err)
+	}
+	var errs []error
+	for _, other := range containers {
+		if other.ID == c.ID {
+			continue
+		}
+		if err := other.resumedWithSandbox(); err != nil {
+			errs = append(errs, fmt.Errorf("container %q resumed its sandbox, but marking container %q resumed: %w", c.ID, other.ID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// resumedWithSandbox marks c Running if it is Paused, once its sandbox is
+// resumed.
+func (c *Container) resumedWithSandbox() error {
+	defer func() { _ = c.Saver.close() }()
+	// modify acts on the state saved now rather than on the state loaded
+	// before acquiring the lock.
+	err := c.modify(func() error {
+		if c.Status == Paused {
+			c.changeStatus(Running)
+		}
 		return nil
 	})
+	if errors.Is(err, os.ErrNotExist) {
+		// Destroyed meanwhile.
+		return nil
+	}
+	return err
 }
 
 // State returns the metadata of the container.
@@ -2132,7 +2260,8 @@ func (c *Container) changeStatus(s Status) {
 		}
 
 	case Paused:
-		if c.Status != Running {
+		// A container restored paused is Paused from Created.
+		if c.Status != Created && c.Status != Running {
 			panic(fmt.Sprintf("invalid state transition: %v => %v", c.Status, s))
 		}
 		if c.Sandbox == nil {
