@@ -1264,6 +1264,10 @@ type LoadOpts struct {
 	// ownership of this timeline remains in the hands of the caller of
 	// LoadFrom.
 	Timeline *timing.Timeline
+
+	// If WorkingSet is true, the image's working set (Image.WorkingSet), if
+	// any, is the MemoryFile's (see MemoryFile.SetWorkingSet).
+	WorkingSet bool
 }
 
 // LoadFrom loads MemoryFile state from the given stream.
@@ -1295,6 +1299,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	}
 	if err := f.importMetadataProto(&pb); err != nil {
 		return fmt.Errorf("failed to import metadata: %w", err)
+	}
+	if opts.WorkingSet {
+		f.SetWorkingSet(opts.Image.GetWorkingSet())
 	}
 	chunks := f.chunksLoad()
 	if f.dirty.tracked.Load() {
