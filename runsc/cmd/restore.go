@@ -63,6 +63,10 @@ type Restore struct {
 	// uncompressed for background to work; if the checkpoint is compressed,
 	// background has no effect.
 	background bool
+
+	// paused leaves the restored container paused, as "runsc pause" does,
+	// until "runsc resume".
+	paused bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -89,6 +93,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&r.direct, "direct", false, "deprecated, use --direct-io=on")
 	f.Var(&r.directIO, "direct-io", "use O_DIRECT for reading checkpoint pages file. Values: auto|on|off (default auto). auto enables it for GPU restores if the filesystem supports it.")
 	f.BoolVar(&r.background, "background", true, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
+	f.BoolVar(&r.paused, "paused", false, "leave the restored container paused, as 'runsc pause' does, until 'runsc resume'; restore every container of the sandbox with it. Until then the sandbox has not started: 'runsc kill' with SIGKILL of any of its containers ends the restore and every container")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -208,7 +213,12 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.layerPaths, r.directIO, r.background, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, sandbox.RestoreOpts{
+		LayerPaths: r.layerPaths,
+		DirectIO:   r.directIO,
+		Background: r.background,
+		Paused:     r.paused,
+	})
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}
