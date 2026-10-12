@@ -684,6 +684,12 @@ func (r *restorer) restore(l *Loader) error {
 		// application runs nothing until the kernel is resumed.
 		r.cm.pauseRestored()
 		r.timer.Reached("kernel paused")
+	} else {
+		// Record the memory that the application touches first, which the next
+		// checkpoint saves as the image's working set. A kernel restored paused
+		// starts recording at its first resume (containerManager.Resume), when
+		// its application starts running.
+		l.startWorkingSetRecording()
 	}
 
 	r.timer.Reached("Starting sandbox")
@@ -741,6 +747,14 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	r.cm.onRestoreDone(s)
 	timeline.Reached("kernel notified")
 	log.Infof("Restore successful")
+}
+
+// startWorkingSetRecording starts recording the working set of the restored
+// application for --working-set-window, if it is not 0.
+func (l *Loader) startWorkingSetRecording() {
+	if conf := l.root.conf; conf.WorkingSetWindow > 0 {
+		l.k.MemoryFile().StartWorkingSetRecording(uint64(conf.WorkingSetUnit), conf.WorkingSetWindow)
+	}
 }
 
 // doPostRestore does the work that follows a restore, once the restored kernel

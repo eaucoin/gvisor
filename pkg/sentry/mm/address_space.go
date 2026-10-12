@@ -65,22 +65,33 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			mapAR.End = end
 		}
 	}
+	mf, isMF := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+	var wsUnit uint64
+	if isMF {
+		wsUnit = mf.WorkingSetUnit()
+	}
 	if platformEffect != memmap.PlatformEffectDefault {
 		// When explicitly committing, only map ar, since overmapping may incur
 		// unexpected resource usage. When explicitly populating, do the same
 		// since an underlying device file may be sensitive to the mapped
 		// range.
 		mapAR = ar
-	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
+	} else if isMF && mf.IsAsyncLoading() {
 		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
 		// waits for every page in the mapped range to be loaded, so a first
 		// touch waits for its whole map unit: map a small unit while loading,
 		// keeping hugepage-backed pmas' huge pages whole.
 		if pseg.ValuePtr().huge {
 			setMapUnit(hostarch.HugePageSize)
+		} else if wsUnit != 0 {
+			setMapUnit(min(wsUnit, asyncLoadingMapUnit))
 		} else {
 			setMapUnit(asyncLoadingMapUnit)
 		}
+	} else if wsUnit != 0 && !pseg.ValuePtr().huge {
+		// While mf records its working set, map what is touched in its unit,
+		// so that mapping records no more than was touched.
+		setMapUnit(wsUnit)
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
@@ -102,6 +113,9 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			perms.Write = false
 		}
 		if perms.Any() { // MapFile precondition
+			if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
+				mf.RecordTouch(pseg.fileRangeOf(pmaMapAR))
+			}
 			// If the length of the mapping exceeds singleMapThreshold, call
 			// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so
 			// we can check ctx.Killed() reasonably frequently.

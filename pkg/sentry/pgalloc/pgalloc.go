@@ -205,6 +205,8 @@ type MemoryFile struct {
 
 	// dirty is the dirty tracking state; see dirty.go.
 	dirty dirtyState
+	// ws records and holds the working set of the MemoryFile.
+	ws workingSet
 
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
@@ -1520,6 +1522,7 @@ func (f *MemoryFile) mapInternal(fr memmap.FileRange, at hostarch.AccessType, tr
 			return safemem.BlockSeq{}, err
 		}
 	}
+	f.RecordTouch(fr)
 
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
 	if chunks == 1 {
