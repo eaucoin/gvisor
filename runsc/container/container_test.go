@@ -2115,7 +2115,7 @@ func TestUnixDomainSockets(t *testing.T) {
 			}
 			defer contRestore.Destroy()
 
-			if err := contRestore.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+			if err := contRestore.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -2268,8 +2268,9 @@ func TestPauseResumeStatus(t *testing.T) {
 		t.Errorf("container status got %v, want %v", got, want)
 	}
 
-	// Try to resume again. Should cause error.
-	if err := cont.Resume(); err == nil {
+	// Resume again. Resuming a running container in a running sandbox does
+	// nothing.
+	if err := cont.Resume(); err != nil {
 		t.Errorf("error resuming container already running: %v", err)
 	}
 	if got, want := cont.Status, Running; got != want {
@@ -4444,7 +4445,7 @@ func TestUsageFD(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -5808,7 +5809,7 @@ func TestSpecValidation(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			err = cont2.Restore(conf, dir, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
+			err = cont2.Restore(conf, dir, sandbox.RestoreOpts{})
 			if err == nil {
 				if test.wantErr == "" {
 					return
@@ -6439,7 +6440,7 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, lastImage, nil /* layerPaths */, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, lastImage, sandbox.RestoreOpts{}); err != nil {
 		t.Fatalf("error restoring: %v", err)
 	}
 	// Restore does not wait for its hook to finish. Wait before starting another

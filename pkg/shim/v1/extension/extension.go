@@ -45,6 +45,8 @@ type RestoreConfig struct {
 	ImagePath  string
 	Direct     bool
 	Background bool
+	// Paused leaves the restored container paused until it is resumed.
+	Paused bool
 }
 
 // Process is the interface representing a process inside the container.
