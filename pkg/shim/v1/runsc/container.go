@@ -115,6 +115,11 @@ type ContainerConfig struct {
 	// --background, in addition to the containers whose options ask for them.
 	RestoreDirect     bool
 	RestoreBackground bool
+
+	// RestorePaused restores with --paused: the container is paused once
+	// restored, until resumed. Set it on every container of the sandbox
+	// being restored, as RestoreImagePath.
+	RestorePaused bool
 }
 
 // NewContainer returns a new runsc container
@@ -286,6 +291,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 			ImagePath:  conf.RestoreImagePath,
 			Direct:     opts.RestoreDirect || conf.RestoreDirect,
 			Background: opts.RestoreBackground || conf.RestoreBackground,
+			Paused:     conf.RestorePaused,
 		}
 	}
 	c := Container{
