@@ -1,0 +1,7 @@
+base release-20260921.0
+series/fork-infra ef11993d08ed5c534de89edae59910c615f20b2a 15
+series/00-base-fixes f83ef33b1040d597107ee5d9221eef3d4f8dd052 4
+series/10-pgalloc-save-restore-tests 19122d496f7137c5e167ff73ff00edf53b18daf5 2
+series/17-image-format-v2 6c09bbacfc2bd4cf49ac7ce78ab1b45ee5160750 6
+series/18-image-tooling 5ca8cd18c30918d4ab270be4425e2eb057ccaf07 3
+series/11-fault-first-restore d7307466145654da2451033285e48c5ed0852a91 7
