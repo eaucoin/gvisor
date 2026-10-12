@@ -133,7 +133,7 @@ func (w *abwriter) restore(image string, layers []string) {
 	w.t.Helper()
 	w.cont.Destroy()
 	w.cont = w.newContainer()
-	if err := w.cont.Restore(w.conf, image, layers, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+	if err := w.cont.Restore(w.conf, image, sandbox.RestoreOpts{LayerPaths: layers}); err != nil {
 		w.t.Fatalf("error restoring %s: %v", image, err)
 	}
 }
