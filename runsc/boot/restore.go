@@ -333,6 +333,11 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) (bool, e
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Counted in, a container that the checkpoint does not hold would start
+	// the restore before one that it does.
+	if _, ok := r.checkpointedSpecs[info.containerName]; !ok {
+		return false, fmt.Errorf("container %q is not in the checkpoint", info.containerName)
+	}
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
 			return false, fmt.Errorf("container %q already restored", info.containerName)
@@ -952,7 +957,10 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
 	}
-	saveOpts.Metadata[ContainerCountKey] = strconv.Itoa(l.containerCount())
+	// The containers the checkpoint holds: a restore waits for as many, and
+	// pairs each with its spec by name.
+	containerSpecs := l.checkpointContainerSpecs()
+	saveOpts.Metadata[ContainerCountKey] = strconv.Itoa(len(containerSpecs))
 
 	// Save runsc version.
 	saveOpts.Metadata[VersionKey] = version.Version()
@@ -967,7 +975,7 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
-	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
+	specsStr, err := specutils.ConvertSpecsToString(containerSpecs)
 	if err != nil {
 		return err
 	}
