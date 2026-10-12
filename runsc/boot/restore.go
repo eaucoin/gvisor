@@ -270,6 +270,10 @@ type restorer struct {
 	// restorer.restore() returns.
 	background bool
 
+	// If paused is true, the restored kernel is left paused until
+	// containerManager.Resume, which does the post-restore work.
+	paused bool
+
 	// mainMF is the main MemoryFile of the sandbox.
 	// It is created as soon as possible, and may be restored to as soon as
 	// the first container is restored, which is earlier than when the sandbox's
@@ -674,6 +678,14 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	if r.paused {
+		// Paused before it starts, the kernel starts its tasks stopped, and a
+		// task that starts stopped does nothing before it enters the stop: the
+		// application runs nothing until the kernel is resumed.
+		r.cm.pauseRestored()
+		r.timer.Reached("kernel paused")
+	}
+
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
@@ -697,20 +709,16 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	defer timeline.End()
 
 	timeline.Reached("scheduled")
-	if err := control.PostRestore(k, timeline); err != nil {
-		r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
-		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
-		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
-		return
+	// A kernel restored paused does this work at its first resume instead
+	// (postRestoreResumed), once its application runs.
+	if !r.paused {
+		if err := doPostRestore(k, timeline); err != nil {
+			r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
+			log.Warningf("Killing the sandbox after post restore work failed: %v", err)
+			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			return
+		}
 	}
-	timeline.Reached("post restore done")
-
-	// Now that post restore work succeeded, increment the checkpoint gen
-	// manually. The count was saved while the previous kernel was being saved
-	// and checkpoint success was unknown at that time. Now we know the had
-	// checkpoint succeeded. Allow the application to proceed while pages may
-	// keep loading in the background.
-	k.IncCheckpointGenOnRestore()
 
 	// Wait for page loading to complete if happening in the background.
 	if r.asyncMFLoader != nil {
@@ -733,6 +741,36 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	r.cm.onRestoreDone(s)
 	timeline.Reached("kernel notified")
 	log.Infof("Restore successful")
+}
+
+// doPostRestore does the work that follows a restore, once the restored kernel
+// runs.
+func doPostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
+	if err := control.PostRestore(k, timeline); err != nil {
+		return err
+	}
+	timeline.Reached("post restore done")
+
+	// Now that post restore work succeeded, increment the checkpoint gen
+	// manually. The count was saved while the previous kernel was being saved
+	// and checkpoint success was unknown at that time. Now we know the had
+	// checkpoint succeeded. Allow the application to proceed while pages may
+	// keep loading in the background.
+	k.IncCheckpointGenOnRestore()
+	return nil
+}
+
+// postRestoreResumed does the post-restore work of a kernel restored paused,
+// once it is resumed: the save/restore exec hook runs then, in its restore
+// mode rather than its resume mode. If the work fails, the sandbox is killed,
+// as it is when the work fails after a restore that leaves it running.
+func postRestoreResumed(k *kernel.Kernel) error {
+	if err := doPostRestore(k, nil /* timeline */); err != nil {
+		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
+		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		return fmt.Errorf("post restore work failed: %w", err)
+	}
+	return nil
 }
 
 // Calculate the CPU time saved for restore.

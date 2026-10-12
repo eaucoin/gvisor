@@ -369,7 +369,7 @@ func runEscapes(t *testing.T, conf *config.Config, overlay bool) *escape {
 		if err != nil {
 			t.Fatalf("error creating container: %v", err)
 		}
-		if err := r.cont.Restore(conf, delta, r.chain[:len(r.chain)-1], false /* direct */, i%2 == 1 /* background */, nil /* networkArgs */); err != nil {
+		if err := r.cont.Restore(conf, delta, sandbox.RestoreOpts{LayerPaths: r.chain[:len(r.chain)-1], Background: i%2 == 1}); err != nil {
 			t.Fatalf("error restoring the chain of %d images after step %q: %v", len(r.chain), step, err)
 		}
 	}
@@ -712,7 +712,7 @@ func runMemTouch(t *testing.T, conf *config.Config) ([]string, error) {
 		if err != nil {
 			t.Fatalf("error creating container: %v", err)
 		}
-		if err := cont.Restore(conf, image, chain[:len(chain)-1], false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		if err := cont.Restore(conf, image, sandbox.RestoreOpts{LayerPaths: chain[:len(chain)-1]}); err != nil {
 			t.Fatalf("error restoring the chain of %d images: %v", len(chain), err)
 		}
 		// mem_touch may stop, if its memory lost writes.

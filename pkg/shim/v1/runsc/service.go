@@ -213,6 +213,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		RestoreImagePath:   restoreImagePath,
 		RestoreDirect:      restore.direct,
 		RestoreBackground:  restore.background,
+		RestorePaused:      restore.paused,
 	})
 	if err != nil {
 		return nil, err

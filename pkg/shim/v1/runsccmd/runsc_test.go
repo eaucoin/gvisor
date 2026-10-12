@@ -164,11 +164,17 @@ func TestRunscRestoreCLI(t *testing.T) {
 				Detach:     true,
 				Direct:     true,
 				Background: true,
+				Paused:     true,
 			},
 			want: []string{
 				"restore", "--bundle=/bundles/app-1", "--image-path=/ckpt",
-				"--detach", "--direct", "--background", "cid-1",
+				"--detach", "--direct", "--background", "--paused", "cid-1",
 			},
+		},
+		{
+			name: "paused",
+			opts: &RestoreOpts{ImagePath: "/ckpt", Detach: true, Paused: true},
+			want: []string{"restore", "--image-path=/ckpt", "--detach", "--paused", "cid-1"},
 		},
 		{
 			name: "no bundle",

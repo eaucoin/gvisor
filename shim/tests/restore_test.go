@@ -289,6 +289,206 @@ func TestRestoreSandbox(t *testing.T) {
 	}
 }
 
+// TestRestorePaused verifies that a pod restored with the paused restore
+// annotation has its containers PAUSED once started, runs nothing until they
+// are resumed, and can be killed whether it is resumed or not. Resumed as the
+// kubelet resumes a pod, its app container only, the pod has every container
+// RUNNING, its sandbox container included. Killed without being resumed, its
+// app container first, as containerd stops a pod, the whole pod ends without
+// anything in it running.
+func TestRestorePaused(t *testing.T) {
+	t.Run("resumed", func(t *testing.T) { testRestorePaused(t, true /* resume */) })
+	t.Run("killed", func(t *testing.T) { testRestorePaused(t, false /* resume */) })
+}
+
+func testRestorePaused(t *testing.T, resume bool) {
+	rootTmp, err := os.MkdirTemp("/tmp", "runsc-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(rootTmp)
+	})
+	containerd := shimutils.NewMockContainerd(t, map[string]any{
+		"root": rootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	markerDir, err := os.MkdirTemp(testutil.TmpDir(), "markers-")
+	if err != nil {
+		t.Fatalf("failed to create marker dir: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(markerDir)
+	})
+
+	sandboxMarker := markerPath(markerDir, "sandbox")
+	sandboxSpec := shimutils.NewSandboxSpec()
+	sandboxSpec.Process.Args = tickerArgs(sandboxMarker)
+	runAsMappedRoot(sandboxSpec)
+	nameContainer(sandboxSpec, "sandbox")
+	sandbox, client := setupSandboxWithSpec(t, containerd, sandboxSpec)
+	opts, err := containerd.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options: %v", err)
+	}
+
+	appMarker := markerPath(markerDir, "app")
+	appSpec := shimutils.NewContainerSpec(sandbox.ID(), tickerArgs(appMarker))
+	runAsMappedRoot(appSpec)
+	nameContainer(appSpec, "app")
+	app, err := shimutils.NewContainer(appSpec, containerd)
+	if err != nil {
+		t.Fatalf("failed to create app container: %v", err)
+	}
+	if err := createAndWaitForContainer(t.Context(), client, app, opts); err != nil {
+		t.Fatalf("failed to create app container: %v", err)
+	}
+	if err := startAndWaitForContainer(t.Context(), client, app.ID(), containerd); err != nil {
+		t.Fatalf("failed to start app container: %v", err)
+	}
+	markers := []string{sandboxMarker, appMarker}
+	for _, marker := range markers {
+		if err := waitForMarker(t.Context(), marker); err != nil {
+			t.Fatalf("container did not start: %v", err)
+		}
+	}
+
+	imagePath, err := os.MkdirTemp(containerd.WorkingDir(), "checkpoint-")
+	if err != nil {
+		t.Fatalf("failed to create checkpoint dir: %v", err)
+	}
+	checkpointReq := &pb.CheckpointRequest{
+		Id:        sandbox.ID(),
+		ImagePath: imagePath,
+	}
+	if err := containerd.GetTTRPCClient(t).Call(t.Context(), "gvisor.task.TaskService", "Checkpoint", checkpointReq, &pb.CheckpointResponse{}); err != nil {
+		t.Fatalf("failed to checkpoint sandbox: %v", err)
+	}
+
+	restoredRootTmp, err := os.MkdirTemp("/tmp", "runsc-restore-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root for restore: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(restoredRootTmp)
+	})
+	restored := shimutils.NewMockContainerdWithSuffix(t, "restore", map[string]any{
+		"root": restoredRootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	if err := restored.StartShim(t, sandbox); err != nil {
+		t.Fatalf("failed to start shim for restore: %v", err)
+	}
+	restoredClient := restored.GetClient(t)
+	restoredOpts, err := restored.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options for restore: %v", err)
+	}
+
+	containers := []*shimutils.Container{sandbox, app}
+	for _, container := range containers {
+		id := container.ID()
+		annotateSpec(t, container.Bundle(), map[string]string{
+			"dev.gvisor.internal.restore.host-image-path": imagePath,
+			"dev.gvisor.internal.restore.paused":          "true",
+		})
+		createReq := &task.CreateTaskRequest{
+			ID:      id,
+			Bundle:  container.Bundle(),
+			Options: restoredOpts,
+		}
+		if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
+			t.Fatalf("failed to create %s from checkpoint: %v", id, err)
+		}
+		if err := startAndWaitForContainer(t.Context(), restoredClient, id, restored); err != nil {
+			t.Fatalf("failed to restore %s: %v", id, err)
+		}
+		if stateResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: id}); err != nil || stateResp.Status != tasktype.Status_PAUSED {
+			t.Fatalf("%s restored paused: State() = %v, %v, want status %v", id, stateResp, err, tasktype.Status_PAUSED)
+		}
+	}
+
+	// The containers write their markers every 100ms when they run.
+	ticks := make([]int, len(markers))
+	for i, marker := range markers {
+		if ticks[i], err = countLines(marker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Second)
+	for i, marker := range markers {
+		if n, err := countLines(marker); err != nil {
+			t.Fatal(err)
+		} else if n != ticks[i] {
+			t.Fatalf("marker %q of a pod restored paused went from %d lines to %d", marker, ticks[i], n)
+		}
+	}
+
+	if !resume {
+		// As containerd stops a pod, SIGKILL its app container first: that
+		// ends the restore, and the whole pod, without anything in it
+		// running.
+		if err := killAndWaitForContainer(t.Context(), restoredClient, app.ID(), restored); err != nil {
+			t.Fatalf("failed to kill and wait for restored app container: %v", err)
+		}
+		if err := testutil.Poll(func() error {
+			stateResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: sandbox.ID()})
+			if err != nil {
+				return err
+			}
+			if stateResp.Status != tasktype.Status_STOPPED {
+				return fmt.Errorf("sandbox status %v, want %v", stateResp.Status, tasktype.Status_STOPPED)
+			}
+			return nil
+		}, 30*time.Second); err != nil {
+			t.Fatalf("sandbox did not end with its app container: %v", err)
+		}
+		time.Sleep(time.Second)
+		for i, marker := range markers {
+			if n, err := countLines(marker); err != nil {
+				t.Fatal(err)
+			} else if n != ticks[i] {
+				t.Errorf("marker %q of a pod restored paused and killed went from %d lines to %d", marker, ticks[i], n)
+			}
+		}
+		return
+	}
+
+	// The kubelet resumes the app container only, which resumes the sandbox:
+	// every container is RUNNING, and resuming again does nothing.
+	for range 2 {
+		if _, err := restoredClient.Resume(t.Context(), &task.ResumeRequest{ID: app.ID()}); err != nil {
+			t.Fatalf("failed to resume %s: %v", app.ID(), err)
+		}
+		for _, container := range containers {
+			id := container.ID()
+			if stateResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: id}); err != nil || stateResp.Status != tasktype.Status_RUNNING {
+				t.Fatalf("%s resumed: State() = %v, %v, want status %v", id, stateResp, err, tasktype.Status_RUNNING)
+			}
+		}
+	}
+	for i, marker := range markers {
+		if err := testutil.Poll(func() error {
+			n, err := countLines(marker)
+			if err != nil {
+				return err
+			}
+			if n <= ticks[i] {
+				return fmt.Errorf("marker %q has %d lines, want more than %d", marker, n, ticks[i])
+			}
+			return nil
+		}, 10*time.Second); err != nil {
+			t.Errorf("container did not run once resumed: %v", err)
+		}
+	}
+
+	if err := killAndWaitForContainer(t.Context(), restoredClient, sandbox.ID(), restored); err != nil {
+		t.Fatalf("failed to kill and wait for restored sandbox: %v", err)
+	}
+}
+
 // TestRestoreAbsentContainer verifies that a container the checkpoint does not
 // hold, as it does not hold a Kubernetes init container that ran to
 // completion before it, is created from it and exits with status 0 once
@@ -633,6 +833,21 @@ func markerPath(dir, name string) string {
 // second time.
 func markerArgs(marker string) []string {
 	return []string{"sh", "-c", fmt.Sprintf("echo started >>%q; exec sleep 10000", marker)}
+}
+
+// tickerArgs returns the process args for a container that appends a line to
+// the marker file every 100ms, for as long as it runs.
+func tickerArgs(marker string) []string {
+	return []string{"sh", "-c", fmt.Sprintf("while true; do echo tick >>%q; sleep 0.1; done", marker)}
+}
+
+// countLines returns the number of lines in a marker file.
+func countLines(marker string) (int, error) {
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		return 0, err
+	}
+	return strings.Count(string(b), "\n"), nil
 }
 
 // waitForMarker waits for a container to write its marker.
