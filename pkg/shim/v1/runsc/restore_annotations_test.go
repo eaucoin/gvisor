@@ -40,8 +40,17 @@ func TestTakeRestoreAnnotations(t *testing.T) {
 				restoreImagePathAnnotation:  "/ckpt",
 				restoreDirectAnnotation:     "true",
 				restoreBackgroundAnnotation: "true",
+				restorePausedAnnotation:     "true",
 			},
-			want: restoreAnnotations{imagePath: "/ckpt", direct: true, background: true},
+			want: restoreAnnotations{imagePath: "/ckpt", direct: true, background: true, paused: true},
+		},
+		{
+			name: "paused",
+			annotations: map[string]string{
+				restoreImagePathAnnotation: "/ckpt",
+				restorePausedAnnotation:    "true",
+			},
+			want: restoreAnnotations{imagePath: "/ckpt", paused: true},
 		},
 		{
 			name:        "image path only",
@@ -66,6 +75,11 @@ func TestTakeRestoreAnnotations(t *testing.T) {
 		{
 			name:        "no image path",
 			annotations: map[string]string{restoreBackgroundAnnotation: "true"},
+			wantErr:     true,
+		},
+		{
+			name:        "paused without image path",
+			annotations: map[string]string{restorePausedAnnotation: "true"},
 			wantErr:     true,
 		},
 	} {
