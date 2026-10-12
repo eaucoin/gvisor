@@ -267,7 +267,7 @@ func restoreContainers(conf *config.Config, specs []*specs.Spec, ids []string, i
 		cu.Add(func() { cont.Destroy() })
 		containers = append(containers, cont)
 
-		if err := cont.Restore(conf, imagePath, nil /* layerPaths */, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		if err := cont.Restore(conf, imagePath, sandbox.RestoreOpts{}); err != nil {
 			return nil, nil, fmt.Errorf("error restoring container: %v", err)
 		}
 
@@ -3220,6 +3220,400 @@ func testMultiContainerCheckpointRestore(t *testing.T, conf *config.Config, comp
 		// Future restores will reuse newIds. It requires the other containers
 		// using those IDs to cease to exist because they share the same identity.
 		cleanup2()
+	}
+}
+
+// pausedSandbox is a sandbox of three containers restored paused: a root
+// container and two subcontainers, of which the first runs an application
+// that appends a number to output every 100ms when it runs.
+type pausedSandbox struct {
+	conf       *config.Config
+	containers []*Container
+	outputPath string
+	output     *os.File
+
+	// lastNum is the last number that the application wrote before the
+	// checkpoint.
+	lastNum int
+}
+
+// restorePausedSandbox starts a sandbox, checkpoints it, and restores it
+// paused into new containers. It checks that the restored containers are
+// Paused, that the sandbox cannot be resumed before all of them are restored,
+// and that the application runs nothing until then.
+func restorePausedSandbox(t *testing.T) *pausedSandbox {
+	t.Helper()
+	conf := testutil.TestConfig(t)
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	t.Cleanup(cleanup)
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	t.Cleanup(func() { outputFile.Close() })
+
+	script := fmt.Sprintf("for ((i=0; ;i++)); do echo $i >> %q; sleep 0.1; done", outputPath)
+	testSpecs, ids := createSpecs(
+		sleepCmd,
+		[]string{"bash", "-c", script},
+		sleepCmd,
+	)
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+
+	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	lastNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+
+	// Restore into new containers with different IDs.
+	newIDs := make([]string, 0, len(ids))
+	for range ids {
+		newIDs = append(newIDs, testutil.RandomContainerID())
+	}
+	for _, spec := range testSpecs[1:] {
+		spec.Annotations[specutils.ContainerdSandboxIDAnnotation] = newIDs[0]
+	}
+
+	// Delete and recreate file before restoring.
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatalf("error removing file")
+	}
+	outputFile2, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	t.Cleanup(func() { outputFile2.Close() })
+
+	var restored []*Container
+	for i, spec := range testSpecs {
+		bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
+		if err != nil {
+			t.Fatalf("error setting up container: %v", err)
+		}
+		t.Cleanup(cleanup)
+		cont, err := New(conf, Args{
+			ID:        newIDs[i],
+			Spec:      spec,
+			BundleDir: bundleDir,
+		})
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+		t.Cleanup(func() { cont.Destroy() })
+		if err := cont.Restore(conf, dir, sandbox.RestoreOpts{Paused: true}); err != nil {
+			t.Fatalf("error restoring container %d: %v", i, err)
+		}
+		restored = append(restored, cont)
+
+		// The sandbox's kernel is restored with its last container.
+		if i == 0 {
+			if err := cont.Resume(); err == nil {
+				t.Errorf("resuming the root container before the others are restored succeeded, want an error")
+			}
+		}
+	}
+	ps := &pausedSandbox{
+		conf:       conf,
+		containers: restored,
+		outputPath: outputPath,
+		output:     outputFile2,
+		lastNum:    lastNum,
+	}
+	ps.checkStatuses(t, Paused, Paused, Paused)
+
+	// The application writes a number every 100ms when it runs.
+	time.Sleep(time.Second)
+	ps.checkNothingRan(t)
+	return ps
+}
+
+// checkStatuses checks the statuses that the sandbox's containers have saved.
+func (ps *pausedSandbox) checkStatuses(t *testing.T, want ...Status) {
+	t.Helper()
+	for i, cont := range ps.containers {
+		loaded, err := Load(ps.conf.RootDir, FullID{SandboxID: cont.Sandbox.ID, ContainerID: cont.ID}, LoadOpts{Exact: true})
+		if err != nil {
+			t.Fatalf("error loading container %d: %v", i, err)
+		}
+		if got := loaded.Status; got != want[i] {
+			t.Errorf("container %d status: got %v, want %v", i, got, want[i])
+		}
+	}
+}
+
+// checkNothingRan checks that the application has written nothing since the
+// restore.
+func (ps *pausedSandbox) checkNothingRan(t *testing.T) {
+	t.Helper()
+	if fi, err := ps.output.Stat(); err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	} else if fi.Size() != 0 {
+		t.Fatalf("sandbox restored paused ran: it wrote %d bytes", fi.Size())
+	}
+}
+
+// TestMultiContainerCheckpointRestorePaused checks that a sandbox restored
+// paused runs nothing until one of its containers is resumed, which resumes
+// the sandbox and leaves none of its containers Paused, and that resuming
+// another then succeeds and does nothing. As the kubelet's resumes of a pod,
+// the resumes leave out the root container, which can then be signalled and
+// destroyed.
+func TestMultiContainerCheckpointRestorePaused(t *testing.T) {
+	ps := restorePausedSandbox(t)
+	restored := ps.containers
+
+	// A subcontainer resumes the sandbox, and every container is Running.
+	if err := restored[1].Resume(); err != nil {
+		t.Fatalf("error resuming container 1: %v", err)
+	}
+	ps.checkStatuses(t, Running, Running, Running)
+	firstNum, err := readOutputNum(ps.outputPath, 0)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	if ps.lastNum+1 != firstNum {
+		t.Errorf("error numbers not in order, previous: %d, next: %d", ps.lastNum, firstNum)
+	}
+
+	// Resuming another container does nothing.
+	if err := restored[2].Resume(); err != nil {
+		t.Fatalf("error resuming container 2: %v", err)
+	}
+	ps.checkStatuses(t, Running, Running, Running)
+
+	// The application still runs.
+	wantNum := firstNum + 5
+	if err := testutil.Poll(func() error {
+		num, err := readOutputNum(ps.outputPath, -1)
+		if err != nil {
+			return &backoff.PermanentError{Err: err}
+		}
+		if num < wantNum {
+			return fmt.Errorf("last number %d, want at least %d", num, wantNum)
+		}
+		return nil
+	}, 10*time.Second); err != nil {
+		t.Errorf("application stopped after the resumes: %v", err)
+	}
+
+	// The root container, never resumed, can be signalled and destroyed.
+	root, err := Load(ps.conf.RootDir, FullID{SandboxID: restored[0].Sandbox.ID, ContainerID: restored[0].ID}, LoadOpts{Exact: true})
+	if err != nil {
+		t.Fatalf("error loading the root container: %v", err)
+	}
+	if err := root.SignalContainer(unix.Signal(0), false); err != nil {
+		t.Errorf("error signalling the root container: %v", err)
+	}
+	if err := root.SignalContainer(unix.SIGKILL, false); err != nil {
+		t.Fatalf("error killing the root container: %v", err)
+	}
+	if _, err := root.Wait(); err != nil {
+		t.Errorf("error waiting for the root container: %v", err)
+	}
+	if err := root.Destroy(); err != nil {
+		t.Errorf("error destroying the root container: %v", err)
+	}
+}
+
+// TestMultiContainerCheckpointRestorePausedKill checks that SIGKILL sent to
+// any container of a sandbox restored paused, never resumed, ends the restore:
+// every container of the sandbox ends, without the application running after
+// the restore.
+func TestMultiContainerCheckpointRestorePausedKill(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// killed is the index of the container killed: 0 for the root
+		// container, 1 for the subcontainer that runs the application, 2
+		// for the other.
+		killed int
+		all    bool
+	}{
+		{name: "root", killed: 0},
+		{name: "root-all", killed: 0, all: true},
+		{name: "subcontainer", killed: 1},
+		{name: "subcontainer-all", killed: 1, all: true},
+		{name: "other-subcontainer", killed: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := restorePausedSandbox(t)
+			// The sandbox process, which the root container's wait reaps.
+			sandboxPid := ps.containers[0].Sandbox.Getpid()
+
+			// Wait for each container, as the shim does from its start.
+			type waitResult struct {
+				ws  unix.WaitStatus
+				err error
+			}
+			waits := make([]chan waitResult, len(ps.containers))
+			for i, cont := range ps.containers {
+				waits[i] = make(chan waitResult, 1)
+				go func() {
+					ws, err := cont.Wait()
+					waits[i] <- waitResult{ws, err}
+				}()
+			}
+			// Let the waits reach the sandbox.
+			time.Sleep(time.Second)
+
+			// Signal a copy of the container, which the wait does not use.
+			killed, err := Load(ps.conf.RootDir, FullID{SandboxID: ps.containers[0].Sandbox.ID, ContainerID: ps.containers[tc.killed].ID}, LoadOpts{Exact: true})
+			if err != nil {
+				t.Fatalf("error loading the container to kill: %v", err)
+			}
+
+			// A signal other than SIGKILL is delivered, and would take effect
+			// once the sandbox runs.
+			if err := killed.SignalContainer(unix.SIGTERM, tc.all); err != nil {
+				t.Fatalf("error sending SIGTERM to a paused container: %v", err)
+			}
+			ps.checkStatuses(t, Paused, Paused, Paused)
+			ps.checkNothingRan(t)
+
+			if err := killed.SignalContainer(unix.SIGKILL, tc.all); err != nil {
+				t.Fatalf("error killing a paused container: %v", err)
+			}
+
+			// Every container ends.
+			for i, wait := range waits {
+				select {
+				case res := <-wait:
+					if res.err != nil {
+						t.Errorf("error waiting for container %d: %v", i, res.err)
+					} else if i != 0 && (!res.ws.Signaled() || res.ws.Signal() != unix.SIGKILL) {
+						t.Errorf("container %d's wait status: got %#x, want killed by SIGKILL", i, int(res.ws))
+					}
+				case <-time.After(30 * time.Second):
+					t.Fatalf("container %d did not end", i)
+				}
+			}
+			if err := blockUntilWaitable(sandboxPid); err != nil && err != unix.ECHILD {
+				t.Errorf("error waiting for the sandbox to exit: %v", err)
+			}
+			ps.checkStatuses(t, Stopped, Stopped, Stopped)
+
+			// The application wrote nothing before it was killed.
+			time.Sleep(time.Second)
+			ps.checkNothingRan(t)
+		})
+	}
+}
+
+// TestMultiContainerPausedKill checks that SIGKILL sent to a Paused container
+// of a sandbox that has run, and was then paused, ends that container, and
+// resumes the sandbox, whose other containers run.
+func TestMultiContainerPausedKill(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "paused-kill-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	script := fmt.Sprintf("for ((i=0; ;i++)); do echo $i >> %q; sleep 0.1; done", outputPath)
+	testSpecs, ids := createSpecs(
+		sleepCmd,
+		sleepCmd,
+		[]string{"bash", "-c", script},
+	)
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+
+	// Pausing a container pauses the sandbox: the application stops.
+	if err := conts[1].Pause(); err != nil {
+		t.Fatalf("error pausing container 1: %v", err)
+	}
+	pausedNum, err := readOutputNum(outputPath, -1)
+	if err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	}
+	time.Sleep(time.Second)
+	if num, err := readOutputNum(outputPath, -1); err != nil {
+		t.Fatalf("error with outputFile: %v", err)
+	} else if num != pausedNum {
+		t.Fatalf("paused sandbox ran: last number went from %d to %d", pausedNum, num)
+	}
+
+	// SIGKILL ends the Paused container.
+	if err := conts[1].SignalContainer(unix.SIGKILL, false); err != nil {
+		t.Fatalf("error killing a paused container: %v", err)
+	}
+	ws, err := conts[1].Wait()
+	if err != nil {
+		t.Fatalf("error waiting for the killed container: %v", err)
+	}
+	if !ws.Signaled() || ws.Signal() != unix.SIGKILL {
+		t.Errorf("killed container's wait status: got %#x, want killed by SIGKILL", int(ws))
+	}
+
+	// The others run.
+	for i, want := range []Status{Running, Stopped, Running} {
+		loaded, err := Load(conf.RootDir, FullID{SandboxID: conts[i].Sandbox.ID, ContainerID: conts[i].ID}, LoadOpts{Exact: true})
+		if err != nil {
+			t.Fatalf("error loading container %d: %v", i, err)
+		}
+		if got := loaded.Status; got != want {
+			t.Errorf("container %d status: got %v, want %v", i, got, want)
+		}
+	}
+	wantNum := pausedNum + 5
+	if err := testutil.Poll(func() error {
+		num, err := readOutputNum(outputPath, -1)
+		if err != nil {
+			return &backoff.PermanentError{Err: err}
+		}
+		if num < wantNum {
+			return fmt.Errorf("last number %d, want at least %d", num, wantNum)
+		}
+		return nil
+	}, 10*time.Second); err != nil {
+		t.Errorf("application did not run once the sandbox was resumed: %v", err)
 	}
 }
 
