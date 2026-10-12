@@ -541,6 +541,14 @@ containers are restored. CRI also wants a runtime to reject the restore options
 it does not know; containerd does not implement `RestorePod` yet, so no such
 options reach the shim, and there is nothing for it to check.
 
+A checkpoint holds the containers its sandbox had when it was taken, and not
+one deleted before, such as a Kubernetes init container that ran to completion.
+A container created from the checkpoint whose name
+(`io.kubernetes.cri.container-name`) the checkpoint does not hold runs nothing:
+it is created, and exits with status 0 once started, without runsc. So a pod
+restores with its init containers completed, as they were when it was
+checkpointed, rather than running them again.
+
 ### Restoring a pod from its annotations
 
 On Kubernetes versions whose CRI has no `RestorePod`, the kubelet never sets
@@ -563,8 +571,8 @@ instead, once containerd passes them to the containers' specs:
 The shim removes these annotations from the specs it passes to runsc, and
 refuses any other annotation with the `dev.gvisor.internal.restore.` prefix.
 The restored pod's spec is validated against the checkpointed one as with any
-restore (see below), so it must have the same containers, names, images and
-commands.
+restore (see below), so the containers that the checkpoint holds must have the
+same names, images and commands.
 
 ## Restore validation
 

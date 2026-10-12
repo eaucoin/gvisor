@@ -702,11 +702,11 @@ func (s *runscService) allProcessesForAllContainers() (o []process.Process) {
 }
 
 func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]uint32, error) {
-	p, err := c.Process("")
+	p, err := c.runscInit()
 	if err != nil {
 		return nil, err
 	}
-	ps, err := p.(*proc.Init).Runtime().Ps(ctx, c.ID)
+	ps, err := p.Runtime().Ps(ctx, c.ID)
 	if err != nil {
 		return nil, err
 	}
