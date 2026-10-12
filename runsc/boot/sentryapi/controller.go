@@ -125,6 +125,14 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// Paused leaves the restored kernel paused, as containerManager.Pause
+	// does, until containerManager.Resume, so that its application runs
+	// nothing before the node is ready for it, such as a pod's network
+	// policy for its new address. Until then, the sandbox has not started:
+	// killing any of its containers ends the restore and every container
+	// (see containerManager.KillPaused).
+	Paused bool `json:"paused"`
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
@@ -152,6 +160,10 @@ const ContMgrPause = "containerManager.Pause"
 
 // ContMgrResume resumes all tasks.
 const ContMgrResume = "containerManager.Resume"
+
+// ContMgrKillPaused sends SIGKILL to a container of a paused sandbox, and
+// resumes the sandbox so that the signal takes effect.
+const ContMgrKillPaused = "containerManager.KillPaused"
 
 // ContMgrWait waits on the init process of the container and returns its
 // ExitStatus.

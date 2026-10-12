@@ -607,8 +607,33 @@ func (d DirectIO) String() string {
 	panic(fmt.Sprintf("invalid direct I/O mode %d", d))
 }
 
+// RestoreOpts contains the options for restoring a sandbox.
+type RestoreOpts struct {
+	// LayerPaths are where to look for the images that are layers of the image
+	// restored from, besides its layers directory (see
+	// checkpointimage.FindLayers).
+	LayerPaths []string
+
+	// DirectIO controls whether the checkpoint pages file is read with
+	// O_DIRECT.
+	DirectIO DirectIO
+
+	// Background lets the checkpoint pages file be read after Restore returns.
+	// It has no effect on a compressed checkpoint.
+	Background bool
+
+	// Paused leaves the restored sandbox paused, as Pause does, until Resume:
+	// its application runs nothing until then. Until then, SIGKILL sent to
+	// any of its containers ends every container of the sandbox.
+	Paused bool
+
+	// NetworkArgs, if not nil, configures the restored network stack instead
+	// of the network that the sandbox's network namespace holds.
+	NetworkArgs *sentryapi.CreateLinksAndRoutesArgs
+}
+
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, layerPaths []string, directIO DirectIO, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, opts RestoreOpts) error {
 	waitRegisteredMetrics := s.fetchRegisteredMetrics()
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
@@ -628,7 +653,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	opt := sentryapi.RestoreOpts{
-		Background:     background,
+		Background:     opts.Background,
+		Paused:         opts.Paused,
 		SplitFSRestore: s.FSRestore,
 	}
 	defer func() {
@@ -636,10 +662,11 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 			_ = f.Close()
 		}
 	}()
+	directIO := opts.DirectIO
 	if directIO == DirectIOAuto && !specutils.NVProxyEnabled(spec, conf) {
 		directIO = DirectIOOff
 	}
-	if err := s.setRestoreOpts(conf, imagePath, layerPaths, directIO, &opt); err != nil {
+	if err := s.setRestoreOpts(conf, imagePath, opts.LayerPaths, directIO, &opt); err != nil {
 		return err
 	}
 
@@ -658,7 +685,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	if networkArgs == nil {
+	if opts.NetworkArgs == nil {
 		var disableIPv6 bool
 		disableIPv6, err = getDisableIPv6(spec)
 		if err != nil {
@@ -672,8 +699,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	} else {
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
-		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+		log.Debugf("Setting up network args, config: %+v", opts.NetworkArgs)
+		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, opts.NetworkArgs, nil); err != nil {
 			return fmt.Errorf("setting network args: %w", err)
 		}
 	}
@@ -2823,6 +2850,28 @@ func (s *Sandbox) Resume(cid string) error {
 	log.Debugf("Resume sandbox %q", s.ID)
 	if err := s.call(sentryapi.ContMgrResume, nil, nil); err != nil {
 		return fmt.Errorf("resuming container %q: %w", cid, err)
+	}
+	return nil
+}
+
+// KillPaused sends SIGKILL to a container of a paused sandbox, to all of its
+// processes if all is true, and resumes the sandbox so that the signal takes
+// effect, without the post-resume work. If cid is the root container, or if
+// the sandbox was restored paused and has not been resumed since, every
+// process of the sandbox is killed.
+func (s *Sandbox) KillPaused(cid string, all bool) error {
+	log.Debugf("Kill paused sandbox %q", s.ID)
+	mode := sentryapi.DeliverToProcess
+	if all {
+		mode = sentryapi.DeliverToAllProcesses
+	}
+	args := sentryapi.SignalArgs{
+		CID:   cid,
+		Signo: int32(unix.SIGKILL),
+		Mode:  mode,
+	}
+	if err := s.call(sentryapi.ContMgrKillPaused, &args, nil); err != nil {
+		return fmt.Errorf("killing paused container %q: %w", cid, err)
 	}
 	return nil
 }
