@@ -54,6 +54,55 @@ runsc restore --image-path=<path> <container id>
 > Note: All top-level runsc flags needed when calling run must be provided to
 > `restore`.
 
+### Restoring paused
+
+With `--paused`, `runsc restore` leaves the restored sandbox paused, as `runsc
+pause` leaves a sandbox: its kernel is restored, and with `--background` its
+memory keeps loading, but its application runs nothing until `runsc resume`.
+`runsc state` reports the container `paused` until then. An orchestrator can so
+finish preparing what the restored application needs before it runs, such as the
+network policy of the sandbox's new address, so that the application never sends
+or answers a packet before it is in place.
+
+```bash
+runsc restore --image-path=<path> --paused <container id>
+# ...
+runsc resume <container id>
+```
+
+Pausing and resuming apply to the whole sandbox. Restore each container of the
+sandbox with `--paused`, so that each reports `paused`: the first `runsc resume`
+of any of them resumes the sandbox, and reports every container of the sandbox
+`running`, including those never resumed, such as a pod's sandbox container.
+Resuming a `running` container then does nothing. The sandbox cannot be resumed
+before all of its containers are restored.
+
+The save/restore exec binary (see
+[Application-Driven Checkpoint/Restore](#application-driven-checkpointrestore))
+runs at the first resume, in its `restore` mode, rather than once the restore
+is done: it runs in the restored application's containers, which run nothing
+before. `runsc resume` returns once it has run, and fails, killing the sandbox,
+if it fails. `runsc wait --restore` does not wait for the resume: it returns
+once the kernel and its memory are restored.
+
+Until the sandbox is resumed:
+
+-   Nothing in it answers, so health checks that run in it or connect to it,
+    such as Kubernetes' liveness and readiness probes, fail. Resume it before
+    they fail too often, or delay them.
+-   The sandbox has not started yet: `SIGKILL` sent to any of its containers
+    with `runsc kill` ends the restore, and every container of the sandbox,
+    without anything in it running, not even the save/restore exec binary.
+    Containerd stops a pod by killing its app containers before its sandbox
+    container, and none of them runs meanwhile. A signal other than `SIGKILL`
+    takes effect once the sandbox is resumed.
+
+Once a sandbox has run, a signal that `runsc kill` sends to one of its
+containers while it is paused takes effect once it is resumed, except
+`SIGKILL`, which resumes the sandbox so that the processes that it kills die
+without running anything more. The sandbox's other containers then run.
+`SIGKILL` sent to the root container ends every container of the sandbox.
+
 ## Optimizations
 
 gVisor supports several performance optimizations during checkpoint and restore.
@@ -567,6 +616,17 @@ instead, once containerd passes them to the containers' specs:
 -   `dev.gvisor.internal.restore.direct`: `true` restores with `--direct`.
 -   `dev.gvisor.internal.restore.background`: `true` restores with
     `--background`.
+-   `dev.gvisor.internal.restore.paused`: `true` restores with `--paused` (see
+    [Restoring paused](#restoring-paused)). The pod's containers are `PAUSED`
+    once started, and its sandbox runs nothing until one of them is resumed
+    through the task service's `Resume` (`ctr task resume`), which resumes them
+    all; resuming the others then does nothing. The kubelet never resumes
+    them: something else must, such as a node agent that does once the pod's
+    network policy is programmed for its new address. If containerd restarts
+    while a task is paused, CRI reports its container's state as unknown.
+    Stopping or deleting a pod that was never resumed ends the whole pod at
+    the first `SIGKILL` of any of its containers, without anything in it
+    running, as [Restoring paused](#restoring-paused) describes.
 
 The shim removes these annotations from the specs it passes to runsc, and
 refuses any other annotation with the `dev.gvisor.internal.restore.` prefix.
