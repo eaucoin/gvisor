@@ -289,6 +289,174 @@ func TestRestoreSandbox(t *testing.T) {
 	}
 }
 
+// TestRestoreAbsentContainer verifies that a container the checkpoint does not
+// hold, as it does not hold a Kubernetes init container that ran to
+// completion before it, is created from it and exits with status 0 once
+// started, without running again, while the containers it holds are restored
+// around it.
+func TestRestoreAbsentContainer(t *testing.T) {
+	rootTmp, err := os.MkdirTemp("/tmp", "runsc-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(rootTmp)
+	})
+	containerd := shimutils.NewMockContainerd(t, map[string]any{
+		"root": rootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	markerDir, err := os.MkdirTemp(testutil.TmpDir(), "markers-")
+	if err != nil {
+		t.Fatalf("failed to create marker dir: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(markerDir)
+	})
+
+	sandboxMarker := markerPath(markerDir, "sandbox")
+	sandboxSpec := shimutils.NewSandboxSpec()
+	sandboxSpec.Process.Args = markerArgs(sandboxMarker)
+	runAsMappedRoot(sandboxSpec)
+	nameContainer(sandboxSpec, "sandbox")
+	sandbox, client := setupSandboxWithSpec(t, containerd, sandboxSpec)
+	opts, err := containerd.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options: %v", err)
+	}
+
+	// The init container runs to completion, and is deleted, as containerd
+	// deletes a container's task once it exits.
+	initMarker := markerPath(markerDir, "init")
+	initSpec := shimutils.NewContainerSpec(sandbox.ID(), []string{"sh", "-c", fmt.Sprintf("echo started >>%q", initMarker)})
+	runAsMappedRoot(initSpec)
+	nameContainer(initSpec, "init")
+	initContainer, err := shimutils.NewContainer(initSpec, containerd)
+	if err != nil {
+		t.Fatalf("failed to create init container: %v", err)
+	}
+	if err := createAndWaitForContainer(t.Context(), client, initContainer, opts); err != nil {
+		t.Fatalf("failed to create init container: %v", err)
+	}
+	if err := startAndWaitForContainer(t.Context(), client, initContainer.ID(), containerd); err != nil {
+		t.Fatalf("failed to start init container: %v", err)
+	}
+	if waitResp, err := client.Wait(t.Context(), &task.WaitRequest{ID: initContainer.ID()}); err != nil || waitResp.ExitStatus != 0 {
+		t.Fatalf("init container: Wait() = %v, %v, want exit status 0", waitResp, err)
+	}
+	if _, err := client.Delete(t.Context(), &task.DeleteRequest{ID: initContainer.ID()}); err != nil {
+		// runsc destroys the container in the sandbox before the cgroup
+		// cleanup that a rootless environment refuses.
+		if !strings.Contains(err.Error(), "operation not permitted") {
+			t.Fatalf("failed to delete init container: %v", err)
+		}
+		t.Logf("Ignoring expected delete error in rootless environment: %v", err)
+	}
+
+	appMarker := markerPath(markerDir, "app")
+	appSpec := shimutils.NewContainerSpec(sandbox.ID(), markerArgs(appMarker))
+	runAsMappedRoot(appSpec)
+	nameContainer(appSpec, "app")
+	app, err := shimutils.NewContainer(appSpec, containerd)
+	if err != nil {
+		t.Fatalf("failed to create app container: %v", err)
+	}
+	if err := createAndWaitForContainer(t.Context(), client, app, opts); err != nil {
+		t.Fatalf("failed to create app container: %v", err)
+	}
+	if err := startAndWaitForContainer(t.Context(), client, app.ID(), containerd); err != nil {
+		t.Fatalf("failed to start app container: %v", err)
+	}
+	for _, marker := range []string{sandboxMarker, appMarker} {
+		if err := waitForMarker(t.Context(), marker); err != nil {
+			t.Fatalf("container did not start: %v", err)
+		}
+	}
+
+	imagePath, err := os.MkdirTemp(containerd.WorkingDir(), "checkpoint-")
+	if err != nil {
+		t.Fatalf("failed to create checkpoint dir: %v", err)
+	}
+	checkpointReq := &pb.CheckpointRequest{
+		Id:        sandbox.ID(),
+		ImagePath: imagePath,
+	}
+	if err := containerd.GetTTRPCClient(t).Call(t.Context(), "gvisor.task.TaskService", "Checkpoint", checkpointReq, &pb.CheckpointResponse{}); err != nil {
+		t.Fatalf("failed to checkpoint sandbox: %v", err)
+	}
+
+	restoredRootTmp, err := os.MkdirTemp("/tmp", "runsc-restore-root-")
+	if err != nil {
+		t.Fatalf("failed to create temp root for restore: %v", err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(restoredRootTmp)
+	})
+	restored := shimutils.NewMockContainerdWithSuffix(t, "restore", map[string]any{
+		"root": restoredRootTmp,
+	}, map[string]any{
+		"ignore-cgroups": "true",
+	})
+	if err := restored.StartShim(t, sandbox); err != nil {
+		t.Fatalf("failed to start shim for restore: %v", err)
+	}
+	restoredClient := restored.GetClient(t)
+	restoredOpts, err := restored.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options for restore: %v", err)
+	}
+
+	// In the order the kubelet runs a pod's containers: the init container
+	// between the root container and the app container.
+	for _, tc := range []struct {
+		container *shimutils.Container
+		marker    string
+	}{
+		{container: sandbox, marker: sandboxMarker},
+		{container: initContainer, marker: initMarker},
+		{container: app, marker: appMarker},
+	} {
+		id := tc.container.ID()
+		createReq := &task.CreateTaskRequest{
+			ID:         id,
+			Bundle:     tc.container.Bundle(),
+			Options:    restoredOpts,
+			Checkpoint: imagePath,
+		}
+		if _, err := restoredClient.Create(t.Context(), createReq); err != nil {
+			t.Fatalf("failed to create %s from checkpoint: %v", id, err)
+		}
+		if stateResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: id}); err != nil || stateResp.Status != tasktype.Status_CREATED {
+			t.Fatalf("%s created from checkpoint: State() = %v, %v, want status %v", id, stateResp, err, tasktype.Status_CREATED)
+		}
+		if err := startAndWaitForContainer(t.Context(), restoredClient, id, restored); err != nil {
+			t.Fatalf("failed to start %s: %v", id, err)
+		}
+		want := tasktype.Status_RUNNING
+		if tc.container == initContainer {
+			waitResp, err := restoredClient.Wait(t.Context(), &task.WaitRequest{ID: id})
+			if err != nil || waitResp.ExitStatus != 0 {
+				t.Fatalf("%s absent from the checkpoint: Wait() = %v, %v, want exit status 0", id, waitResp, err)
+			}
+			want = tasktype.Status_STOPPED
+		}
+		if stateResp, err := restoredClient.State(t.Context(), &task.StateRequest{ID: id}); err != nil || stateResp.Status != want {
+			t.Fatalf("%s after its start: State() = %v, %v, want status %v", id, stateResp, err, want)
+		}
+		if err := checkMarker(tc.marker); err != nil {
+			t.Errorf("container %s ran again: %v", id, err)
+		}
+	}
+	if _, err := restoredClient.Delete(t.Context(), &task.DeleteRequest{ID: initContainer.ID()}); err != nil {
+		t.Errorf("failed to delete %s absent from the checkpoint: %v", initContainer.ID(), err)
+	}
+
+	if err := killAndWaitForContainer(t.Context(), restoredClient, sandbox.ID(), restored); err != nil {
+		t.Fatalf("failed to kill and wait for restored sandbox: %v", err)
+	}
+}
+
 // TestRestoreSubcontainerBeforeRoot verifies that restoring a subcontainer
 // before the root container fails with an error naming the sandbox state.
 func TestRestoreSubcontainerBeforeRoot(t *testing.T) {
