@@ -61,8 +61,13 @@ type Container struct {
 	// Bundle path
 	Bundle string
 
-	// task is the main process that is running the container.
+	// task is the main process that is running the container, unless the
+	// container is absent from the checkpoint it was created from.
 	task *proc.Init
+
+	// absent is the main process of a container absent from the checkpoint it
+	// was created from, which runs nothing; task is nil then.
+	absent *absentProcess
 
 	// processes maps ExecId to processes running through exec.
 	//
@@ -102,7 +107,8 @@ type ContainerConfig struct {
 	// runsc pairs a container with its state in the image by the name
 	// annotation on the container's spec. Containers whose spec carries no name
 	// are matched by creation order instead, so an unnamed set must be restored
-	// in the order it was created.
+	// in the order it was created. A named container that the image does not
+	// hold runs nothing: it exits with status 0 once started (absentProcess).
 	RestoreImagePath string
 
 	// RestoreDirect and RestoreBackground restore with --direct and
@@ -195,6 +201,27 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		return nil, err
 	}
 
+	if conf.RestoreImagePath != "" {
+		held, err := checkpointHolds(conf.RestoreImagePath, conf.Bundle)
+		if err != nil {
+			return nil, err
+		}
+		if !held {
+			log.L.Infof("Container %s is not in checkpoint %q, and runs nothing", conf.ID, conf.RestoreImagePath)
+			return &Container{
+				ID:     conf.ID,
+				Bundle: conf.Bundle,
+				absent: newAbsentProcess(conf.ID, stdio.Stdio{
+					Stdin:    conf.Stdin,
+					Stdout:   conf.Stdout,
+					Stderr:   conf.Stderr,
+					Terminal: conf.Terminal,
+				}),
+				processes: make(map[string]extension.Process),
+			}, nil
+		}
+	}
+
 	// Convert from types.Mount to proc.Mount.
 	var mounts []proc.Mount
 	for _, m := range conf.Rootfs {
@@ -274,9 +301,26 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 
 // Pid of the main process of a container
 func (c *Container) Pid() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.task.Pid()
+	return c.init().Pid()
+}
+
+// init returns the main process of the container.
+func (c *Container) init() extension.Process {
+	if c.absent != nil {
+		return c.absent
+	}
+	return c.task
+}
+
+// runscInit returns the main process of the container that runsc runs.
+func (c *Container) runscInit() (*proc.Init, error) {
+	if c.absent != nil {
+		return nil, fmt.Errorf("container %s is not in the checkpoint it was created from, and runs nothing: %w", c.ID, errdefs.ErrFailedPrecondition)
+	}
+	if c.task == nil {
+		return nil, fmt.Errorf("container must be created: %w", errdefs.ErrFailedPrecondition)
+	}
+	return c.task, nil
 }
 
 // All processes in the container.
@@ -288,8 +332,8 @@ func (c *Container) All() []extension.Process {
 	for _, p := range c.processes {
 		o = append(o, p)
 	}
-	if c.task != nil {
-		o = append(o, c.task)
+	if c.task != nil || c.absent != nil {
+		o = append(o, c.init())
 	}
 	return o
 }
@@ -312,10 +356,10 @@ func (c *Container) Process(id string) (extension.Process, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if id == "" {
-		if c.task == nil {
+		if c.task == nil && c.absent == nil {
 			return nil, fmt.Errorf("container must be created: %w", errdefs.ErrFailedPrecondition)
 		}
-		return c.task, nil
+		return c.init(), nil
 	}
 	p, ok := c.processes[id]
 	if !ok {
@@ -472,11 +516,11 @@ func (c *Container) Update(ctx context.Context, r *task.UpdateTaskRequest) error
 	if r.Resources == nil {
 		return fmt.Errorf("resources are required: %w", errdefs.ErrInvalidArgument)
 	}
-	p, err := c.Process("")
+	p, err := c.runscInit()
 	if err != nil {
 		return err
 	}
-	return p.(*proc.Init).Update(ctx, r.Resources)
+	return p.Update(ctx, r.Resources)
 }
 
 // Restore a process in the container.
@@ -495,20 +539,20 @@ func (c *Container) Restore(ctx context.Context, r *extension.RestoreRequest) (e
 
 // CheckpointSandbox checkpoints the sandbox.
 func (c *Container) CheckpointSandbox(ctx context.Context, opts *runsccmd.CheckpointOpts) error {
-	p, err := c.Process("")
+	p, err := c.runscInit()
 	if err != nil {
 		return err
 	}
-	return p.(*proc.Init).CheckpointSandbox(ctx, opts)
+	return p.CheckpointSandbox(ctx, opts)
 }
 
 // Stats returns the stats for the container.
 func (c *Container) Stats(ctx context.Context) (*task.StatsResponse, error) {
-	p, err := c.Process("")
+	p, err := c.runscInit()
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
-	stats, err := p.(*proc.Init).Stats(ctx, c.ID)
+	stats, err := p.Stats(ctx, c.ID)
 	if err != nil {
 		log.L.Debugf("Stats error, id: %s: %v", c.ID, err)
 		return nil, err

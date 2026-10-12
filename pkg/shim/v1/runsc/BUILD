@@ -8,6 +8,7 @@ package(
 go_library(
     name = "runsc",
     srcs = [
+        "absent.go",
         "api.go",
         "container.go",
         "debug.go",
@@ -23,6 +24,7 @@ go_library(
     visibility = ["//pkg/shim:__subpackages__"],
     deps = [
         "//pkg/cleanup",
+        "//pkg/sentry/state/checkpointfiles",
         "//pkg/shim/v1/extension",
         "//pkg/shim/v1/proc",
         "//pkg/shim/v1/runsccmd",
@@ -30,6 +32,7 @@ go_library(
         "//pkg/shim/v1/taskserver",
         "//pkg/shim/v1/taskserver:task_server_go_proto",
         "//pkg/shim/v1/utils",
+        "//pkg/state/statefile",
         "//runsc/specutils",
         "@com_github_burntsushi_toml//:go_default_library",
         "@com_github_containerd_cgroups_v3//:go_default_library",
@@ -71,6 +74,7 @@ go_library(
 go_test(
     name = "runsc_test",
     srcs = [
+        "absent_test.go",
         "debug_test.go",
         "epoll_test.go",
         "oom_v2_test.go",
@@ -80,9 +84,11 @@ go_test(
     ],
     library = ":runsc",
     deps = [
+        "//pkg/sentry/state/checkpointfiles",
         "//pkg/shim/v1/proc",
         "//pkg/shim/v1/runsccmd",
         "//pkg/shim/v1/utils",
+        "//pkg/state/statefile",
         "//runsc/specutils",
         "@com_github_containerd_cgroups_v3//cgroup1:go_default_library",
         "@com_github_containerd_cgroups_v3//cgroup2:go_default_library",
