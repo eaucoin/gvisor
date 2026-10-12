@@ -27,6 +27,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/control/server"
@@ -96,6 +97,10 @@ const (
 
 	// ContMgrResume resumes all tasks.
 	ContMgrResume = "containerManager.Resume"
+
+	// ContMgrKillPaused sends SIGKILL to a container of a paused sandbox, and
+	// resumes the sandbox so that the signal takes effect.
+	ContMgrKillPaused = "containerManager.KillPaused"
 
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
@@ -294,6 +299,23 @@ type containerManager struct {
 	// restorer is set when the sandbox in being restored. It stores the state
 	// of all containers and perform all actions required by restore.
 	restorer *restorer
+
+	// pauseMu serializes pausing and resuming the kernel.
+	pauseMu sync.Mutex
+
+	// paused is true if the kernel is paused by Pause, or was restored
+	// paused, and has not been resumed since. The kernel's own pause count
+	// cannot tell: an operation such as a checkpoint, or a signal to all of
+	// a container's processes, pauses it for its own duration.
+	//
+	// +checklocks:pauseMu
+	paused bool
+
+	// postRestorePending is true if the kernel was restored paused and has
+	// not been resumed since: its first resume does the post-restore work.
+	//
+	// +checklocks:pauseMu
+	postRestorePending bool
 }
 
 // StartRoot will start the root container process.
@@ -572,6 +594,14 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// Paused leaves the restored kernel paused, as containerManager.Pause
+	// does, until containerManager.Resume, so that its application runs
+	// nothing before the node is ready for it, such as a pod's network
+	// policy for its new address. Until then, the sandbox has not started:
+	// killing any of its containers ends the restore and every container
+	// (see containerManager.KillPaused).
+	Paused bool `json:"paused"`
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
@@ -643,6 +673,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	cm.restorer = &restorer{
 		cm:         cm,
 		background: o.Background,
+		paused:     o.Paused,
 		timer:      timer,
 	}
 
@@ -999,16 +1030,108 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 	return nil
 }
 
-// Pause pauses all tasks, blocking until they are stopped.
+// Pause pauses all tasks, blocking until they are stopped. It does nothing if
+// they are paused already: pausing and resuming apply to the whole sandbox,
+// and a sandbox is paused or not, however many of its containers were paused.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	if cm.paused {
+		return nil
+	}
 	cm.l.k.Pause()
+	cm.paused = true
 	return nil
 }
 
-// Resume resumes all tasks.
+// pauseRestored pauses the restored kernel before it starts, so that its
+// tasks start stopped, and leaves the post-restore work to Resume.
+func (cm *containerManager) pauseRestored() {
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	cm.l.k.Pause()
+	cm.paused = true
+	cm.postRestorePending = true
+}
+
+// Resume resumes all tasks. It does nothing if they are not paused: pausing
+// and resuming apply to the whole sandbox, and each container of a sandbox
+// restored paused is resumed, the first of them resuming the sandbox.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
+	if _, err := cm.resumableSandbox(); err != nil {
+		return err
+	}
+
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	if !cm.paused {
+		return nil
+	}
 	cm.l.k.Unpause()
+	cm.paused = false
+	if cm.postRestorePending {
+		cm.postRestorePending = false
+		return postRestoreResumed(cm.l.k)
+	}
 	return control.PostResume(cm.l.k, nil)
+}
+
+// KillPaused sends SIGKILL to a container, as Signal does, and then resumes
+// the sandbox if it is paused, so that the signal takes effect: a task handles
+// a pending SIGKILL before it returns to the application, so the processes
+// killed run nothing more.
+//
+// Every task of the sandbox is killed instead, so that nothing in the sandbox
+// runs before it ends, if the container is the root container, whose exit
+// ends the sandbox, or if the sandbox was restored paused and has not been
+// resumed since: it has not started yet, and killing any of its containers
+// abandons the restore. Its application runs nothing, not even the containers
+// not killed, which would run before the node is ready for them (see
+// RestoreOpts.Paused).
+//
+// The resume does no post-resume work: it runs the save/restore exec hook in
+// the application, which is being killed. If the sandbox's other containers
+// go on running, they do without it.
+func (cm *containerManager) KillPaused(args *SignalArgs, _ *struct{}) error {
+	log.Debugf("containerManager.KillPaused: cid: %s, mode: %v", args.CID, args.Mode)
+	if args.Signo != int32(linux.SIGKILL) {
+		return fmt.Errorf("KillPaused sends only SIGKILL, not signal %d", args.Signo)
+	}
+	sandboxID, err := cm.resumableSandbox()
+	if err != nil {
+		return err
+	}
+
+	cm.pauseMu.Lock()
+	defer cm.pauseMu.Unlock()
+	if cm.postRestorePending || (args.CID == sandboxID && args.PID == 0) {
+		// Validate the container as Signal does before killing everything.
+		if _, err := cm.l.threadGroupFromID(execID{cid: args.CID}); err != nil {
+			return err
+		}
+		cm.l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	} else if err := cm.l.signal(args.CID, args.PID, args.Signo, args.Mode); err != nil {
+		return err
+	}
+	if !cm.paused {
+		return nil
+	}
+	cm.l.k.Unpause()
+	cm.paused = false
+	cm.postRestorePending = false
+	return nil
+}
+
+// resumableSandbox returns the sandbox's ID, or an error if its kernel cannot
+// be resumed: until all of its containers are restored, the kernel is the one
+// that the restore replaces, which Restore paused.
+func (cm *containerManager) resumableSandbox() (string, error) {
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if cm.l.state == restoringUnstarted {
+		return "", fmt.Errorf("cannot resume a sandbox before all of its containers are restored: state=%s", cm.l.state)
+	}
+	return cm.l.sandboxID, nil
 }
 
 // Wait waits for the init process in the given container.
