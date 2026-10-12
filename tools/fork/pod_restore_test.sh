@@ -16,13 +16,15 @@
 
 # pod_restore_test.sh checks runsc and its containerd shim in Kubernetes: a
 # one-node k3s cluster, in a Docker container, runs a pod that counts in its
-# memory under runsc; the pod's sandbox is checkpointed through containerd's
-# task service (the shim's Checkpoint), once leaving it running and once
-# stopping it, and restored into new pods by the restore annotations
-# (g3doc/user_guide/checkpoint_restore.md), in the background:
+# memory under runsc, once its init container has run; the pod's sandbox is
+# checkpointed through containerd's task service (the shim's Checkpoint), once
+# leaving it running and once stopping it, and restored into new pods by the
+# restore annotations (g3doc/user_guide/checkpoint_restore.md), in the
+# background:
 #
 #   - a clone of the running pod, and the stopped pod in a new pod, must count
-#     on from their checkpointed state;
+#     on from their checkpointed state, their init container completed without
+#     running again: the checkpoint does not hold it;
 #   - so must the stopped pod restored with another memory limit (the kubelet
 #     derives the process's OOM score adjustment from it);
 #   - a pod whose checkpoint does not exist must fail, not start afresh.
@@ -146,10 +148,10 @@ until on_node kubectl -n "${NS}" get serviceaccount default >/dev/null 2>&1; do
 done
 echo "Node ready: $(on_node k3s --version | head -n 1); $(on_node /opt/gvisor/runsc --version | head -n 1)."
 
-# pod NAME MEMORY [CHECKPOINT] applies a pod that runs the workload, restored
-# from the checkpoint at CHECKPOINT on the node if given. A restored pod repeats the
-# spec of the pod it was checkpointed from (runsc validates it), but for the
-# memory limit.
+# pod NAME MEMORY [CHECKPOINT] applies a pod that runs the workload once its
+# init container has run, restored from the checkpoint at CHECKPOINT on the
+# node if given. A restored pod repeats the spec of the pod it was checkpointed
+# from (runsc validates it), but for the memory limit.
 pod() {
   local -r name="$1" memory="$2" checkpoint="${3:-}"
   local annotations=""
@@ -172,6 +174,11 @@ spec:
   automountServiceAccountToken: false
   enableServiceLinks: false
   terminationGracePeriodSeconds: 0
+  initContainers:
+    - name: init
+      image: ${IMAGE}
+      command:
+        - "true"
   containers:
     - name: counter
       image: ${IMAGE}
@@ -201,6 +208,34 @@ running() {
   done
   ms=$(( ($(date +%s%N) - start) / 1000000 ))
   printf '%d.%03d\n' $(( ms / 1000 )) $(( ms % 1000 ))
+}
+
+# init_completed NAME RUNSC checks that the init container of pod NAME exited
+# with status 0, and that runsc ran it if RUNSC is "ran", or never did if it is
+# "skipped", as in a pod restored from a checkpoint that does not hold it:
+# runsc logs each command it runs, with its arguments, under its sandbox's ID.
+init_completed() {
+  local -r name="$1" want="$2"
+  local status sandbox id got=skipped
+  status="$(on_node kubectl -n "${NS}" get pod "${name}" \
+    -o 'jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}')"
+  if [[ "${status}" != 0 ]]; then
+    echo "pod ${name}'s init container did not exit with status 0: ${status:-it did not exit}" >&2
+    return 1
+  fi
+  sandbox="$(sandbox_id "${name}")"
+  id="$(on_node crictl ps --all --quiet --pod "${sandbox}" --name '^init$')"
+  if [[ -z "${id}" ]]; then
+    echo "pod ${name} has no init container" >&2
+    return 1
+  fi
+  if on_node grep -rqF "${id}" "/var/log/runsc/${sandbox}"; then
+    got=ran
+  fi
+  if [[ "${got}" != "${want}" ]]; then
+    echo "pod ${name}'s init container was ${got} by runsc, want ${want}" >&2
+    return 1
+  fi
 }
 
 # pod_exec NAME COMMAND... runs COMMAND in pod NAME.
@@ -256,6 +291,7 @@ restored() {
 on_node mkdir -p /checkpoints
 pod source 256Mi
 echo "Source pod running after $(running source) s."
+init_completed source ran
 counting source
 
 # A checkpoint that leaves the sandbox running, restored into a clone.
@@ -263,6 +299,7 @@ before="$(pod_exec source cat /count)"
 on_node ctr --namespace k8s.io task checkpoint --image-path /checkpoints/live "$(sandbox_id source)"
 pod clone 256Mi /checkpoints/live
 echo "Clone running after $(running clone) s."
+init_completed clone skipped
 restored clone "${before}"
 pod_exec source cat /count >/dev/null
 on_node kubectl -n "${NS}" delete pod clone --grace-period=0 --force >/dev/null 2>&1
@@ -273,10 +310,12 @@ before="$(pod_exec source cat /count)"
 on_node ctr --namespace k8s.io task checkpoint --exit --image-path /checkpoints/exit "$(sandbox_id source)"
 pod restored 256Mi /checkpoints/exit
 echo "Restored pod running after $(running restored) s."
+init_completed restored skipped
 restored restored "${before}"
 on_node kubectl -n "${NS}" delete pod restored --grace-period=0 --force >/dev/null 2>&1
 pod resized 512Mi /checkpoints/exit
 echo "Pod with a new memory limit running after $(running resized) s."
+init_completed resized skipped
 restored resized "${before}"
 
 # A checkpoint that does not exist: the pod must not start.
