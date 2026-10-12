@@ -2632,6 +2632,23 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	return l.containerSpecs
 }
 
+// checkpointContainerSpecs returns the specs of the containers that a
+// checkpoint of the sandbox holds, by name: those that have not been
+// destroyed. containerSpecs also keeps the spec of a destroyed container, such
+// as a Kubernetes init container that ran to completion, which the kernel no
+// longer has.
+func (l *Loader) checkpointContainerSpecs() map[string]*specs.Spec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	containerSpecs := make(map[string]*specs.Spec)
+	for name, cid := range l.containerIDs {
+		if _, ok := l.processes[execID{cid: cid}]; ok {
+			containerSpecs[name] = l.containerSpecs[name]
+		}
+	}
+	return containerSpecs
+}
+
 // signalUnkillablePolicy maps the runsc config signal-unkillable policy
 // to the corresponding kernel policy.
 func signalUnkillablePolicy(p config.SignalUnkillablePolicy) kernel.SignalUnkillablePolicy {
