@@ -1067,12 +1067,15 @@ func (cm *containerManager) Resume(_, _ *struct{}) error {
 	if !cm.paused {
 		return nil
 	}
-	cm.l.k.Unpause()
 	cm.paused = false
 	if cm.postRestorePending {
+		// The application of a kernel restored paused runs from now on.
 		cm.postRestorePending = false
+		cm.l.startWorkingSetRecording()
+		cm.l.k.Unpause()
 		return postRestoreResumed(cm.l.k)
 	}
+	cm.l.k.Unpause()
 	return control.PostResume(cm.l.k, nil)
 }
 

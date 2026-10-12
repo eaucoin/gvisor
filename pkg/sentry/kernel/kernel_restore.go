@@ -288,9 +288,11 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 	if err := checkpointimage.ValidateImage(opts.Image); err != nil {
 		return err
 	}
+	opts.WorkingSet = true
 	if err := k.mf.LoadFrom(ctx, r, &opts); err != nil {
 		return fmt.Errorf("failed to load main MemoryFile %p: %w", k.mf, err)
 	}
+	opts.WorkingSet = false
 	if err := loadPrivateMemoryFiles(ctx, r, pgalloc.MemoryFileMapFromContext(ctx), FSCheckpointedMemoryFilesFromContext(ctx), &opts); err != nil {
 		return fmt.Errorf("failed to load private MemoryFiles: %w", err)
 	}
@@ -363,6 +365,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, page
 		Image:      image.Proto,
 		PagesFiles: make([]*pgalloc.AsyncPagesFileLoad, len(pagesFiles)),
 		Timeline:   timeline,
+		WorkingSet: true,
 	}
 	for i, pagesFile := range pagesFiles {
 		mfl.loadWg.Add(1)
@@ -391,6 +394,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, page
 	ctx := context.Background()
 	records := image.MemoryFileRecords()
 	err := mainMF.LoadFrom(ctx, records, &opts)
+	opts.WorkingSet = false
 	mfl.metadataErr = err
 	mfl.mainMetadataErr = err
 	mfl.mainMFStartWg.Done()
