@@ -48,6 +48,12 @@ const (
 	// restoreBackgroundAnnotation, if "true", restores with `runsc restore
 	// --background`, as the restore_background option does.
 	restoreBackgroundAnnotation = restoreAnnotationPrefix + "background"
+
+	// restorePausedAnnotation, if "true", restores with `runsc restore
+	// --paused`: the container is PAUSED once started, until resumed. The
+	// whole pod's sandbox runs nothing until one of its containers is resumed,
+	// so set it on all of them, and resume each.
+	restorePausedAnnotation = restoreAnnotationPrefix + "paused"
 )
 
 // restoreAnnotations is the restore that a container's spec annotations
@@ -56,6 +62,7 @@ type restoreAnnotations struct {
 	imagePath  string
 	direct     bool
 	background bool
+	paused     bool
 }
 
 // takeRestoreAnnotations returns the restore that the annotations of the
@@ -80,6 +87,8 @@ func takeRestoreAnnotations(bundle string) (restoreAnnotations, error) {
 			r.direct, err = strconv.ParseBool(value)
 		case restoreBackgroundAnnotation:
 			r.background, err = strconv.ParseBool(value)
+		case restorePausedAnnotation:
+			r.paused, err = strconv.ParseBool(value)
 		default:
 			err = errdefs.ErrInvalidArgument
 		}
@@ -91,7 +100,7 @@ func takeRestoreAnnotations(bundle string) (restoreAnnotations, error) {
 	if !found {
 		return r, nil
 	}
-	if r.imagePath == "" && (r.direct || r.background) {
+	if r.imagePath == "" && (r.direct || r.background || r.paused) {
 		return r, fmt.Errorf("restore annotations without %s: %w", restoreImagePathAnnotation, errdefs.ErrInvalidArgument)
 	}
 	if err := utils.WriteSpec(bundle, spec); err != nil {
