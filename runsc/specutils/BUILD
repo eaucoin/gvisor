@@ -52,3 +52,14 @@ go_test(
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )
+
+go_test(
+    name = "namespace_test",
+    size = "small",
+    srcs = ["namespace_test.go"],
+    library = ":specutils",
+    deps = [
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
