@@ -53,11 +53,13 @@ func nsCloneFlag(nst specs.LinuxNamespaceType) uintptr {
 	}
 }
 
-// nsPath returns the path of the namespace for the current process and the
-// given namespace.
+// nsPath returns the path of the namespace of the given type for the calling
+// thread.
 func nsPath(nst specs.LinuxNamespaceType) string {
 	// LINT.IfChange
-	base := "/proc/self/ns"
+	// Not /proc/self/ns, which holds the namespaces of the thread group
+	// leader: setns(2) acts on the calling thread, which may be in others.
+	base := "/proc/thread-self/ns"
 	switch nst {
 	case specs.CgroupNamespace:
 		return filepath.Join(base, "cgroup")
@@ -115,7 +117,7 @@ func ApplyNS(ns specs.LinuxNamespace) (func() error, error) {
 	}
 	defer newNS.Close()
 
-	// Store current namespace to restore back.
+	// Store the current thread's namespace to restore back.
 	curPath := nsPath(ns.Type)
 	oldNS, err := os.Open(curPath)
 	if err != nil {
