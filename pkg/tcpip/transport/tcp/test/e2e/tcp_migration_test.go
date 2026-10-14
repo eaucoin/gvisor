@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -176,6 +177,81 @@ func TestTCPMigration(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestTCPMigrationDisabledRestoredSendsNothing checks that a stack saved and
+// restored with live TCP migration disabled sends nothing over TCP of a
+// connection it had, whatever timers the connection had armed and however the
+// restored stack is configured: the connection is ended as it is saved, and
+// none is restored. A sandbox restored paused relies on it, as its network
+// stack runs while its application does not.
+func TestTCPMigrationDisabledRestoredSendsNothing(t *testing.T) {
+	c := testcontext.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+
+	c.Stack().SetAllowLiveTCPMigration(false)
+	c.Stack().SetRemoveConf(true)
+	c.CreateConnected(testcontext.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+	// Arm its timers: keepalive, and the retransmission of data its peer does
+	// not acknowledge.
+	c.EP.SocketOptions().SetKeepAlive(true)
+	var r bytes.Reader
+	r.Reset([]byte("unacknowledged"))
+	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+	c.GetPacket().Release()
+
+	var buf bytes.Buffer
+	if _, err := state.Save(context.Background(), &buf, c.Stack()); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	// Ended as it is saved, sending nothing: the save takes the stack's NICs first.
+	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateError; got != want {
+		t.Fatalf("Unexpected endpoint state after save: want %v, got %v", want, got)
+	}
+
+	// Restored with the same address and a route, as a pod given the address of
+	// the one before it would be, and its clock moved past every timer the
+	// connection had.
+	clock := faketime.NewManualClock()
+	restoredStack := stack.New(stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		Clock:              clock,
+	})
+	restoredStack.SetAllowLiveTCPMigration(false)
+	defer restoredStack.Destroy()
+	if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), restoredStack); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	link := channel.New(1000, e2e.DefaultMTU, "")
+	defer link.Close()
+	if err := restoredStack.CreateNIC(1, link); err != nil {
+		t.Fatalf("CreateNIC failed: %v", err)
+	}
+	if err := restoredStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: testcontext.StackAddrWithPrefix,
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress failed: %v", err)
+	}
+	restoredStack.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	restoredStack.Restore()
+	clock.Advance(3 * time.Hour)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for pkt := link.ReadContext(ctx); pkt != nil; pkt = link.ReadContext(ctx) {
+		network := pkt.NetworkProtocolNumber
+		v := pkt.ToView()
+		pkt.DecRef()
+		if network == header.IPv4ProtocolNumber && header.IPv4(v.AsSlice()).TransportProtocol() == header.TCPProtocolNumber {
+			t.Errorf("the restored stack sent a TCP segment: %x", v.AsSlice())
+		}
+		v.Release()
 	}
 }
 
