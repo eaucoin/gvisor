@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,8 +31,10 @@ import (
 	tasktype "github.com/containerd/containerd/api/types/task"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/checkpointgofer/s3/s3test"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/shim/shimutils"
 )
@@ -495,6 +498,40 @@ func testRestorePaused(t *testing.T, resume bool) {
 // started, without running again, while the containers it holds are restored
 // around it.
 func TestRestoreAbsentContainer(t *testing.T) {
+	testRestoreAbsentContainer(t, func(string) {})
+}
+
+// TestRestoreAbsentContainerS3 verifies the same for a checkpoint in an
+// S3-compatible object store, whose image path holds only the checkpoint
+// gofer's options file: the shim learns which containers the checkpoint holds
+// from runsc, which reads them through the checkpoint gofer.
+func TestRestoreAbsentContainerS3(t *testing.T) {
+	store := s3test.NewStore(t)
+	srv := httptest.NewServer(store)
+	defer srv.Close()
+	const prefix = "image/"
+	imagePath := testRestoreAbsentContainer(t, func(imagePath string) {
+		opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": %q, "credentials": {"access_key_id": "key", "secret_access_key": "secret"}}`, srv.URL, s3test.Bucket, prefix)
+		if err := os.WriteFile(filepath.Join(imagePath, "s3_opts.json"), []byte(opts), 0600); err != nil {
+			t.Fatalf("failed to write S3 options: %v", err)
+		}
+	})
+	if _, ok := store.Object(prefix + checkpointfiles.StateFileName); !ok {
+		t.Errorf("checkpoint did not write %s to the object store", checkpointfiles.StateFileName)
+	}
+	entries, err := os.ReadDir(imagePath)
+	if err != nil {
+		t.Fatalf("failed to read checkpoint dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "s3_opts.json" {
+		t.Errorf("checkpoint dir holds %v, want s3_opts.json alone", entries)
+	}
+}
+
+// testRestoreAbsentContainer runs TestRestoreAbsentContainer's checks, with
+// prepare called on the checkpoint's image path before the checkpoint, and
+// returns the image path.
+func testRestoreAbsentContainer(t *testing.T, prepare func(imagePath string)) string {
 	rootTmp, err := os.MkdirTemp("/tmp", "runsc-root-")
 	if err != nil {
 		t.Fatalf("failed to create temp root: %v", err)
@@ -578,6 +615,7 @@ func TestRestoreAbsentContainer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create checkpoint dir: %v", err)
 	}
+	prepare(imagePath)
 	checkpointReq := &pb.CheckpointRequest{
 		Id:        sandbox.ID(),
 		ImagePath: imagePath,
@@ -655,6 +693,7 @@ func TestRestoreAbsentContainer(t *testing.T) {
 	if err := killAndWaitForContainer(t.Context(), restoredClient, sandbox.ID(), restored); err != nil {
 		t.Fatalf("failed to kill and wait for restored sandbox: %v", err)
 	}
+	return imagePath
 }
 
 // TestRestoreSubcontainerBeforeRoot verifies that restoring a subcontainer
