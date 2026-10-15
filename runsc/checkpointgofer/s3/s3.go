@@ -124,6 +124,13 @@ type FileServerOptions struct {
 	// ObjectPrefix is prepended to each filename to form object keys.
 	ObjectPrefix string
 
+	// LayersPrefix, if not empty, is prepended to "<digest>/<filename>" to
+	// form the keys of the files of the image's layers (see
+	// checkpointimage.LayerPath), which are otherwise read under ObjectPrefix,
+	// as "layers/<digest>/<filename>". A store can then keep each image once,
+	// under its digest, as the layer of the images after it.
+	LayersPrefix string
+
 	// UsePathStyle addresses the bucket in the URL's path
 	// (https://host/bucket/key) rather than in its host name
 	// (https://bucket.host/key), as most stores other than AWS require.
@@ -423,6 +430,9 @@ func (s *FileServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 
 // object returns the object holding the file at path.
 func (s *FileServer) object(path string) object {
+	if d, name, ok := checkpointimage.ParseLayerPath(path); ok && s.opts.LayersPrefix != "" {
+		return object{bucket: s.opts.Bucket, key: s.opts.LayersPrefix + d.String() + "/" + name}
+	}
 	return object{bucket: s.opts.Bucket, key: s.opts.ObjectPrefix + path}
 }
 
