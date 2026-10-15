@@ -43,6 +43,12 @@ type imageDir struct {
 	// openImageMetadata opens such an image.
 	store string
 
+	// layersStore is the URI of the location of the image's layers in the
+	// object store, each in a directory named by its digest, if the store
+	// keeps them apart from the image (see sandbox.CheckpointGoferLayersURI);
+	// otherwise "", and they are in the image's layers/ directory.
+	layersStore string
+
 	// img is the image's pages metadata, or nil if the image is a single
 	// state file, which holds its memory too, as a compressed checkpoint
 	// does. Only openImageMetadata opens such an image.
@@ -124,10 +130,14 @@ func openImageMetadata(conf *config.Config, path string, layerPaths []string) (d
 // user.
 func (d *imageDir) displayPath(p string) string {
 	if d.store != "" {
-		if rel, err := filepath.Rel(d.path, p); err == nil && filepath.IsLocal(rel) {
-			return strings.TrimSuffix(d.store, "/") + "/" + rel
+		rel, err := filepath.Rel(d.path, p)
+		if err != nil || !filepath.IsLocal(rel) {
+			return p
 		}
-		return p
+		if layer, ok := strings.CutPrefix(rel, checkpointimage.LayersDir+"/"); ok && d.layersStore != "" {
+			return strings.TrimSuffix(d.layersStore, "/") + "/" + layer
+		}
+		return strings.TrimSuffix(d.store, "/") + "/" + rel
 	}
 	if d.archive == nil {
 		return p
