@@ -419,6 +419,49 @@ func TestOpenPermissions(t *testing.T) {
 	}
 }
 
+// TestLayersPrefix checks where the files of an image's layers are read from:
+// under the object prefix, in layers/<digest>/, or, with a layers prefix, under
+// it, in <digest>/; the image's own files are under the object prefix either
+// way.
+func TestLayersPrefix(t *testing.T) {
+	d := checkpointimage.Digest{1}
+	layerMeta := checkpointimage.LayerPath(d, checkpointfiles.PagesMetadataFileName)
+	layerPages := checkpointimage.LayerPath(d, checkpointfiles.PagesFileName)
+	for _, tc := range []struct {
+		layersPrefix string
+		// keys holds the key of the object read for each file.
+		keys map[string]string
+	}{
+		{
+			keys: map[string]string{
+				checkpointfiles.StateFileName: "image/" + checkpointfiles.StateFileName,
+				layerMeta:                     "image/" + layerMeta,
+				layerPages:                    "image/" + layerPages,
+			},
+		},
+		{
+			layersPrefix: "workspace/layers/",
+			keys: map[string]string{
+				checkpointfiles.StateFileName: "image/" + checkpointfiles.StateFileName,
+				layerMeta:                     "workspace/layers/" + d.String() + "/" + checkpointfiles.PagesMetadataFileName,
+				layerPages:                    "workspace/layers/" + d.String() + "/" + checkpointfiles.PagesFileName,
+			},
+		},
+	} {
+		s := s3test.NewStore(t)
+		for _, key := range tc.keys {
+			s.SetObject(key, []byte(key))
+		}
+		srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, ObjectPrefix: "image/", LayersPrefix: tc.layersPrefix})
+		for path, key := range tc.keys {
+			buf := make([]byte, len(key))
+			if c := read(t, openRead(t, srv, path), 0, buf); c.N != uint64(len(key)) || string(buf) != key {
+				t.Errorf("layers prefix %q: reading %q got %q (%d bytes, %v), want the object %q", tc.layersPrefix, path, buf[:c.N], c.N, c.Err, key)
+			}
+		}
+	}
+}
+
 // TestNewFileServerErrorsHoldNoCredentials checks that an error about the
 // options does not print the credentials, which would reach the logs.
 func TestNewFileServerErrorsHoldNoCredentials(t *testing.T) {
