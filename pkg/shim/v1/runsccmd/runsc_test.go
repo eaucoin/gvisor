@@ -221,3 +221,44 @@ func TestRunscRestoreCLI(t *testing.T) {
 		})
 	}
 }
+
+// TestRunscImageInspectCLI verifies that ImageInspect runs "image inspect
+// --json" on the image, after the global flags, and reads the containers it
+// prints, or reports runsc's error.
+func TestRunscImageInspectCLI(t *testing.T) {
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.txt")
+	script := filepath.Join(dir, "fake-runsc")
+	scriptBody := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >%q
+if [ "$6" = /invalid ]; then
+	echo "/invalid is not a checkpoint image" >&2
+	exit 3
+fi
+echo '{"digest": "d", "containers": ["app", "sidecar"]}'
+`, argsLog)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "root")
+	r := &Runsc{Command: script, Root: root, Config: map[string]string{"platform": "systrap"}}
+
+	info, err := r.ImageInspect(t.Context(), "/ckpt")
+	if err != nil {
+		t.Fatalf("ImageInspect: %v", err)
+	}
+	if want := []string{"app", "sidecar"}; !slices.Equal(info.Containers, want) {
+		t.Errorf("ImageInspect: containers %v, want %v", info.Containers, want)
+	}
+	rawArgs, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args, want := strings.Fields(string(rawArgs)), []string{"--root=" + root, "--platform=systrap", "image", "inspect", "--json", "/ckpt"}; !slices.Equal(args, want) {
+		t.Errorf("argv = %v, want %v", args, want)
+	}
+
+	if _, err := r.ImageInspect(t.Context(), "/invalid"); err == nil || !strings.Contains(err.Error(), "is not a checkpoint image") {
+		t.Errorf("ImageInspect of an invalid image: got error %v, want runsc's", err)
+	}
+}

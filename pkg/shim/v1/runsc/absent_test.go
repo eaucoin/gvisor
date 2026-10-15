@@ -16,10 +16,13 @@ package runsc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,39 +30,28 @@ import (
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
-	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-// writeCheckpoint writes a state file holding the containers named into a new
-// image directory, and returns the directory.
-func writeCheckpoint(t *testing.T, names ...string) string {
+// fakeRunsc writes a runsc that "image inspect" finds the containers named in
+// any image, and returns options that run it. It logs the arguments of each
+// run to the returned file.
+func fakeRunsc(t *testing.T, names ...string) (*Options, string) {
 	t.Helper()
-	containerSpecs := make(map[string]*specs.Spec)
-	for _, name := range names {
-		containerSpecs[name] = &specs.Spec{}
-	}
-	specsStr, err := specutils.ConvertSpecsToString(containerSpecs)
-	if err != nil {
-		t.Fatalf("ConvertSpecsToString: %v", err)
-	}
 	dir := t.TempDir()
-	f, err := os.Create(filepath.Join(dir, checkpointfiles.StateFileName))
+	containers, err := json.Marshal(names)
 	if err != nil {
-		t.Fatalf("create state file: %v", err)
+		t.Fatal(err)
 	}
-	defer f.Close()
-	w, err := statefile.NewWriter(f, nil, map[string]string{containerSpecsKey: specsStr})
-	if err != nil {
-		t.Fatalf("statefile.NewWriter: %v", err)
+	argsLog := filepath.Join(dir, "args.txt")
+	script := filepath.Join(dir, "fake-runsc")
+	body := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >>%q\necho '{\"containers\": %s}'\n", argsLog, containers)
+	if err := os.WriteFile(script, []byte(body), 0755); err != nil {
+		t.Fatal(err)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close state file: %v", err)
-	}
-	return dir
+	return &Options{BinaryName: script, Root: filepath.Join(dir, "root")}, argsLog
 }
 
 // writeBundle writes a bundle whose spec carries annotations, and returns it.
@@ -73,7 +65,6 @@ func writeBundle(t *testing.T, annotations map[string]string) string {
 }
 
 func TestCheckpointHolds(t *testing.T) {
-	image := writeCheckpoint(t, "sandbox", "app")
 	subcontainer := func(name string) map[string]string {
 		annotations := map[string]string{
 			specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeContainer,
@@ -87,6 +78,9 @@ func TestCheckpointHolds(t *testing.T) {
 		name        string
 		annotations map[string]string
 		want        bool
+		// inspected is whether the shim asks runsc which containers the
+		// checkpoint holds.
+		inspected bool
 	}{
 		{
 			name: "root container",
@@ -100,11 +94,13 @@ func TestCheckpointHolds(t *testing.T) {
 			name:        "named subcontainer held",
 			annotations: subcontainer("app"),
 			want:        true,
+			inspected:   true,
 		},
 		{
 			name:        "named subcontainer absent",
 			annotations: subcontainer("init"),
 			want:        false,
+			inspected:   true,
 		},
 		{
 			name:        "unnamed subcontainer",
@@ -113,19 +109,28 @@ func TestCheckpointHolds(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := checkpointHolds(image, writeBundle(t, tc.annotations))
+			opts, argsLog := fakeRunsc(t, "sandbox", "app")
+			got, err := checkpointHolds(t.Context(), "/ckpt", writeBundle(t, tc.annotations), "k8s.io", opts)
 			if err != nil {
 				t.Fatalf("checkpointHolds: %v", err)
 			}
 			if got != tc.want {
 				t.Errorf("checkpointHolds = %t, want %t", got, tc.want)
 			}
+			args, err := os.ReadFile(argsLog)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if inspected := strings.HasSuffix(string(args), " image inspect --json /ckpt\n"); inspected != tc.inspected || strings.Count(string(args), "\n") > 1 {
+				t.Errorf("runsc ran with %q, want one run of image inspect: %t", args, tc.inspected)
+			}
 		})
 	}
 
-	t.Run("no state file", func(t *testing.T) {
-		if _, err := checkpointHolds(t.TempDir(), writeBundle(t, subcontainer("app"))); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("checkpointHolds: got error %v, want one wrapping %v", err, os.ErrNotExist)
+	t.Run("runsc fails", func(t *testing.T) {
+		opts := &Options{BinaryName: "/bin/false", Root: t.TempDir()}
+		if _, err := checkpointHolds(t.Context(), "/ckpt", writeBundle(t, subcontainer("app")), "k8s.io", opts); err == nil {
+			t.Errorf("checkpointHolds succeeded with a runsc that fails")
 		}
 	})
 }
