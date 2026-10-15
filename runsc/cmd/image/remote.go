@@ -50,8 +50,9 @@ var startCheckpointGofer = func(conf *config.Config, dir string) (*os.File, erro
 // in the object store that the checkpoint gofer's options file in dir selects,
 // as runsc restore reads it: its state file's metadata, its pages metadata, if
 // it has any (a single state file has none), and the pages metadata of each of
-// its layers, which the store holds in the image's layers/ directory and which
-// identifies the layer. It returns nil if dir holds no options file.
+// its layers, which the store holds in the image's layers/ directory, or under
+// the options' layers prefix, and which identifies the layer. It returns nil if
+// dir holds no options file.
 func openRemoteImage(conf *config.Config, dir string) (*imageDir, error) {
 	sock, err := startCheckpointGofer(conf, dir)
 	if err != nil || sock == nil {
@@ -74,7 +75,7 @@ func openRemoteImage(conf *config.Config, dir string) (*imageDir, error) {
 	}
 	defer afc.DecRef()
 
-	d := &imageDir{path: dir, store: uri}
+	d := &imageDir{path: dir, store: uri, layersStore: sandbox.CheckpointGoferLayersURI(dir)}
 	if d.state, err = readRemoteState(afc); err != nil {
 		return nil, fmt.Errorf("%s: %w", d.displayPath(filepath.Join(dir, checkpointfiles.StateFileName)), err)
 	}
