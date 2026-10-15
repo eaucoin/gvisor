@@ -76,6 +76,8 @@ func TestEmbeddedPointers(t *testing.T) {
 	of2 := outerFieldSecond{magic(), inner{magic()}}
 	oa := outerArray{[2]inner{{magic()}, {magic()}}}
 	osl := outerSlice{oa.inner[:]}
+	ba := [4]byte{0x81, 0x82, 0x83, 0x84}
+	bsl := ba[:2]
 	ofv := outerFieldValue{innerFieldValue{magic()}}
 	one := [1]inner{{magic()}}
 
@@ -102,6 +104,10 @@ func TestEmbeddedPointers(t *testing.T) {
 		system{&ofv.inner, &ofv},
 		system{&one, &one[0]},
 		system{&one[0], &one},
+		system{&ba, &ba[2]},
+		system{&ba[2], &ba},
+		system{&ba, &bsl},
+		system{&bsl, &ba},
 	})
 }
 

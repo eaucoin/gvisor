@@ -15,8 +15,12 @@
 package tests
 
 import (
+	"bytes"
+	"context"
 	"reflect"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 var allArrayPrimitives = []any{
@@ -99,6 +103,43 @@ func TestSlices(t *testing.T) {
 	runTestCases(t, false, "pointers", pointersTo(allSlices))
 	runTestCases(t, false, "interfaces", interfacesTo(allSlices))
 	runTestCases(t, false, "interfacesToPointers", interfacesTo(pointersTo(allSlices)))
+}
+
+func TestByteArraysAreSavedAsTheirBytes(t *testing.T) {
+	// Bytes that would each take two as varints.
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i) | 0x80
+	}
+	var saved bytes.Buffer
+	if _, err := state.Save(context.Background(), &saved, &data); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	if saved.Len() > len(data)+1024 {
+		t.Errorf("%d bytes saved as %d", len(data), saved.Len())
+	}
+	var loaded []byte
+	if _, err := state.Load(context.Background(), &saved, &loaded); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !bytes.Equal(loaded, data) {
+		t.Errorf("the bytes loaded are not those saved")
+	}
+}
+
+func TestByteArrayContainers(t *testing.T) {
+	full := byteArrayContainer{
+		array:      [3]byte{0x81, 0, 0xff},
+		named:      [3]namedByte{0x82, 1, 0xfe},
+		namedSlice: []namedByte{0x83, 2},
+		inner:      arrayOfBytes{v: [2]byte{0x84, 3}},
+	}
+	containers := []any{byteArrayContainer{}, full}
+	// A named type in an interface must be registered, which namedByte is not.
+	named := []any{[2]namedByte{0x85, 4}, []namedByte{0x86, 5}}
+	runTestCases(t, false, "plain", append(containers, named...))
+	runTestCases(t, false, "pointers", pointersTo(append(containers, named...)))
+	runTestCases(t, false, "interfaces", interfacesTo(containers))
 }
 
 func TestArrayContainers(t *testing.T) {
