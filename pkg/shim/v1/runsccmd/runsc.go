@@ -384,6 +384,26 @@ func (r *Runsc) Checkpoint(context context.Context, id string, opts *CheckpointO
 	return nil
 }
 
+// ImageInfo is the part of a checkpoint image's description by "runsc image
+// inspect" that the shim reads.
+type ImageInfo struct {
+	// Containers are the names of the containers that the checkpoint holds.
+	Containers []string `json:"containers"`
+}
+
+// ImageInspect describes the checkpoint image in imagePath.
+func (r *Runsc) ImageInspect(context context.Context, imagePath string) (*ImageInfo, error) {
+	data, stderr, err := cmdOutput(r.command(context, "image", "inspect", "--json", imagePath), false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, stderr)
+	}
+	var info ImageInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("image inspect printed %q: %w", data, err)
+	}
+	return &info, nil
+}
+
 // FSCheckpoint will fscheckpoint a container.
 func (r *Runsc) FSCheckpoint(context context.Context, id string, opts *CheckpointOpts) error {
 	args := []string{"fscheckpoint"}
