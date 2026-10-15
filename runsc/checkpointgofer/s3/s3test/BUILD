@@ -11,6 +11,7 @@ go_library(
     srcs = ["s3test.go"],
     visibility = [
         "//runsc:__subpackages__",
+        "//shim/tests:__pkg__",
     ],
     deps = ["//pkg/sync"],
 )
