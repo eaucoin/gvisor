@@ -153,9 +153,9 @@ func TestCheckpointGoferURI(t *testing.T) {
 					t.Fatalf("failed to write %s: %v", optsPath, err)
 				}
 			}
-			got := checkpointGoferURI(subDir)
+			got := CheckpointGoferURI(subDir)
 			if got != tc.want {
-				t.Errorf("checkpointGoferURI(%q) = %q, want %q", subDir, got, tc.want)
+				t.Errorf("CheckpointGoferURI(%q) = %q, want %q", subDir, got, tc.want)
 			}
 		})
 	}
