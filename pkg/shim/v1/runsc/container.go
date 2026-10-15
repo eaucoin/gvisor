@@ -207,7 +207,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 	}
 
 	if conf.RestoreImagePath != "" {
-		held, err := checkpointHolds(conf.RestoreImagePath, conf.Bundle)
+		held, err := checkpointHolds(ctx, conf.RestoreImagePath, conf.Bundle, ns, &opts)
 		if err != nil {
 			return nil, err
 		}
