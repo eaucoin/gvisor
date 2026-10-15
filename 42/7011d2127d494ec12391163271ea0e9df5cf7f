@@ -1,0 +1,12 @@
+base release-20260921.0
+series/fork-infra 3e6e1e8a44d4549b2eb7fd6d490e4dbf1984112f 16
+series/00-base-fixes 78be1c886baee8222f252ee5c80766153d1d685f 6
+series/10-pgalloc-save-restore-tests 19122d496f7137c5e167ff73ff00edf53b18daf5 2
+series/17-image-format-v2 6c09bbacfc2bd4cf49ac7ce78ab1b45ee5160750 6
+series/18-image-tooling 5bc63f480174a65421bc8fa5986da2130a9662b9 4
+series/11-fault-first-restore dec80a4fc0008beb9931e45da3aab99549e132f0 7
+series/14-dirty-tracking-framework ec04a957a2c18df8fa023af68c24336b7211027b 3
+series/15-dirty-source-write-protection 22d0718b36d7a33414a3a8da5433964545125bb2 3
+series/19-incremental-save 0cae13a106b6d0bd8ecf077ff5c45481a0069b54 5
+series/20-precopy 5e15720aa7ec1508830eeda462e482e4f65cdf6a 6
+series/16-dirty-source-uffd-wp a5c9fdc3a0fd2ab4ff10e55762e42afc10aaac3b 4
