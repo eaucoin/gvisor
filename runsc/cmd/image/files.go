@@ -31,7 +31,11 @@ import (
 // imageDir is an image directory that has been read.
 type imageDir struct {
 	path string
-	img  *checkpointimage.Image
+
+	// img is the image's pages metadata, or nil if the image is a single
+	// state file, which holds its memory too, as a compressed checkpoint
+	// does. Only openImageMetadata opens such an image.
+	img *checkpointimage.Image
 
 	// archive is the checkpoint archive that the image was extracted from, or
 	// nil if it was not.
@@ -72,6 +76,23 @@ func openImage(path string, layerPaths []string, withPages bool) (d *imageDir, c
 	return d, a.remove, nil
 }
 
+// openImageMetadata opens the image at path as openImage does, without the
+// data of an archive's pages files, for a command that reads only the image's
+// metadata. The image may also be a directory holding a single state file, as
+// a compressed checkpoint is, whose imageDir has no img.
+func openImageMetadata(path string, layerPaths []string) (d *imageDir, close func(), err error) {
+	if _, err := os.Stat(filepath.Join(path, checkpointfiles.PagesMetadataFileName)); errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(path, checkpointfiles.StateFileName)); err == nil {
+			if len(layerPaths) != 0 {
+				return nil, nil, fmt.Errorf("layer paths %q given for %s, a single state file without layers", layerPaths, path)
+			}
+			d := &imageDir{path: path}
+			return d, func() {}, d.readState()
+		}
+	}
+	return openImage(path, layerPaths, false /* withPages */)
+}
+
 // displayPath returns how to show p, a path of d or of its layers, to the
 // user.
 func (d *imageDir) displayPath(p string) string {
@@ -95,20 +116,28 @@ func openImageDir(dir string, layerPaths []string) (*imageDir, error) {
 	if d.layerDirs, err = checkpointimage.LocateLayers(img, dir, layerPaths); err != nil {
 		return nil, err
 	}
-	sf, err := os.Open(filepath.Join(dir, checkpointfiles.StateFileName))
-	if err != nil {
+	if err := d.readState(); err != nil {
 		return nil, err
+	}
+	return d, nil
+}
+
+// readState reads the metadata and the size of d's state file.
+func (d *imageDir) readState() error {
+	sf, err := os.Open(filepath.Join(d.path, checkpointfiles.StateFileName))
+	if err != nil {
+		return err
 	}
 	defer sf.Close()
 	if d.state, err = statefile.MetadataUnsafe(sf); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", sf.Name(), err)
+		return fmt.Errorf("reading %s: %w", sf.Name(), err)
 	}
 	st, err := sf.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	d.stateSize = st.Size()
-	return d, nil
+	return nil
 }
 
 // pagesPath returns the path of the pages file of layer i, or "" if the layer
