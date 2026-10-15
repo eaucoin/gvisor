@@ -46,15 +46,16 @@ import (
 const remotePrefix = "image/"
 
 // remoteImage returns a store, and a directory holding the S3 options file
-// that selects the image under remotePrefix in it, which the image commands
-// read through a checkpoint gofer that serves the store in this process.
-func remoteImage(t *testing.T) (*s3test.Store, string) {
+// that selects the image under remotePrefix in it, and its layers under
+// layersPrefix if it is not empty, which the image commands read through a
+// checkpoint gofer that serves the store in this process.
+func remoteImage(t *testing.T, layersPrefix string) (*s3test.Store, string) {
 	t.Helper()
 	store := s3test.NewStore(t)
 	srv := httptest.NewServer(store)
 	t.Cleanup(srv.Close)
 	dir := t.TempDir()
-	opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": %q}`, srv.URL, s3test.Bucket, remotePrefix)
+	opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": %q, "layers_prefix": %q}`, srv.URL, s3test.Bucket, remotePrefix, layersPrefix)
 	if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), []byte(opts), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +71,7 @@ func remoteImage(t *testing.T) (*s3test.Store, string) {
 			Endpoint:             srv.URL,
 			Bucket:               s3test.Bucket,
 			ObjectPrefix:         remotePrefix,
+			LayersPrefix:         layersPrefix,
 			UsePathStyle:         true,
 			Credentials:          credentials.NewStaticCredentialsProvider("key", "secret", ""),
 		})
@@ -155,7 +157,7 @@ func inspectJSON(t *testing.T, image string) *imageInfo {
 func TestInspectRemote(t *testing.T) {
 	root, template, _ := testImages(t)
 	deltaDir := filepath.Join(root, "delta")
-	store, dir := remoteImage(t)
+	store, dir := remoteImage(t, "")
 	putImage(t, store, deltaDir, nil)
 
 	want := inspectJSON(t, deltaDir)
@@ -190,11 +192,43 @@ func TestInspectRemote(t *testing.T) {
 	}
 }
 
+// TestInspectRemoteLayersPrefix checks that inspect and layers read the layers
+// of an image in an object store under the layers prefix of its options, where
+// the store keeps each image once, by its digest, and show them there.
+func TestInspectRemoteLayersPrefix(t *testing.T) {
+	root, template, _ := testImages(t)
+	deltaDir := filepath.Join(root, "delta")
+	const layersPrefix = "layers/"
+	store, dir := remoteImage(t, layersPrefix)
+	putImage(t, store, deltaDir, func(rel string) bool {
+		return strings.HasPrefix(rel, checkpointimage.LayersDir+"/")
+	})
+	layerDir := filepath.Join(deltaDir, checkpointimage.LayersDir, template.Digest.String())
+	for _, name := range []string{checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
+		data, err := os.ReadFile(filepath.Join(layerDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.SetObject(layersPrefix+template.Digest.String()+"/"+name, data)
+	}
+
+	want := inspectJSON(t, deltaDir)
+	want.State.Size = 0
+	want.Layers[0].Path = "s3://" + s3test.Bucket + "/" + remotePrefix + checkpointfiles.PagesFileName
+	want.Layers[1].Path = "s3://" + s3test.Bucket + "/" + layersPrefix + template.Digest.String() + "/" + checkpointfiles.PagesFileName
+	if diff := cmp.Diff(want, inspectJSON(t, dir)); diff != "" {
+		t.Errorf("inspect --json of the image in the store differs from its description in a directory (-want +got):\n%s", diff)
+	}
+	if status, out := run(t, new(layers), dir); status != subcommands.ExitSuccess || out != template.Digest.String()+"\n" {
+		t.Errorf("layers = %v, %q; want %q", status, out, template.Digest.String()+"\n")
+	}
+}
+
 // TestInspectRemoteLayerNotFound checks that inspect reports a layer that the
 // store does not hold as not found.
 func TestInspectRemoteLayerNotFound(t *testing.T) {
 	root, _, _ := testImages(t)
-	store, dir := remoteImage(t)
+	store, dir := remoteImage(t, "")
 	putImage(t, store, filepath.Join(root, "delta"), func(rel string) bool {
 		return strings.HasPrefix(rel, checkpointimage.LayersDir+"/")
 	})
@@ -208,7 +242,7 @@ func TestInspectRemoteLayerNotFound(t *testing.T) {
 // an image whose layer in the store is another image.
 func TestInspectRemoteWrongLayer(t *testing.T) {
 	root, template, _ := testImages(t)
-	store, dir := remoteImage(t)
+	store, dir := remoteImage(t, "")
 	deltaDir := filepath.Join(root, "delta")
 	putImage(t, store, deltaDir, nil)
 	meta, err := os.ReadFile(filepath.Join(deltaDir, checkpointfiles.PagesMetadataFileName))
@@ -229,7 +263,7 @@ func TestInspectRemoteSingleStateFile(t *testing.T) {
 		boot.VersionKey:        version.Version(),
 		boot.ContainerSpecsKey: `{"app":{"ociVersion":"1.0.2"}}`,
 	})
-	store, dir := remoteImage(t)
+	store, dir := remoteImage(t, "")
 	putImage(t, store, local, nil)
 	info := inspectJSON(t, dir)
 	if info.Digest != "" || len(info.Layers) != 0 || !slices.Equal(info.Containers, []string{"app"}) {
@@ -241,7 +275,7 @@ func TestInspectRemoteSingleStateFile(t *testing.T) {
 // inspect given layer paths, refuse an image in an object store.
 func TestRemoteRefused(t *testing.T) {
 	root, _, _ := testImages(t)
-	store, dir := remoteImage(t)
+	store, dir := remoteImage(t, "")
 	putImage(t, store, filepath.Join(root, "delta"), nil)
 	for _, tc := range []struct {
 		cmd  subcommands.Command
