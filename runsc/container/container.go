@@ -466,7 +466,17 @@ func (c *Container) Restore(conf *config.Config, imagePath string, opts sandbox.
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, opts)
+		if err := c.Sandbox.Restore(conf, spec, c.ID, imagePath, opts); err != nil {
+			// The sandbox has no kernel to start, and its process and gofer
+			// would wait for nothing: stop them, so that the container is
+			// stopped, its Wait returns, and its deletion has nothing to
+			// wait on.
+			if stopErr := c.stopFailedRestore(); stopErr != nil {
+				log.Warningf("Stopping the sandbox of container %q after its restore failed: %v", c.ID, stopErr)
+			}
+			return err
+		}
+		return nil
 	}
 	status := Running
 	if opts.Paused {
@@ -1531,6 +1541,29 @@ func (c *Container) stop() error {
 		}
 	}
 	return nil
+}
+
+// stopFailedRestore stops the sandbox and the gofer of the root container c,
+// whose restore failed, and marks c stopped, as a sandbox that ended does.
+// Unlike stop, it keeps c.Sandbox, which a Wait on c asks for the sandbox's
+// exit status.
+//
+// Preconditions: c.Saver is locked.
+func (c *Container) stopFailedRestore() error {
+	var errs []error
+	if err := c.Sandbox.DestroyContainer(c.ID); err != nil {
+		errs = append(errs, fmt.Errorf("destroying the sandbox: %w", err))
+	}
+	if goferPid := c.GoferPid.Load(); goferPid != 0 {
+		if err := unix.Kill(goferPid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			errs = append(errs, fmt.Errorf("killing the gofer %d: %w", goferPid, err))
+		}
+	}
+	c.changeStatus(Stopped)
+	if err := c.saveLocked(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (c *Container) waitForStopped() error {

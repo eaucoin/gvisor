@@ -91,7 +91,11 @@ func (s *createdState) Start(ctx context.Context, restoreConf *extension.Restore
 		// it can only stay in created state, and never be deleted.
 		// To work around that, we treat non-root container in start/restore
 		// failure state as stopped.
-		if !s.p.Sandbox {
+		//
+		// A root container whose restore failed is stopped too: runsc left its
+		// sandbox with no kernel to start, and nothing will make it exit, so
+		// its Wait, and whoever waits on it to delete it, would wait forever.
+		if !s.p.Sandbox || restoreConf != nil {
 			// p.io is nil when the process was created with a terminal.
 			if s.p.io != nil {
 				s.p.io.Close()
