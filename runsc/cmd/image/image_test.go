@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -433,6 +434,47 @@ func TestLayers(t *testing.T) {
 	status, out := run(t, new(layers), filepath.Join(root, "delta"))
 	if status != subcommands.ExitSuccess || out != template.Digest.String()+"\n" {
 		t.Errorf("layers = %v, %q; want %q", status, out, template.Digest.String()+"\n")
+	}
+}
+
+// TestSingleStateFile checks the commands on a compressed checkpoint, a single
+// state file that holds its memory too: inspect describes its state file
+// metadata and containers, layers lists no layer, and verify, which checks
+// pages files, refuses it.
+func TestSingleStateFile(t *testing.T) {
+	dir := t.TempDir()
+	writeStateFile(t, filepath.Join(dir, checkpointfiles.StateFileName), map[string]string{
+		boot.VersionKey:        version.Version(),
+		boot.ContainerSpecsKey: `{"app":{"ociVersion":"1.0.2"}}`,
+	})
+	status, out := run(t, new(inspect), "--json", dir)
+	if status != subcommands.ExitSuccess {
+		t.Fatalf("inspect --json: %v", status)
+	}
+	var info imageInfo
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		t.Fatalf("inspect --json printed %q: %v", out, err)
+	}
+	if info.Digest != "" || len(info.Layers) != 0 || len(info.MemoryFiles) != 0 || !slices.Equal(info.Containers, []string{"app"}) {
+		t.Errorf("inspect --json printed:\n%s\nwant no digest, layers or memory files, and the container app", out)
+	}
+	status, out = run(t, new(inspect), dir)
+	if status != subcommands.ExitSuccess {
+		t.Fatalf("inspect: %v", status)
+	}
+	for _, want := range []string{"Containers:     app\n", "Memory: in the state file\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect printed:\n%s\nwhich lacks %q", out, want)
+		}
+	}
+	if status, _ := run(t, new(inspect), "--layer-path", t.TempDir(), dir); status != subcommands.ExitFailure {
+		t.Errorf("inspect --layer-path = %v, want %v", status, subcommands.ExitFailure)
+	}
+	if status, out := run(t, new(layers), dir); status != subcommands.ExitSuccess || out != "" {
+		t.Errorf("layers = %v, %q; want no layer", status, out)
+	}
+	if status, _ := run(t, new(verify), dir); status != subcommands.ExitFailure {
+		t.Errorf("verify = %v, want %v", status, subcommands.ExitFailure)
 	}
 }
 

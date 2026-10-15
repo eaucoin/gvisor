@@ -53,6 +53,7 @@ func (*inspect) Synopsis() string {
 func (*inspect) Usage() string {
 	return `inspect [--json] [--layer-path=DIR]... IMAGE - describe the checkpoint image IMAGE: its identity, format, state file metadata, containers, layers, memory and working set.
 IMAGE is an image directory, or a container engine's checkpoint archive of a runsc container (tar, uncompressed, gzip or zstd), whose container is described too.
+A compressed checkpoint, a single state file that holds its memory too, is described by its state file metadata and containers alone.
 `
 }
 
@@ -68,7 +69,7 @@ func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, closeImage, err := openImage(f.Arg(0), i.layerPaths, false /* withPages */)
+	d, closeImage, err := openImageMetadata(f.Arg(0), i.layerPaths)
 	if err != nil {
 		return exitStatus(err)
 	}
@@ -93,14 +94,16 @@ func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 type imageInfo struct {
 	// Archive is set if the image is in a checkpoint archive.
 	Archive *archiveInfo `json:"archive,omitempty"`
-	Digest  string       `json:"digest"`
-	Format  formatInfo   `json:"format"`
-	State   stateInfo    `json:"state"`
+	// Digest, Format, Layers and MemoryFiles are absent for a single state
+	// file, which has no pages metadata.
+	Digest string     `json:"digest,omitempty"`
+	Format formatInfo `json:"format,omitzero"`
+	State  stateInfo  `json:"state"`
 	// Containers are the names of the containers that the checkpoint holds,
 	// sorted: those that a restore of it brings back.
 	Containers  []string         `json:"containers"`
-	Layers      []layerInfo      `json:"layers"`
-	MemoryFiles []memoryFileInfo `json:"memory_files"`
+	Layers      []layerInfo      `json:"layers,omitempty"`
+	MemoryFiles []memoryFileInfo `json:"memory_files,omitempty"`
 	WorkingSet  *workingSetInfo  `json:"working_set,omitempty"`
 }
 
@@ -147,14 +150,11 @@ type workingSetInfo struct {
 }
 
 func describe(d *imageDir) (*imageInfo, error) {
-	img := d.img
 	containers, err := specutils.GetSpecsFromString(d.state[boot.ContainerSpecsKey])
 	if err != nil {
 		return nil, fmt.Errorf("%s of %s: %w: %v", boot.ContainerSpecsKey, d.path, checkpointimage.ErrFormat, err)
 	}
 	info := &imageInfo{
-		Digest:     img.Digest.String(),
-		Format:     formatInfo{Major: img.Header.Major, Minor: img.Header.Minor},
 		State:      stateInfo{Size: d.stateSize, Metadata: make(map[string]string)},
 		Containers: slices.Sorted(maps.Keys(containers)),
 	}
@@ -166,6 +166,12 @@ func describe(d *imageDir) (*imageInfo, error) {
 	if a := d.archive; a != nil {
 		info.Archive = &archiveInfo{Path: a.path, Container: a.container}
 	}
+	img := d.img
+	if img == nil {
+		return info, nil
+	}
+	info.Digest = img.Digest.String()
+	info.Format = formatInfo{Major: img.Header.Major, Minor: img.Header.Minor}
 	for i, l := range img.Layers() {
 		li := layerInfo{PagesSize: l.PagesSize}
 		if p := d.pagesPath(i); p != "" {
@@ -219,8 +225,10 @@ func (info *imageInfo) print(w io.Writer) {
 			fmt.Fprintf(tw, "Runtime:\t%s\n", c.Runtime)
 		}
 	}
-	fmt.Fprintf(tw, "Image:\t%s\n", info.Digest)
-	fmt.Fprintf(tw, "Format:\t%d.%d\n", info.Format.Major, info.Format.Minor)
+	if info.Digest != "" {
+		fmt.Fprintf(tw, "Image:\t%s\n", info.Digest)
+		fmt.Fprintf(tw, "Format:\t%d.%d\n", info.Format.Major, info.Format.Minor)
+	}
 	for _, k := range []string{boot.VersionKey, checkpointimage.FormatMetadataKey, boot.PlatformKey, boot.CPUFeaturesKey, "timestamp"} {
 		if v, ok := info.State.Metadata[k]; ok {
 			fmt.Fprintf(tw, "%s:\t%s\n", k, v)
@@ -229,6 +237,10 @@ func (info *imageInfo) print(w io.Writer) {
 	fmt.Fprintf(tw, "State file:\t%d bytes\n", info.State.Size)
 	fmt.Fprintf(tw, "Containers:\t%s\n", strings.Join(info.Containers, ", "))
 	tw.Flush()
+	if info.Digest == "" {
+		fmt.Fprintf(w, "\nMemory: in the state file\n")
+		return
+	}
 
 	fmt.Fprintf(w, "\nLayers:\n")
 	tw = tabwriter.NewWriter(w, 0, 8, 2, ' ', 0)

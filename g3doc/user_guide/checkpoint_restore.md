@@ -178,9 +178,10 @@ image directory, synced before they succeed.
     version, state file metadata (runsc version, image format, platform, CPU
     features, time), the names of the containers it holds, its layers and where
     they were found, the memory of each MemoryFile and which layers hold it,
-    and its working set. The JSON output
-    is meant for other tools, such as checkpoint managers listing the
-    checkpoints of every runtime; fields are only ever added to it.
+    and its working set. Of a compressed checkpoint, a single state file, it
+    prints the state file metadata and the containers. The JSON output is meant
+    for other tools, such as checkpoint managers listing the checkpoints of
+    every runtime; fields are only ever added to it.
 -   `runsc image verify [--pages] [--host] IMAGE` checks the checksums and
     consistency of `pages_meta.img` and the identity and size of every layer;
     with `--pages`, it reads every page and checks it against its hash; with
