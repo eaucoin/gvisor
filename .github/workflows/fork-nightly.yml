@@ -1,5 +1,7 @@
-# Tier 2 of the fork's CI: gVisor's save/restore suites, nightly on main and
-# on demand for a series. The system call tests run in their save/restore
+# Tier 2 of the fork's CI: gVisor's save/restore suites, nightly on main once
+# main has changed (a tip tested already, or being tested, is not tested
+# again: it would say the same, hours of runners later), and on demand for a
+# series or main. The system call tests run in their save/restore
 # and save/resume variants and in the fork's save variants that track dirty
 # pages (save_verify: every save verifies that tracking missed no write;
 # save_incremental: every save but the first is a delta, restores read the
@@ -29,7 +31,9 @@ name: Fork nightly
 
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.ref || 'main' }}
-  cancel-in-progress: true
+  # A scheduled run waits for one running, whose result then makes it due or
+  # not, rather than cancel it.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
   contents: read
@@ -50,8 +54,37 @@ env:
   KVM_TESTS: aio|exec|fork|futex|madvise|mlock|mmap|mremap|pread64|pwrite64|read|sendfile|shm|splice|write
 
 jobs:
+  due:
+    name: Whether a tier 2 is due
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: read
+    outputs:
+      due: ${{ steps.due.outputs.due }}
+    steps:
+      - id: due
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          state=none
+          if [[ "${EVENT}" == schedule ]]; then
+            state="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}/statuses" \
+              --jq '[.[] | select(.context == "fork-nightly")][0].state // "none"')"
+          fi
+          # "error" is a cancelled run: run it again. "pending" is one running.
+          if [[ "${state}" != none && "${state}" != error ]]; then
+            echo "due=false" >>"${GITHUB_OUTPUT}"
+            echo "${REF} has a tier 2 result already (${state}): not tested again." >>"${GITHUB_STEP_SUMMARY}"
+          else
+            echo "due=true" >>"${GITHUB_OUTPUT}"
+          fi
+
   build:
     name: Build runsc and the tests
+    needs: due
+    if: needs.due.outputs.due == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
