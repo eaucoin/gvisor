@@ -85,6 +85,11 @@ type S3Options struct {
 	// between ObjectPrefix and the filename.
 	ObjectPrefix string `json:"object_prefix"`
 
+	// LayersPrefix, if not empty, is prepended to "<digest>/<filename>" to
+	// form the keys of the files of the image's layers, which are otherwise
+	// under ObjectPrefix, as "layers/<digest>/<filename>".
+	LayersPrefix string `json:"layers_prefix,omitzero"`
+
 	// Addressing is how requests address the bucket: "path"
 	// (https://host/bucket/key), as most stores other than AWS require, or
 	// "virtual" (https://bucket.host/key). If it is empty, it is "path" with
@@ -285,6 +290,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		Region:                  opts.Region,
 		Bucket:                  opts.Bucket,
 		ObjectPrefix:            opts.ObjectPrefix,
+		LayersPrefix:            opts.LayersPrefix,
 		SharedCredentialsFile:   opts.CredentialsFile,
 		Profile:                 opts.Profile,
 		MaxAttempts:             opts.MaxAttempts,
