@@ -185,7 +185,7 @@ func run(t *testing.T, cmd subcommands.Command, args ...string) (subcommands.Exi
 		b, _ := io.ReadAll(r)
 		out <- string(b)
 	}()
-	status := cmd.Execute(context.Background(), fs)
+	status := cmd.Execute(context.Background(), fs, &config.Config{})
 	w.Close()
 	os.Stdout = stdout
 	return status, <-out
