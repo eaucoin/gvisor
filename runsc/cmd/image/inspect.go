@@ -29,6 +29,7 @@ import (
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -54,6 +55,7 @@ func (*inspect) Usage() string {
 	return `inspect [--json] [--layer-path=DIR]... IMAGE - describe the checkpoint image IMAGE: its identity, format, state file metadata, containers, layers, memory and working set.
 IMAGE is an image directory, or a container engine's checkpoint archive of a runsc container (tar, uncompressed, gzip or zstd), whose container is described too.
 A compressed checkpoint, a single state file that holds its memory too, is described by its state file metadata and containers alone.
+An image directory may also hold only the options file of a checkpoint gofer (gcs_opts.json or s3_opts.json, as for runsc restore): the image in the object store that it selects is then read through a checkpoint gofer, without its pages.
 `
 }
 
@@ -64,12 +66,13 @@ func (i *inspect) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, closeImage, err := openImageMetadata(f.Arg(0), i.layerPaths)
+	conf := args[0].(*config.Config)
+	d, closeImage, err := openImageMetadata(conf, f.Arg(0), i.layerPaths)
 	if err != nil {
 		return exitStatus(err)
 	}
@@ -118,7 +121,9 @@ type formatInfo struct {
 }
 
 type stateInfo struct {
-	Size int64 `json:"size"`
+	// Size is absent for an image in an object store, whose sizes the
+	// checkpoint gofer does not report.
+	Size int64 `json:"size,omitempty"`
 	// Metadata is the state file's metadata, but for the container specs,
 	// which are long and printed by "runsc spec" in a better form.
 	Metadata map[string]string `json:"metadata"`
@@ -234,7 +239,9 @@ func (info *imageInfo) print(w io.Writer) {
 			fmt.Fprintf(tw, "%s:\t%s\n", k, v)
 		}
 	}
-	fmt.Fprintf(tw, "State file:\t%d bytes\n", info.State.Size)
+	if info.State.Size != 0 {
+		fmt.Fprintf(tw, "State file:\t%d bytes\n", info.State.Size)
+	}
 	fmt.Fprintf(tw, "Containers:\t%s\n", strings.Join(info.Containers, ", "))
 	tw.Flush()
 	if info.Digest == "" {

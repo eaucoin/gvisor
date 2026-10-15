@@ -14,8 +14,10 @@ go_test(
         "shim_test.go",
     ],
     deps = [
+        "//pkg/sentry/state/checkpointfiles",
         "//pkg/shim/v1/taskserver:task_server_go_proto",
         "//pkg/test/testutil",
+        "//runsc/checkpointgofer/s3/s3test",
         "//runsc/specutils",
         "//shim/shimutils",
         "@com_github_containerd_containerd_api//events:go_default_library",

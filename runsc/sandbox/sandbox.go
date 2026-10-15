@@ -659,7 +659,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	// Restore the container and start the root container.
 	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := checkpointGoferURI(imagePath); target != "" {
+			if target := CheckpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
 			}
 		}
@@ -1879,7 +1879,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
-			if target := checkpointGoferURI(imagePath); target != "" {
+			if target := CheckpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2035,7 +2035,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	if err := s.call(boot.ContMgrFSSave, &args, nil); err != nil {
 		if args.UseCheckpointGofer {
-			if target := checkpointGoferURI(imagePath); target != "" {
+			if target := CheckpointGoferURI(imagePath); target != "" {
 				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
 			}
 		}
@@ -2138,10 +2138,10 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 	return files[:], nil
 }
 
-// checkpointGoferURI returns the URI (e.g. "gs://bucket/prefix" or
+// CheckpointGoferURI returns the URI (e.g. "gs://bucket/prefix" or
 // "s3://bucket") of the checkpoint files that the options file under
 // imagePath specifies, or an empty string if not applicable.
-func checkpointGoferURI(imagePath string) string {
+func CheckpointGoferURI(imagePath string) string {
 	for _, store := range checkpointGoferStores {
 		data, err := os.ReadFile(path.Join(imagePath, store.optsFileName))
 		if err != nil {
@@ -2191,9 +2191,23 @@ func openCheckpointGoferOptions(imagePath string) (*checkpointGoferStore, *os.Fi
 
 // maybeStartCheckpointGoferAndGetSocket checks if use of a checkpoint gofer is
 // specified by configuration files in imagePath. If so, it starts the
-// checkpoint gofer and returns an os.File representing a socket connected to
-// it. Otherwise, it returns nil.
+// checkpoint gofer for the sandbox in cg and returns an os.File representing a
+// socket connected to it. Otherwise, it returns nil.
 func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg cgroup.Cgroup, imagePath string, extraFlags ...string) (*os.File, error) {
+	return StartCheckpointGofer(conf, cg, imagePath, &specutils.LogFileOpts{
+		SandboxID: s.ID,
+		CID:       s.ID,
+		Command:   "checkpointgofer",
+		Timestamp: s.StartTime,
+	}, extraFlags...)
+}
+
+// StartCheckpointGofer checks if use of a checkpoint gofer is specified by
+// configuration files in imagePath. If so, it starts the checkpoint gofer, in
+// cg unless cg is nil, with extraFlags and its debug log named after logOpts,
+// and returns an os.File representing a socket connected to it. Otherwise, it
+// returns nil. The checkpoint gofer exits once the socket is closed.
+func StartCheckpointGofer(conf *config.Config, cg cgroup.Cgroup, imagePath string, logOpts *specutils.LogFileOpts, extraFlags ...string) (*os.File, error) {
 	store, optsFile, err := openCheckpointGoferOptions(imagePath)
 	if err != nil {
 		return nil, err
@@ -2232,14 +2246,8 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 			extraFiles = append(extraFiles, f.Fd())
 			argv = append(argv, fmt.Sprintf("--log-fd=%d", len(extraFiles)-1))
 		}
-		lfOpts := &specutils.LogFileOpts{
-			SandboxID: s.ID,
-			CID:       s.ID,
-			Command:   "checkpointgofer",
-			Timestamp: s.StartTime,
-		}
 		if conf.DebugLog != "" && specutils.IsDebugCommand(conf, "checkpointgofer") {
-			f, err := specutils.OpenDebugLogFile(conf.DebugLog, lfOpts)
+			f, err := specutils.OpenDebugLogFile(conf.DebugLog, logOpts)
 			if err != nil {
 				return fmt.Errorf("opening debug log file: %w", err)
 			}
