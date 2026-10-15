@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/google/subcommands"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
@@ -37,7 +38,7 @@ func (*layers) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*layers) Usage() string {
-	return `layers IMAGE - print the digest of each image whose pages file holds data of the checkpoint image IMAGE (an image directory or a container engine's checkpoint archive of a runsc container), one per line, for an image store's garbage collection: an image can be deleted when no image kept lists it.
+	return `layers IMAGE - print the digest of each image whose pages file holds data of the checkpoint image IMAGE (an image directory, a container engine's checkpoint archive of a runsc container, or a directory holding a checkpoint gofer's options file, as for inspect), one per line, for an image store's garbage collection: an image can be deleted when no image kept lists it.
 `
 }
 
@@ -45,12 +46,13 @@ func (*layers) Usage() string {
 func (*layers) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (*layers) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+func (*layers) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, closeImage, err := openImageMetadata(f.Arg(0), nil /* layerPaths */)
+	conf := args[0].(*config.Config)
+	d, closeImage, err := openImageMetadata(conf, f.Arg(0), nil /* layerPaths */)
 	if err != nil {
 		return exitStatus(err)
 	}
