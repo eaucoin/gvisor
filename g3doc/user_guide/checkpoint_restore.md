@@ -285,6 +285,14 @@ container's name, pod, engine and runtime, read from the archive's `spec.dump`
 and `config.dump`. Layers are looked for in the archive and with
 `--layer-path`.
 
+`inspect` and `layers` also read an image in an object store (see
+[Checkpoint images in object stores](#checkpoint-images-in-object-stores)),
+given its image path, which holds only the options file: they read its
+metadata, and its layers' in its `layers/` directory, through a checkpoint
+gofer, and none of its pages. `inspect` then shows the objects' URIs as the
+paths of the pages files, and no state file size, which the store does not
+report. The other commands refuse such an image.
+
 ### Using checkpointctl
 
 [checkpointctl](https://github.com/checkpoint-restore/checkpointctl) reads the
@@ -629,6 +637,11 @@ instead, once containerd passes them to the containers' specs:
     Stopping or deleting a pod that was never resumed ends the whole pod at
     the first `SIGKILL` of any of its containers, without anything in it
     running, as [Restoring paused](#restoring-paused) describes.
+
+The image path may hold the checkpoint in an object store (see
+[Checkpoint images in object stores](#checkpoint-images-in-object-stores)):
+the shim learns which containers a checkpoint holds from `runsc image
+inspect`, which reads the image wherever runsc restores it from.
 
 The shim removes these annotations from the specs it passes to runsc, and
 refuses any other annotation with the `dev.gvisor.internal.restore.` prefix.
