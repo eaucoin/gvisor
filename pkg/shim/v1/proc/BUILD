@@ -53,6 +53,7 @@ go_test(
     ],
     library = ":proc",
     deps = [
+        "//pkg/shim/v1/extension",
         "//pkg/shim/v1/runsccmd",
         "@com_github_containerd_console//:go_default_library",
         "@com_github_containerd_containerd_v2//pkg/protobuf/types:go_default_library",
