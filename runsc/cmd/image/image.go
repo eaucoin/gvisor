@@ -66,8 +66,9 @@ func (*Image) Usage() string {
 	buf.WriteString(`Usage: image <subcommand> <subcommand args>
 
 The image commands work on uncompressed checkpoint images (directories written
-by "runsc checkpoint --image-path") without a sandbox. They never modify an
-image: commands that rewrite one write a new image directory.
+by "runsc checkpoint --image-path") without a sandbox; inspect and layers also
+read compressed ones, single state files. They never modify an image: commands
+that rewrite one write a new image directory.
 
 inspect, verify and layers also read the checkpoint archives that container
 engines (containerd, CRI-O, Podman) make of runsc containers, as checkpointctl
