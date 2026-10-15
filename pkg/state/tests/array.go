@@ -33,3 +33,19 @@ type sliceContainer struct {
 type slicePtrContainer struct {
 	v *[]any
 }
+
+// namedByte is a byte of a type of its own.
+type namedByte uint8
+
+// +stateify savable
+type byteArrayContainer struct {
+	array      [3]byte
+	named      [3]namedByte
+	namedSlice []namedByte
+	inner      arrayOfBytes
+}
+
+// +stateify savable
+type arrayOfBytes struct {
+	v [2]byte
+}
