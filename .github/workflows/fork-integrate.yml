@@ -1,6 +1,6 @@
 # Keeps main made of the series in SERIES, and every series tested.
 #
-# Every quarter of an hour, after every tier-1 run, and on demand, it:
+# Every hour, after every tier-1 run, and on demand, it:
 # - disables every workflow that is not the fork's own (fork-*.yml): upstream's
 #   push the go branch, mirror upstream releases or need upstream's secrets;
 # - rebuilds main with tools/fork/series.sh from the longest prefix of SERIES
@@ -13,11 +13,16 @@
 #   "fork-ci" status yet, or one from a cancelled run: with main's workflows
 #   as just pushed, or, for the fork's own series (series/fork-*), which
 #   change the workflows, with their own.
+#
+# A push to a series cannot start it: GitHub reads a push's workflows from the
+# commit pushed, and a work item's series holds upstream's alone. Whoever
+# pushes series dispatches it to have their tier 1 start at once; the hourly
+# run picks up what nobody did.
 name: Fork integrate
 
 "on":
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: "7 * * * *"
   # GitHub runs schedules late or not at all under load: a finished tier 1
   # also starts it, so that main follows its series at once.
   workflow_run:
