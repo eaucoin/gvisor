@@ -680,6 +680,17 @@ and restore: Kubernetes writes `/etc/hosts`, `/etc/hostname` and
 containers, pods or the host while the sandbox is checkpointed. `all` suits
 sandboxes whose mounts do not change, such as read-only volumes.
 
+The files that a checkpoint holds are those that something in the sandbox
+pins as it is saved: an open file, a mapped one (such as a running
+executable, even with its file descriptor closed), a working or root
+directory, a mount point, a bound socket, a watched file, and their
+directories. A checkpoint evicts every other file from the gofer's dentry
+cache before it saves. So a container checkpointed with `--leave-running`,
+which runs on and changes its files, may be restored as long as no pinned
+file is gone or, where checked, changed: one it only looked up is looked up
+again, as it is on the host. A restore that fails stops the sandbox and the
+gofer that it started, so that waiting on the container returns.
+
 ## Networking
 
 Checkpoint/restore is supported with `--network=sandbox` (default),

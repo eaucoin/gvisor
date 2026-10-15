@@ -3928,6 +3928,258 @@ func TestCheckpointRestoreLeaveRunningClone(t *testing.T) {
 	}
 }
 
+// TestCheckpointLeaveRunningRestoresWhatMovedOn checks what the restore of a
+// checkpoint taken with --leave-running asks of the files that the container,
+// running on, changes after it. The checkpoint holds only the files pinned at
+// the save: an open file, and a mapped one, as a running executable is, and
+// their directories. They must be as they were, and a restore fails, stopping
+// its sandbox and gofer so that waiting on it returns, where one is gone or
+// changed. A file the container only looked up is not held: the save evicts
+// it from the dentry cache, and the container that runs on after the save,
+// and the restored one, look it up as it is on the host now.
+func TestCheckpointLeaveRunningRestoresWhatMovedOn(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		// change changes the files of dir after the checkpoint.
+		change func(dir string) error
+		// looked is what the containers read of the looked-up file, and
+		// entries how many entries they list in the looked-up directory,
+		// once the change is made, where the restore must succeed.
+		looked  string
+		entries string
+		// wantErr is a substring of the restore's error, or empty if it must
+		// succeed.
+		wantErr string
+	}{
+		{
+			name:    "looked-up file deleted",
+			change:  func(dir string) error { return os.Remove(filepath.Join(dir, "looked")) },
+			looked:  "gone",
+			entries: "2",
+		},
+		{
+			name: "looked-up file changed",
+			change: func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "looked"), []byte("changed since"), 0666)
+			},
+			looked:  "changed since",
+			entries: "2",
+		},
+		{
+			name:    "looked-up directory deleted",
+			change:  func(dir string) error { return os.RemoveAll(filepath.Join(dir, "dir")) },
+			looked:  "before",
+			entries: "0",
+		},
+		{
+			name:    "open file deleted",
+			change:  func(dir string) error { return os.Remove(filepath.Join(dir, "open")) },
+			wantErr: "failed to walk",
+		},
+		{
+			name:    "open file changed",
+			change:  func(dir string) error { return appendTo(filepath.Join(dir, "open")) },
+			wantErr: "file size validation failed",
+		},
+		{
+			name:    "mapped file deleted",
+			change:  func(dir string) error { return os.Remove(filepath.Join(dir, "test_app")) },
+			wantErr: "failed to walk",
+		},
+		{
+			name:    "mapped file changed",
+			change:  func(dir string) error { return appendTo(filepath.Join(dir, "test_app")) },
+			wantErr: "file size validation failed",
+		},
+	} {
+		for name, conf := range configs(t, true /* noOverlay */) {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				if err := conf.RestoreValidateFiles.Set("all"); err != nil {
+					t.Fatalf("error setting restore-validate-files: %v", err)
+				}
+				dir, err := os.MkdirTemp(testutil.TmpDir(), "moved-on")
+				if err != nil {
+					t.Fatalf("os.MkdirTemp failed: %v", err)
+				}
+				defer os.RemoveAll(dir)
+				imagePath := filepath.Join(dir, "image")
+				for _, d := range []string{dir, imagePath, filepath.Join(dir, "dir")} {
+					if err := os.MkdirAll(d, 0777); err != nil {
+						t.Fatalf("os.MkdirAll(%q) failed: %v", d, err)
+					}
+					if err := os.Chmod(d, 0777); err != nil {
+						t.Fatalf("os.Chmod(%q) failed: %v", d, err)
+					}
+				}
+				for path, content := range map[string]string{"looked": "before", "dir/a": "a", "dir/b": "b", "open": "open"} {
+					if err := os.WriteFile(filepath.Join(dir, path), []byte(content), 0666); err != nil {
+						t.Fatalf("os.WriteFile(%q) failed: %v", path, err)
+					}
+				}
+				if err := copyFile(app, filepath.Join(dir, "test_app")); err != nil {
+					t.Fatalf("error copying test_app: %v", err)
+				}
+				outputPath := filepath.Join(dir, "output")
+				// The shell holds open, and test_app maps, a file of dir, and each
+				// round looks up the others and says what it found.
+				script := fmt.Sprintf(`exec 3<%[1]s/open
+%[1]s/test_app reaper &
+while true; do
+  looked=$(cat %[1]s/looked 2>/dev/null || echo gone)
+  cat %[1]s/dir/a > /dev/null 2>&1
+  echo "$(uname -n) $(ls %[1]s/dir 2>/dev/null | wc -l) $looked" >> %[2]s
+  sleep 0.1
+done`, dir, outputPath)
+				newContainer := func(hostname string) *Container {
+					t.Helper()
+					spec := testutil.NewSpecWithArgs("bash", "-c", script)
+					spec.Hostname = hostname
+					_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+					if err != nil {
+						t.Fatalf("error setting up container: %v", err)
+					}
+					t.Cleanup(cleanup)
+					cont, err := New(conf, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir})
+					if err != nil {
+						t.Fatalf("error creating container: %v", err)
+					}
+					t.Cleanup(func() { cont.Destroy() })
+					return cont
+				}
+				// lastSaid is what the container of hostname said last, and
+				// how many times it said anything.
+				lastSaid := func(hostname string) (string, int) {
+					t.Helper()
+					data, err := os.ReadFile(outputPath)
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatalf("error reading output: %v", err)
+					}
+					last, n := "", 0
+					for _, line := range strings.Split(string(data), "\n") {
+						if said, ok := strings.CutPrefix(line, hostname+" "); ok {
+							last, n = said, n+1
+						}
+					}
+					return last, n
+				}
+				says := func(hostname, want string) error {
+					return testutil.Poll(func() error {
+						if got, _ := lastSaid(hostname); got != want {
+							return fmt.Errorf("%s says %q, want %q", hostname, got, want)
+						}
+						return nil
+					}, 30*time.Second)
+				}
+
+				original := newContainer("original")
+				if err := original.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				if err := says("original", "2 before"); err != nil {
+					t.Fatal(err)
+				}
+				if err := original.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Resume: true}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				if err := tc.change(dir); err != nil {
+					t.Fatalf("error changing the files: %v", err)
+				}
+				// The original runs on after the save that evicted its cache,
+				// and finds its files as they are now.
+				if tc.wantErr == "" {
+					if err := says("original", tc.entries+" "+tc.looked); err != nil {
+						t.Fatalf("after the save: %v", err)
+					}
+				} else {
+					_, before := lastSaid("original")
+					if err := testutil.Poll(func() error {
+						if _, n := lastSaid("original"); n < before+5 {
+							return fmt.Errorf("original said %d more lines", n-before)
+						}
+						return nil
+					}, 30*time.Second); err != nil {
+						t.Fatalf("after the save: %v", err)
+					}
+				}
+
+				clone := newContainer("clone")
+				err = clone.Restore(conf, imagePath, sandbox.RestoreOpts{})
+				if tc.wantErr == "" {
+					if err != nil {
+						t.Fatalf("restore failed: %v", err)
+					}
+					if err := says("clone", tc.entries+" "+tc.looked); err != nil {
+						t.Fatalf("after the restore: %v", err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("restore: got error %v, want one containing %q", err, tc.wantErr)
+				}
+				// The failed restore left nothing running, and waiting on it
+				// returns.
+				if running, err := clone.IsSandboxRunning(); err != nil || running {
+					t.Errorf("the clone's sandbox runs (%v) after its restore failed: %v", running, err)
+				}
+				// The gofer, killed, is a child of this process here, a zombie
+				// until clone.Wait reaps it: it is gone, or one, once it ended.
+				if goferPid := clone.GoferPid.Load(); goferPid != 0 {
+					if err := testutil.Poll(func() error {
+						stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", goferPid))
+						if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+							return nil
+						}
+						if err != nil {
+							return &backoff.PermanentError{Err: err}
+						}
+						// Its state is the first field past its name's ")".
+						fields := strings.Fields(string(stat[strings.LastIndex(string(stat), ")")+1:]))
+						if len(fields) == 0 || fields[0] != "Z" {
+							return fmt.Errorf("its state is %q", fields)
+						}
+						return nil
+					}, 10*time.Second); err != nil {
+						t.Errorf("the clone's gofer %d lives after its restore failed: %v", goferPid, err)
+					}
+				}
+				if clone.Status != Stopped {
+					t.Errorf("the clone is %v after its restore failed, want %v", clone.Status, Stopped)
+				}
+				waited := make(chan error, 1)
+				go func() {
+					_, err := clone.Wait()
+					waited <- err
+				}()
+				select {
+				case <-waited:
+				case <-time.After(30 * time.Second):
+					t.Fatal("waiting on the clone did not return after its restore failed")
+				}
+				if running, err := original.IsSandboxRunning(); err != nil || !running {
+					t.Errorf("the original's sandbox stopped (err: %v)", err)
+				}
+			})
+		}
+	}
+}
+
+// appendTo appends to the file at path, which changes its size.
+func appendTo(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write([]byte("changed"))
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
 // TestUnixDomainSockets checks that Checkpoint/Restore works in cases
 // with filesystem Unix Domain Socket use.
 func TestUnixDomainSockets(t *testing.T) {
