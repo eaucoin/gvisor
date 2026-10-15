@@ -19,10 +19,12 @@ import (
 	"os/exec"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/containerd/console"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	runc "github.com/containerd/go-runc"
+	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 )
 
@@ -101,5 +103,34 @@ func TestCreatedStateStartFailureSandbox(t *testing.T) {
 	}
 	if _, ok := p.initState.(*createdState); !ok {
 		t.Errorf("initState = %T, want *createdState", p.initState)
+	}
+}
+
+// TestCreatedStateRestoreFailureSandbox verifies that a sandbox whose restore
+// failed is stopped, so that waiting on it returns, rather than wait for an
+// exit that its sandbox, left with no kernel to start, never makes.
+func TestCreatedStateRestoreFailureSandbox(t *testing.T) {
+	p := New("id", &runsccmd.Runsc{Command: "/nonexistent-runsc"}, stdio.Stdio{Terminal: true})
+	p.Platform = fakePlatform{}
+	p.Sandbox = true
+
+	if err := p.Restore(t.Context(), &extension.RestoreConfig{ImagePath: "/nonexistent-image"}); err == nil {
+		t.Fatal("Restore() succeeded, want error")
+	}
+	if _, ok := p.initState.(*stoppedState); !ok {
+		t.Errorf("initState = %T, want *stoppedState", p.initState)
+	}
+	if got := p.ExitStatus(); got != InternalErrorCode {
+		t.Errorf("ExitStatus() = %d, want %d", got, InternalErrorCode)
+	}
+	waited := make(chan struct{})
+	go func() {
+		p.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait() did not return after the restore failed")
 	}
 }
