@@ -76,6 +76,7 @@ error rather than ignored:
   "region": "us-east-1",
   "bucket": "checkpoints",
   "object_prefix": "my-sandbox/",
+  "layers_prefix": "my-images/",
   "addressing": "path",
   "credentials": {"access_key_id": "...", "secret_access_key": "...", "session_token": "..."},
   "credentials_file": "/etc/runsc/s3-credentials",
@@ -97,7 +98,11 @@ option.
 
 `runsc/checkpointgofer/s3` is the GCS backend's sibling: `s3.FileServer`
 implements `stateipc.AsyncFileServerImpl`, with the same per-operation
-allowances, and names the object of each file `object_prefix + name`.
+allowances, and names the object of each file `object_prefix + name`, but
+for the files of the image's layers (`layers/<digest>/<name>`), which are
+`layers_prefix + <digest>/<name>` when `layers_prefix` is set: a store can keep
+each image once, by its digest, as the layer of every image after it, and an
+image's commit is then the write of whatever names it.
 
 **Reads** are ranged GETs, one goroutine per slot. The pages file is read in
 16 MiB reads, 8 in flight, by default (GCS's read size, and the best first
