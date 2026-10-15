@@ -50,11 +50,15 @@ func (*layers) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	d, closeImage, err := openImage(f.Arg(0), nil /* layerPaths */, false /* withPages */)
+	d, closeImage, err := openImageMetadata(f.Arg(0), nil /* layerPaths */)
 	if err != nil {
 		return exitStatus(err)
 	}
 	defer closeImage()
+	if d.img == nil {
+		// A single state file refers to no other image.
+		return subcommands.ExitSuccess
+	}
 	for _, l := range d.img.Layers()[1:] {
 		fmt.Println(l.Digest)
 	}
