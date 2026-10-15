@@ -22,15 +22,26 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // imageDir is an image directory that has been read.
 type imageDir struct {
+	// path is the image directory. For an image in an object store, it holds
+	// only the checkpoint gofer's options file, and stands for the image's
+	// location in the store in paths of the image.
 	path string
+
+	// store is the URI of the image's location in an object store (e.g.
+	// "s3://bucket/prefix"), or "" if the image is in path. Only
+	// openImageMetadata opens such an image.
+	store string
 
 	// img is the image's pages metadata, or nil if the image is a single
 	// state file, which holds its memory too, as a compressed checkpoint
@@ -45,7 +56,9 @@ type imageDir struct {
 	// if it was not found.
 	layerDirs []string
 
-	// state is the metadata of the state file, and stateSize its size.
+	// state is the metadata of the state file, and stateSize its size, or 0
+	// for an image in an object store, whose sizes the checkpoint gofer does
+	// not report.
 	state     map[string]string
 	stateSize int64
 }
@@ -79,8 +92,22 @@ func openImage(path string, layerPaths []string, withPages bool) (d *imageDir, c
 // openImageMetadata opens the image at path as openImage does, without the
 // data of an archive's pages files, for a command that reads only the image's
 // metadata. The image may also be a directory holding a single state file, as
-// a compressed checkpoint is, whose imageDir has no img.
-func openImageMetadata(path string, layerPaths []string) (d *imageDir, close func(), err error) {
+// a compressed checkpoint is, whose imageDir has no img; or one holding the
+// options file of a checkpoint gofer, which reads the image in an object store
+// (see openRemoteImage).
+func openImageMetadata(conf *config.Config, path string, layerPaths []string) (d *imageDir, close func(), err error) {
+	if st, err := os.Stat(path); err == nil && st.IsDir() {
+		d, err := openRemoteImage(conf, path)
+		if err != nil {
+			return nil, nil, err
+		}
+		if d != nil {
+			if len(layerPaths) != 0 {
+				return nil, nil, fmt.Errorf("layer paths %q cannot be used with an image in an object store, whose layers are in its %q directory", layerPaths, checkpointimage.LayersDir)
+			}
+			return d, func() {}, nil
+		}
+	}
 	if _, err := os.Stat(filepath.Join(path, checkpointfiles.PagesMetadataFileName)); errors.Is(err, fs.ErrNotExist) {
 		if _, err := os.Stat(filepath.Join(path, checkpointfiles.StateFileName)); err == nil {
 			if len(layerPaths) != 0 {
@@ -96,6 +123,12 @@ func openImageMetadata(path string, layerPaths []string) (d *imageDir, close fun
 // displayPath returns how to show p, a path of d or of its layers, to the
 // user.
 func (d *imageDir) displayPath(p string) string {
+	if d.store != "" {
+		if rel, err := filepath.Rel(d.path, p); err == nil && filepath.IsLocal(rel) {
+			return strings.TrimSuffix(d.store, "/") + "/" + rel
+		}
+		return p
+	}
 	if d.archive == nil {
 		return p
 	}
@@ -105,6 +138,9 @@ func (d *imageDir) displayPath(p string) string {
 // openImageDir reads the image in dir, and looks for its layers in
 // dir/layers and in layerPaths.
 func openImageDir(dir string, layerPaths []string) (*imageDir, error) {
+	if uri := sandbox.CheckpointGoferURI(dir); uri != "" {
+		return nil, fmt.Errorf("%s holds the options of a checkpoint gofer for %s: only inspect and layers read an image in an object store", dir, uri)
+	}
 	img, err := checkpointimage.ReadMetadataFile(filepath.Join(dir, checkpointfiles.PagesMetadataFileName))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("%s has no %s: it is not an uncompressed checkpoint image", dir, checkpointfiles.PagesMetadataFileName)
