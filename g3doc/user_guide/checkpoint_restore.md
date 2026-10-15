@@ -737,6 +737,12 @@ Gateway and others), the file is `s3_opts.json`:
     configuration, such as `AWS_REGION`, or `us-east-1` with an `endpoint`).
 -   `bucket` and `object_prefix`: where the objects are; the prefix is
     prepended to file names as is (end it with `/` to make it a directory).
+-   `layers_prefix`: where the image's layers are, if not under
+    `object_prefix` in `layers/`: the files of the layer `<identity>` are then
+    `<layers_prefix><identity>/pages_meta.img` and `.../pages.img`. A store
+    that keeps each image once, as `<layers_prefix><identity>/`, restores any
+    of them with `object_prefix` set to its directory and `layers_prefix` to
+    their parent.
 -   `addressing`: `path` (`https://host/bucket/key`, the default with an
     `endpoint`, as most stores other than Amazon S3 require) or `virtual`
     (`https://bucket.host/key`).

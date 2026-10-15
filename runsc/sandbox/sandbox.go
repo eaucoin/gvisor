@@ -2162,6 +2162,30 @@ func CheckpointGoferURI(imagePath string) string {
 	return ""
 }
 
+// CheckpointGoferLayersURI returns the URI (e.g. "s3://bucket/layers/") under
+// which the checkpoint gofer that the options file under imagePath selects
+// reads the image's layers, each in a directory named by its digest, if the
+// options give the layers a prefix of their own (layers_prefix); otherwise,
+// it returns an empty string, and the layers are in the image's layers/
+// directory.
+func CheckpointGoferLayersURI(imagePath string) string {
+	for _, store := range checkpointGoferStores {
+		data, err := os.ReadFile(path.Join(imagePath, store.optsFileName))
+		if err != nil {
+			continue
+		}
+		var opts struct {
+			Bucket       string `json:"bucket"`
+			LayersPrefix string `json:"layers_prefix"`
+		}
+		if err := json.Unmarshal(data, &opts); err != nil || opts.Bucket == "" || opts.LayersPrefix == "" {
+			return ""
+		}
+		return fmt.Sprintf("%s://%s/%s", store.uriScheme, opts.Bucket, strings.TrimPrefix(opts.LayersPrefix, "/"))
+	}
+	return ""
+}
+
 // openCheckpointGoferOptions returns the store whose options file is in
 // imagePath, and the file, open; or nil if there is none.
 func openCheckpointGoferOptions(imagePath string) (*checkpointGoferStore, *os.File, error) {

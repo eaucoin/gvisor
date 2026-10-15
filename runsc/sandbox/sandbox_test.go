@@ -161,6 +161,35 @@ func TestCheckpointGoferURI(t *testing.T) {
 	}
 }
 
+func TestCheckpointGoferLayersURI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "no layers prefix",
+			content: `{"bucket": "my-test-bucket", "object_prefix": "snapshots/test/"}`,
+			want:    "",
+		},
+		{
+			name:    "layers prefix",
+			content: `{"bucket": "my-test-bucket", "object_prefix": "snapshots/test/layers/1/", "layers_prefix": "snapshots/test/layers/"}`,
+			want:    "s3://my-test-bucket/snapshots/test/layers/",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, checkpointS3OptsFileName), []byte(tc.content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if got := CheckpointGoferLayersURI(dir); got != tc.want {
+				t.Errorf("CheckpointGoferLayersURI(%s) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOpenCheckpointGoferOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
