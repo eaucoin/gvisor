@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"sort"
 
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/state/wire"
 )
 
@@ -538,7 +539,16 @@ func (es *encodeState) encodeStruct(obj reflect.Value, dest *wire.Object) {
 }
 
 // encodeArray encodes an array.
+//
+// An array of bytes is encoded as a string of them: as a wire.Array, each byte
+// would take an Object, sixteen bytes, until Save writes them, and a varint
+// on the wire.
 func (es *encodeState) encodeArray(obj reflect.Value, dest *wire.Object) {
+	if obj.Type().Elem().Kind() == reflect.Uint8 {
+		s := wire.String(bytesOf(obj))
+		*dest = &s // Needs alloc.
+		return
+	}
 	l := obj.Len()
 	a := &wire.Array{
 		Contents: make([]wire.Object, l),
@@ -549,6 +559,21 @@ func (es *encodeState) encodeArray(obj reflect.Value, dest *wire.Object) {
 		// using the type information from only the first element.
 		es.encodeObject(obj.Index(i), encodeAsValue, &a.Contents[i])
 	}
+}
+
+// bytesOf returns the contents of obj, an array of bytes, as a string. One
+// that is addressable, as an array is when Save reaches it through a pointer,
+// a slice or a field, is not copied: the objects Save encodes do not change
+// while it runs, and their encoding lives no longer.
+func bytesOf(obj reflect.Value) string {
+	if obj.CanAddr() {
+		return gohacks.StringFromImmutableBytes(obj.Bytes())
+	}
+	b := make([]byte, obj.Len())
+	for i := range b {
+		b[i] = byte(obj.Index(i).Uint())
+	}
+	return gohacks.StringFromImmutableBytes(b)
 }
 
 // findType recursively finds type information.

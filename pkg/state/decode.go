@@ -570,7 +570,15 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 			Failf("complex number truncated from %v to %v", complex128(*x), obj.Complex())
 		}
 	case *wire.String:
-		obj.SetString(string(*x))
+		if obj.Kind() != reflect.Array {
+			obj.SetString(string(*x))
+			break
+		}
+		// An array of bytes; see encodeArray.
+		if len(*x) != obj.Len() {
+			Failf("mismatching array length expect=%d, actual=%d", obj.Len(), len(*x))
+		}
+		copy(obj.Bytes(), *x)
 	case *wire.Slice:
 		// See *wire.Ref above; same applies.
 		if id := objectID(x.Ref.Root); id == 0 {
