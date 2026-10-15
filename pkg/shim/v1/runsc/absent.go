@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,18 +28,11 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/fifo"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
-	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
-
-// containerSpecsKey is the key of the state file metadata under which runsc
-// saves the specs of the containers that a checkpoint holds, by name
-// (runsc/boot.ContainerSpecsKey; the shim does not link runsc/boot).
-const containerSpecsKey = "container_specs"
 
 // checkpointHolds reports whether the checkpoint in imagePath holds the
 // container whose spec is in bundle.
@@ -47,7 +40,12 @@ const containerSpecsKey = "container_specs"
 // Only a named subcontainer can be absent from it: the root container's
 // restore brings back the whole sandbox, and runsc pairs a container whose
 // spec carries no name with one of the checkpoint's by creation order.
-func checkpointHolds(imagePath, bundle string) (bool, error) {
+//
+// runsc, which restores from the checkpoint, tells the containers it holds
+// from the checkpoint's own metadata, wherever the image lives: in imagePath,
+// or in an object store that a checkpoint gofer's options file in imagePath
+// selects.
+func checkpointHolds(ctx context.Context, imagePath, bundle, namespace string, opts *Options) (bool, error) {
 	spec, err := utils.ReadSpec(bundle)
 	if err != nil {
 		return false, fmt.Errorf("read oci spec: %w", err)
@@ -56,23 +54,12 @@ func checkpointHolds(imagePath, bundle string) (bool, error) {
 	if specutils.IsRootContainer(spec) || name == "" {
 		return true, nil
 	}
-	// The checkpoint is as trusted as the bundle that names it: runsc
-	// restores from it.
-	f, err := os.Open(filepath.Join(imagePath, checkpointfiles.StateFileName))
+	runsc := proc.NewRunsc(opts.Root, bundle, namespace, opts.BinaryName, opts.RunscConfig, spec)
+	info, err := runsc.ImageInspect(ctx, imagePath)
 	if err != nil {
 		return false, fmt.Errorf("checkpoint %q: %w", imagePath, err)
 	}
-	defer f.Close()
-	metadata, err := statefile.MetadataUnsafe(f)
-	if err != nil {
-		return false, fmt.Errorf("checkpoint %q: read state file metadata: %w", imagePath, err)
-	}
-	checkpointed, err := specutils.GetSpecsFromString(metadata[containerSpecsKey])
-	if err != nil {
-		return false, fmt.Errorf("checkpoint %q: %w", imagePath, err)
-	}
-	_, ok := checkpointed[name]
-	return ok, nil
+	return slices.Contains(info.Containers, name), nil
 }
 
 // absentProcess is the init process of a container that the checkpoint it is
