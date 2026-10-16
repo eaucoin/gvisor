@@ -17,6 +17,8 @@ package control
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -300,6 +302,9 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
+	// What the save allocates is garbage once it has ended; see
+	// collectAfterSave.
+	defer collectAfterSave()
 	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
 		return err
 	}
@@ -309,6 +314,39 @@ func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExec
 		}
 	}
 	return nil
+}
+
+// collectAfterSave collects, in the background, the garbage of the save that
+// has just ended, and returns to the host the memory it held.
+//
+// A save allocates in proportion to the state it writes, hundreds of
+// megabytes for a sandbox of a few gigabytes, all of it garbage once the state
+// is written. The Go runtime's background scavenger returns to the host the
+// heap's free memory beyond what its heap goal says it will need, and that
+// goal is set by the last collection, which ran during the save, while the
+// save's allocations were live. Until the next collection, which a Sentry that
+// allocates little may not run for a long time, the Sentry so keeps memory
+// for a heap as large as the save's: a sandbox saved again and again as its
+// memory grows keeps the largest save's. Even once a collection has set the
+// goal anew, the scavenger, paced to a sliver of one CPU, returns hundreds of
+// megabytes over minutes. FreeOSMemory collects, then returns the heap's free
+// memory at once.
+//
+// It runs on a goroutine of its own, so that the save's caller does not wait
+// for it: a sandbox left running runs on meanwhile, stopped only for the
+// collection's brief stop-the-world phases, though what in it allocates waits
+// for the heap while its free memory is returned. The log says how long both
+// took.
+func collectAfterSave() {
+	go func() {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		start := time.Now()
+		debug.FreeOSMemory()
+		took := time.Since(start)
+		runtime.ReadMemStats(&after)
+		log.Infof("Collected the save's garbage and returned it to the host in %v, the world stopped for %v of it: heap in use %d -> %d bytes, held from the host %d -> %d bytes", took, time.Duration(after.PauseTotalNs-before.PauseTotalNs), before.HeapAlloc, after.HeapAlloc, before.HeapSys-before.HeapReleased, after.HeapSys-after.HeapReleased)
+	}()
 }
 
 // preSave is called before saving the kernel.
