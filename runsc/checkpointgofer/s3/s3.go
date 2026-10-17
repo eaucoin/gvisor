@@ -163,11 +163,35 @@ type FileServerOptions struct {
 	PagesFileReadBytes    uint64
 	PagesFileReadParallel int
 
+	// If PagesRetryWhileRunning is true, reads of pages files (an image's and
+	// its layers') that fail as they may not again, as when the store is away
+	// for a while, are retried for as long as the FileServer runs, with
+	// backoff of at most 10 seconds, rather than MaxAttempts times. A restore
+	// that loads its pages in the background then waits for the store to come
+	// back, where its pages would otherwise never be loaded and the sandbox
+	// could not use them; an application that touches a page not yet loaded
+	// waits too. Its other files are read as MaxAttempts says, so that a restore
+	// whose store is away fails before it begins.
+	PagesRetryWhileRunning bool
+
 	// PagesFilePartBytes and PagesFileWriteParallel are the size of the parts
 	// in which the pages file is uploaded and the number of parts uploaded at
 	// once. If they are 0, they are 32 MiB and 4.
 	PagesFilePartBytes     int
 	PagesFileWriteParallel int
+}
+
+// ParsePagesRetry returns the FileServerOptions.PagesRetryWhileRunning that
+// value, the pages_retry option of a checkpoint gofer's S3 options, says: false
+// for "", true for "while-running".
+func ParsePagesRetry(value string) (bool, error) {
+	switch value {
+	case "":
+		return false, nil
+	case "while-running":
+		return true, nil
+	}
+	return false, fmt.Errorf("unknown pages_retry value %q", value)
 }
 
 // retryPolicy bounds the requests of a FileServer.
@@ -348,6 +372,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		maxReadBytes uint64
 		maxRanges    = 1
 		maxParallel  int
+		whileRunning bool
 	)
 	switch name {
 	case checkpointfiles.StateFileName:
@@ -369,6 +394,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		// use readv, we aren't subject to UIO_MAXIOV.
 		maxReadBytes, maxParallel = s.opts.PagesFileReadBytes, s.opts.PagesFileReadParallel
 		maxRanges = int(maxReadBytes / uint64(os.Getpagesize()))
+		whileRunning = s.opts.PagesRetryWhileRunning
 	default:
 		log.Warningf("s3.FileServer.OpenRead: unknown path %q", path)
 		return nil, fs.ErrPermission
@@ -379,7 +405,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	}
 	obj := s.object(path)
 	log.Infof("Opening %s for reading", obj)
-	return newReader(s.ctx, s.client, obj, s.retry, maxReadBytes, maxRanges, maxParallel), nil
+	return newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel), nil
 }
 
 // OpenWrite implements stateipc.AsyncFileServerImpl.OpenWrite.
