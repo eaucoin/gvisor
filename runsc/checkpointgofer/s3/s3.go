@@ -21,8 +21,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -113,6 +115,13 @@ type FileServerOptions struct {
 	// is empty, the AWS endpoint of Region is used.
 	Endpoint string
 
+	// Socket, if not empty, is the absolute path of a Unix domain socket on
+	// which the store at Endpoint is served: requests connect to it, whatever
+	// Endpoint's host, and not through a proxy. Each connection dials it anew,
+	// so that a store that comes back on a new socket at the path, as a
+	// process that restarts does, is found there. It requires an Endpoint.
+	Socket string
+
 	// Region is the region that requests are signed for. If it is empty, the
 	// AWS SDK's configuration (AWS_REGION, the shared configuration file)
 	// provides it, or, with an Endpoint, it is "us-east-1".
@@ -194,6 +203,44 @@ func ParsePagesRetry(value string) (bool, error) {
 	return false, fmt.Errorf("unknown pages_retry value %q", value)
 }
 
+// checkSocket returns an error unless socket, FileServerOptions.Socket, is the
+// absolute path of a Unix domain socket and endpoint is not empty.
+func checkSocket(socket, endpoint string) error {
+	if endpoint == "" {
+		return fmt.Errorf("socket %q requires an endpoint", socket)
+	}
+	if !filepath.IsAbs(socket) {
+		return fmt.Errorf("socket %q is not an absolute path", socket)
+	}
+	fi, err := os.Stat(socket)
+	if err != nil {
+		return fmt.Errorf("socket: %w", err)
+	}
+	if fi.Mode().Type() != fs.ModeSocket {
+		return fmt.Errorf("socket %q is not a Unix domain socket", socket)
+	}
+	return nil
+}
+
+// newTransport returns the transport of a FileServer's requests, with up to
+// maxConns idle connections, which connect to socket unless it is empty.
+func newTransport(socket string, maxConns int) *http.Transport {
+	t := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConnsPerHost: maxConns,
+		// Disable HTTP/2 for performance, as the GCS checkpoint gofer does.
+		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+	}
+	if socket != "" {
+		t.Proxy = nil
+		var d net.Dialer
+		t.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return d.DialContext(ctx, "unix", socket)
+		}
+	}
+	return t
+}
+
 // retryPolicy bounds the requests of a FileServer.
 type retryPolicy struct {
 	maxAttempts int
@@ -245,6 +292,12 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 		return nil, fmt.Errorf("pages file part size %d is not between %d and %d", o.PagesFilePartBytes, minPartBytes, maxPartBytes)
 	}
 
+	if o.Socket != "" {
+		if err := checkSocket(o.Socket, o.Endpoint); err != nil {
+			return nil, err
+		}
+	}
+
 	if o.SharedCredentialsFile != "" {
 		fi, err := os.Stat(o.SharedCredentialsFile)
 		if err != nil {
@@ -268,15 +321,7 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 				so.RateLimiter = ratelimit.None
 			})
 		}),
-		config.WithHTTPClient(&http.Client{
-			Transport: &http.Transport{
-				Proxy:               http.ProxyFromEnvironment,
-				MaxIdleConnsPerHost: maxConns,
-				// Disable HTTP/2 for performance, as the GCS checkpoint
-				// gofer does.
-				TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
-			},
-		}),
+		config.WithHTTPClient(&http.Client{Transport: newTransport(o.Socket, maxConns)}),
 		// Checksums of whole objects cannot check ranged reads, and stores
 		// other than AWS do not all accept the trailing checksums of
 		// uploads; checkpoint images carry their own.
