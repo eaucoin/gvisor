@@ -763,6 +763,19 @@ Gateway and others), the file is `s3_opts.json`:
     stalled store fails a checkpoint or restore rather than hangs it.
 -   `read_bytes` and `read_parallel` (default 16 MiB and 8): the size of reads
     of `pages.img` and the number in flight.
+-   `pages_retry` (default none): `"while-running"` retries reads of
+    `pages.img`, the image's and its layers', for as long as the sandbox runs
+    rather than `max_attempts` times, after a backoff of up to 10 seconds that
+    grows from 1 second, each attempt still bounded by
+    `request_timeout_seconds`. A restore whose pages are loaded in the
+    background (`--background`) then waits for a store that is away for a
+    while, as when it restarts, instead of failing the load and ending the
+    sandbox: meanwhile, an application that touches a page not yet loaded
+    waits for it. Errors that recur, as a missing object or refused
+    credentials, still fail the restore at once, and the other files are read
+    as `max_attempts` says, so that a restore whose store is away fails before
+    it begins. A store that stays away keeps the sandbox waiting until it is
+    killed.
 -   `write_part_bytes` and `write_parallel` (default 32 MiB and 4): `pages.img`
     is uploaded in a multipart upload of parts of this size (at least 5 MiB; a
     file smaller than a part is uploaded at once), this many at a time. A
