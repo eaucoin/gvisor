@@ -71,6 +71,11 @@ type S3Options struct {
 	// is empty, the store is AWS's, at the endpoint of Region.
 	Endpoint string `json:"endpoint,omitzero"`
 
+	// Socket, if not empty, is the absolute path of a Unix domain socket on
+	// which the store at Endpoint is served: requests connect to it, whatever
+	// Endpoint's host, and not through a proxy.
+	Socket string `json:"socket,omitzero"`
+
 	// Region is the region that requests are signed for. If it is empty, the
 	// AWS SDK's configuration provides it (e.g. AWS_REGION), or, with an
 	// Endpoint, it is "us-east-1".
@@ -294,6 +299,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		AllowFSCheckpointReads:  cmd.allowFSCheckpointReads,
 		AllowFSCheckpointWrites: cmd.allowFSCheckpointWrites,
 		Endpoint:                opts.Endpoint,
+		Socket:                  opts.Socket,
 		Region:                  opts.Region,
 		Bucket:                  opts.Bucket,
 		ObjectPrefix:            opts.ObjectPrefix,
