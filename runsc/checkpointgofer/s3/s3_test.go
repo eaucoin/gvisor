@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -619,6 +620,156 @@ func TestLayersPrefix(t *testing.T) {
 				t.Errorf("layers prefix %q: reading %q got %q (%d bytes, %v), want the object %q", tc.layersPrefix, path, buf[:c.N], c.N, c.Err, key)
 			}
 		}
+	}
+}
+
+// socketPath returns the path of a Unix domain socket in a new directory,
+// short enough for a socket's address.
+func socketPath(t *testing.T) string {
+	dir, err := os.MkdirTemp("", "s3-socket")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "store.sock")
+}
+
+// serveOnSocket serves s on a new Unix domain socket at path until the server
+// it returns is closed, or the test ends.
+func serveOnSocket(t *testing.T, s *s3test.Store, path string) *http.Server {
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	hs := &http.Server{Handler: s}
+	go hs.Serve(l)
+	t.Cleanup(func() { hs.Close() })
+	return hs
+}
+
+// newSocketFileServer returns a FileServer for the store served on the socket
+// at path, at an endpoint whose host does not resolve.
+func newSocketFileServer(t *testing.T, path string, opts FileServerOptions) *FileServer {
+	opts.Endpoint = "http://store.invalid"
+	opts.Socket = path
+	opts.Bucket = s3test.Bucket
+	opts.UsePathStyle = true
+	opts.Credentials = credentials.NewStaticCredentialsProvider("key", "secret", "")
+	opts.MaxAttempts = 3
+	srv, err := NewFileServer(context.Background(), &opts)
+	if err != nil {
+		t.Fatalf("NewFileServer: %v", err)
+	}
+	t.Cleanup(srv.Destroy)
+	return srv
+}
+
+// TestSocket checks that a FileServer with a Socket reads and writes the store
+// served on it, whatever its Endpoint's host, and not through a proxy.
+func TestSocket(t *testing.T) {
+	s := s3test.NewStore(t)
+	path := socketPath(t)
+	serveOnSocket(t, s, path)
+	srv := newSocketFileServer(t, path, FileServerOptions{AllowCheckpointReads: true, AllowCheckpointWrites: true})
+	obj := testObject(64 << 10)
+	w, err := srv.OpenWrite(checkpointfiles.StateFileName)
+	if err != nil {
+		t.Fatalf("OpenWrite: %v", err)
+	}
+	if err := write(t, w, chunked(obj)...); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got, ok := s.Object(checkpointfiles.StateFileName); !ok || !bytes.Equal(got, obj) {
+		t.Fatalf("the store holds %d bytes (found %t), want the %d written", len(got), ok, len(obj))
+	}
+	buf := make([]byte, len(obj))
+	if c := read(t, openRead(t, srv, checkpointfiles.StateFileName), 0, buf); c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj) {
+		t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+	}
+	if tr := newTransport(path, 1); tr.Proxy != nil {
+		t.Errorf("the transport of a socket has a proxy")
+	}
+}
+
+// TestSocketComesBack checks that the reads of the pages file of a FileServer
+// with a Socket and PagesRetryWhileRunning wait for the store while nothing
+// serves its socket, as when the process serving it restarts, and continue
+// once a new socket at its path does.
+func TestSocketComesBack(t *testing.T) {
+	for _, whileRunning := range []bool{true, false} {
+		t.Run(fmt.Sprintf("while running %t", whileRunning), func(t *testing.T) {
+			s := s3test.NewStore(t)
+			obj := testObject(64 << 10)
+			s.SetObject(checkpointfiles.PagesFileName, obj)
+			path := socketPath(t)
+			first := serveOnSocket(t, s, path)
+			r := openRead(t, newSocketFileServer(t, path, FileServerOptions{AllowCheckpointReads: true, PagesRetryWhileRunning: whileRunning}), checkpointfiles.PagesFileName)
+			buf := make([]byte, len(obj)/2)
+			if c := read(t, r, 0, buf); c.Err != nil {
+				t.Fatalf("read before the store went away: %v", c.Err)
+			}
+			// The store goes away with its socket, and comes back on a new one
+			// after its reader's attempts, as many as MaxAttempts says, failed.
+			first.Close()
+			if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the socket of a closed listener remains: %v", err)
+			}
+			done := make(chan stateio.Completion, 1)
+			go func() { done <- read(t, r, int64(len(buf)), buf) }()
+			var c stateio.Completion
+			select {
+			case c = <-done:
+			case <-time.After(time.Second):
+				serveOnSocket(t, s, path)
+				c = <-done
+			}
+			if whileRunning && (c.N != uint64(len(buf)) || c.Err != nil || !bytes.Equal(buf, obj[len(buf):])) {
+				t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+			}
+			if !whileRunning && !errors.Is(c.Err, unix.EIO) {
+				t.Errorf("read: %d bytes, %v; want 0 bytes, %v", c.N, c.Err, unix.EIO)
+			}
+		})
+	}
+}
+
+// TestNewFileServerSocket checks which Sockets NewFileServer accepts.
+func TestNewFileServerSocket(t *testing.T) {
+	path := socketPath(t)
+	serveOnSocket(t, s3test.NewStore(t), path)
+	file := filepath.Join(filepath.Dir(path), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		socket   string
+		endpoint string
+		ok       bool
+	}{
+		{name: "socket", socket: path, endpoint: "http://store", ok: true},
+		{name: "no endpoint", socket: path},
+		{name: "relative path", socket: filepath.Base(path), endpoint: "http://store"},
+		{name: "missing", socket: path + ".missing", endpoint: "http://store"},
+		{name: "not a socket", socket: file, endpoint: "http://store"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "relative path" {
+				t.Chdir(filepath.Dir(path))
+			}
+			srv, err := NewFileServer(context.Background(), &FileServerOptions{
+				Endpoint:    tc.endpoint,
+				Socket:      tc.socket,
+				Bucket:      s3test.Bucket,
+				Credentials: credentials.NewStaticCredentialsProvider("key", "secret", ""),
+			})
+			if err == nil {
+				srv.Destroy()
+			}
+			if (err == nil) != tc.ok {
+				t.Errorf("NewFileServer with socket %q, endpoint %q: %v, want success %t", tc.socket, tc.endpoint, err, tc.ok)
+			}
+		})
 	}
 }
 

@@ -73,6 +73,7 @@ error rather than ignored:
 ```json
 {
   "endpoint": "https://s3.example.com",
+  "socket": "/run/s3-proxy/store.sock",
   "region": "us-east-1",
   "bucket": "checkpoints",
   "object_prefix": "my-sandbox/",
@@ -92,7 +93,7 @@ error rather than ignored:
 ```
 
 Only `bucket` is required. `credentials` excludes `credentials_file` and
-`profile`. The [user guide](../user_guide/checkpoint_restore.md) documents each
+`profile`; `socket` requires `endpoint`. The [user guide](../user_guide/checkpoint_restore.md) documents each
 option.
 
 ### The S3 backend
@@ -143,6 +144,16 @@ retrying as it is closed, which the sandbox's end does, so a sandbox whose
 store stays away is still destroyed at once. The SDK's checksums of whole
 objects are off: they cannot check ranged reads, not every store accepts them
 on uploads, and checkpoint images carry their own page hashes.
+
+**Socket.** With `socket`, the gofer's requests connect to that Unix domain
+socket rather than to `endpoint`'s host, and not through the environment's
+proxy: a host's proxy to its store (one that holds the store's credentials, or
+reaches it on the host's behalf) then serves the sandboxes without a TCP port
+that every process of the host, the containers on its network among them, could
+reach. The gofer dials the socket for each connection, so that a proxy that
+restarts is found at the same path, and checks at its start that the path is
+absolute and a socket. `endpoint` still names the store's URL, whose host and
+scheme the requests carry.
 
 **Layers** are objects too: the gofer serves
 `layers/<digest>/pages_meta.img` and `layers/<digest>/pages.img` for reading
@@ -262,11 +273,14 @@ CPUs), signed requests, images out of the store's page cache, median of 4:
     with `pages_retry` retry pages files' reads past `max_attempts` through a
     store that is away or stalls (and fail at once on missing objects and
     refused credentials, and on other files after `max_attempts`), and stop
-    retrying as the reader closes, abort failed and unfinished uploads, refuse
-    files outside an operation's allowance, and check file permissions and
-    that errors hold no credentials.
+    retrying as the reader closes, read and write through a `socket` whatever
+    `endpoint`'s host, wait for a socket that goes away and comes back, abort
+    failed and unfinished uploads, refuse files outside an operation's
+    allowance and sockets that are not, and check file permissions and that
+    errors hold no credentials.
 -   `TestCheckpointRestoreS3` (`runsc/container`) checkpoints a container
-    through the gofer to `s3test` and restores it with `--background`.
+    through the gofer to `s3test` and restores it with `--background`;
+    `TestCheckpointRestoreS3Socket` does so through a `socket`.
     `TestCheckpointRestoreS3StoreAway` restores it with `pages_retry` while
     the store is away for longer than `max_attempts` outlast, and checks its
     data; `TestCheckpointRestoreS3StoreGoneKilled` kills the sandbox and

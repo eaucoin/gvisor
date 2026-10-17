@@ -2496,6 +2496,40 @@ func TestCheckpointRestoreS3(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreS3Socket checks that a container checkpoints to and
+// restores with --background from an S3-compatible object store served on the
+// Unix domain socket that its options' socket names, whatever their endpoint's
+// host.
+func TestCheckpointRestoreS3Socket(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			store := s3test.NewStore(t)
+			// In /tmp: a socket's path is at most 107 bytes long, which the
+			// test's own temporary directory may leave too little of.
+			sockDir, err := os.MkdirTemp("/tmp", "s3-socket")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(sockDir)
+			sock := filepath.Join(sockDir, "store.sock")
+			l, err := net.Listen("unix", sock)
+			if err != nil {
+				t.Fatalf("error listening on %q: %v", sock, err)
+			}
+			srv := &http.Server{Handler: store}
+			go srv.Serve(l)
+			defer srv.Close()
+			dir := s3OptsDir(t, "http://store.invalid", fmt.Sprintf(`, "socket": %q`, sock))
+
+			testCheckpointRestoreBackground(t, conf, dir, nil)
+
+			if _, ok := store.Object("image/" + checkpointfiles.PagesFileName); !ok {
+				t.Errorf("checkpoint did not write %s to the object store", checkpointfiles.PagesFileName)
+			}
+		})
+	}
+}
+
 // pagesRetryOpts are the S3 options of the tests of pages_retry: reads of the
 // pages file retried while the sandbox runs, in reads of 1 MiB, so that a
 // 32 MiB container's pages load in many, and 2 attempts of each request,
@@ -2725,6 +2759,13 @@ func TestCheckpointRestoreS3StoreGoneKilled(t *testing.T) {
 func s3ImageDir(t *testing.T, store *s3test.Store, extra string) string {
 	srv := httptest.NewServer(store)
 	t.Cleanup(srv.Close)
+	return s3OptsDir(t, srv.URL, extra)
+}
+
+// s3OptsDir returns an image path whose s3_opts.json has the checkpoint gofer
+// keep the image under "image/" in the store at endpoint, with the S3 options
+// extra besides (a JSON object's members, with a leading comma).
+func s3OptsDir(t *testing.T, endpoint, extra string) string {
 	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp failed: %v", err)
@@ -2733,7 +2774,7 @@ func s3ImageDir(t *testing.T, store *s3test.Store, extra string) string {
 	if err := os.Chmod(dir, 0777); err != nil {
 		t.Fatalf("error chmoding file: %q, %v", dir, err)
 	}
-	opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": "image/", "credentials": {"access_key_id": "key", "secret_access_key": "secret"}%s}`, srv.URL, s3test.Bucket, extra)
+	opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": "image/", "credentials": {"access_key_id": "key", "secret_access_key": "secret"}%s}`, endpoint, s3test.Bucket, extra)
 	if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), []byte(opts), 0600); err != nil {
 		t.Fatalf("error writing S3 options: %v", err)
 	}

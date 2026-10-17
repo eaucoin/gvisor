@@ -733,6 +733,12 @@ Gateway and others), the file is `s3_opts.json`:
 
 -   `endpoint`: the URL of the store; without it, the store is Amazon S3 in
     `region`.
+-   `socket`: the absolute path of a Unix domain socket on which the store at
+    `endpoint` is served, as by a proxy on the host. Requests connect to it,
+    whatever `endpoint`'s host, and not through a proxy of the environment;
+    each connection dials it anew, so a store that restarts on a new socket at
+    the same path is found again (with `pages_retry`, a background restore
+    waits for it meanwhile). It requires an `endpoint`.
 -   `region`: the region requests are signed for (default: the AWS SDK's
     configuration, such as `AWS_REGION`, or `us-east-1` with an `endpoint`).
 -   `bucket` and `object_prefix`: where the objects are; the prefix is
