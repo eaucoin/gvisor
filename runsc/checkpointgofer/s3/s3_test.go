@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -41,6 +42,8 @@ import (
 
 func init() {
 	retryMaxBackoff = time.Millisecond
+	pagesRetryFirstBackoff = time.Millisecond
+	pagesRetryMaxBackoff = time.Millisecond
 }
 
 // newTestFileServer returns a FileServer for the store s.
@@ -240,6 +243,163 @@ func TestReadWaitOr(t *testing.T) {
 	cs, err := r.(stateio.WaitOrAsyncReader).WaitOr(nil, wake)
 	if len(cs) != 0 || err != nil {
 		t.Errorf("WaitOr with a wake pending = %v, %v; want no completions, nil", cs, err)
+	}
+}
+
+// awayFor returns a Store fault that fails the first n GetObjects as a store
+// that is away does, its connections reset before any response.
+func awayFor(t *testing.T, n int) func(w http.ResponseWriter, r *http.Request, op string, i int) bool {
+	return func(w http.ResponseWriter, r *http.Request, op string, i int) bool {
+		if op != "GetObject" || i >= n {
+			return false
+		}
+		s3test.ResetConnection(t, w, "")
+		return true
+	}
+}
+
+func TestPagesReadRetriesWhileRunning(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		whileRunning bool
+		path         string
+		want         error
+		attempts     int
+	}{
+		// Away for longer than MaxAttempts: the pages file's reads wait for it.
+		{name: "pages file", whileRunning: true, path: checkpointfiles.PagesFileName, attempts: 11},
+		{name: "a layer's pages file", whileRunning: true, path: checkpointimage.LayerPath(checkpointimage.Digest{1}, checkpointfiles.PagesFileName), attempts: 11},
+		// Without PagesRetryWhileRunning, or of another file, they fail as before.
+		{name: "pages file, as before", path: checkpointfiles.PagesFileName, want: unix.EIO, attempts: 3},
+		{name: "state file", whileRunning: true, path: checkpointfiles.StateFileName, want: unix.EIO, attempts: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := s3test.NewStore(t)
+			obj := testObject(64 << 10)
+			s.SetObject(tc.path, obj)
+			s.Fault = awayFor(t, 10)
+			r := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, MaxAttempts: 3, PagesRetryWhileRunning: tc.whileRunning}), tc.path)
+			buf := make([]byte, len(obj))
+			c := read(t, r, 0, buf)
+			if tc.want == nil && (c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj)) {
+				t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+			}
+			if tc.want != nil && (c.N != 0 || !errors.Is(c.Err, tc.want)) {
+				t.Errorf("read: %d bytes, %v; want 0 bytes, %v", c.N, c.Err, tc.want)
+			}
+			if got := len(s.Ops()); got != tc.attempts {
+				t.Errorf("%d requests, want %d", got, tc.attempts)
+			}
+		})
+	}
+}
+
+func TestPagesReadRetriesStalledStoreWhileRunning(t *testing.T) {
+	s := s3test.NewStore(t)
+	obj := testObject(4096)
+	s.SetObject(checkpointfiles.PagesFileName, obj)
+	s.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+		if n >= 2 {
+			return false
+		}
+		// The store stalls, past each attempt's time.
+		<-r.Context().Done()
+		return true
+	}
+	r := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, MaxAttempts: 1, RequestTimeout: 100 * time.Millisecond, PagesRetryWhileRunning: true}), checkpointfiles.PagesFileName)
+	buf := make([]byte, len(obj))
+	if c := read(t, r, 0, buf); c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj) {
+		t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+	}
+	if got := len(s.Ops()); got != 3 {
+		t.Errorf("%d requests, want 3", got)
+	}
+}
+
+func TestPagesReadFailuresWhileRunning(t *testing.T) {
+	// What a request is refused for recurs: it fails at once, as before.
+	for _, tc := range []struct {
+		name   string
+		status int
+		code   string
+		want   error
+	}{
+		{name: "missing object", status: http.StatusNotFound, code: "NoSuchKey", want: unix.ENOENT},
+		{name: "access denied", status: http.StatusForbidden, code: "AccessDenied", want: unix.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := s3test.NewStore(t)
+			s.SetObject(checkpointfiles.PagesFileName, testObject(4096))
+			s.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+				s3test.WriteError(w, tc.status, tc.code)
+				return true
+			}
+			r := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, PagesRetryWhileRunning: true}), checkpointfiles.PagesFileName)
+			if c := read(t, r, 0, make([]byte, 4096)); c.N != 0 || !errors.Is(c.Err, tc.want) {
+				t.Errorf("read: %d bytes, %v; want 0 bytes, %v", c.N, c.Err, tc.want)
+			}
+			if got := len(s.Ops()); got != 1 {
+				t.Errorf("%d requests, want 1", got)
+			}
+		})
+	}
+}
+
+func TestPagesReadWhileRunningEndsWithReader(t *testing.T) {
+	// Each read waits for an hour, as near as makes no matter, before it tries
+	// again.
+	defer func(first, most time.Duration) { pagesRetryFirstBackoff, pagesRetryMaxBackoff = first, most }(pagesRetryFirstBackoff, pagesRetryMaxBackoff)
+	pagesRetryFirstBackoff, pagesRetryMaxBackoff = time.Hour, time.Hour
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, testObject(4096))
+	// The store is away for good.
+	s.Fault = awayFor(t, math.MaxInt)
+	r, err := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, PagesRetryWhileRunning: true}).OpenRead(checkpointfiles.PagesFileName)
+	if err != nil {
+		t.Fatalf("OpenRead: %v", err)
+	}
+	r.AddRead(0, 0, nil, memmap.FileRange{}, make([]byte, 4096))
+	time.Sleep(100 * time.Millisecond)
+	// Its reader closed, as the sandbox's end closes it, the read ends,
+	// waiting for no backoff.
+	start := time.Now()
+	r.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("Close took %v while a read retried, want under a second", took)
+	}
+	cs, err := r.Wait(nil, 1)
+	if err != nil || len(cs) != 1 || cs[0].Err == nil {
+		t.Errorf("Wait after Close = %v, %v; want the read failed", cs, err)
+	}
+}
+
+func TestParsePagesRetry(t *testing.T) {
+	for _, tc := range []struct {
+		value        string
+		whileRunning bool
+		err          bool
+	}{
+		{value: ""},
+		{value: "while-running", whileRunning: true},
+		{value: "forever", err: true},
+	} {
+		whileRunning, err := ParsePagesRetry(tc.value)
+		if whileRunning != tc.whileRunning || (err != nil) != tc.err {
+			t.Errorf("ParsePagesRetry(%q) = %t, %v; want %t, an error %t", tc.value, whileRunning, err, tc.whileRunning, tc.err)
+		}
+	}
+}
+
+func TestBackoffBefore(t *testing.T) {
+	defer func(first, most time.Duration) { pagesRetryFirstBackoff, pagesRetryMaxBackoff = first, most }(pagesRetryFirstBackoff, pagesRetryMaxBackoff)
+	pagesRetryFirstBackoff, pagesRetryMaxBackoff = time.Second, 10*time.Second
+	for failures := 1; failures <= 70; failures++ {
+		ceiling := min(10*time.Second, time.Second<<min(failures-1, 31))
+		for range 100 {
+			if d := backoffBefore(failures); d <= 0 || d > ceiling {
+				t.Fatalf("backoffBefore(%d) = %v, want in (0, %v]", failures, d, ceiling)
+			}
+		}
 	}
 }
 

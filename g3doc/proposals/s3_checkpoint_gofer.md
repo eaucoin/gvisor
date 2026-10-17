@@ -85,6 +85,7 @@ error rather than ignored:
   "request_timeout_seconds": 30,
   "read_bytes": 16777216,
   "read_parallel": 8,
+  "pages_retry": "while-running",
   "write_part_bytes": 33554432,
   "write_parallel": 4
 }
@@ -129,9 +130,19 @@ Each request, with its retries, has a deadline of `request_timeout_seconds`
 checkpoint or restore instead of hanging it. A read that finally fails returns
 an error, which the loader makes sticky and runsc turns into the failure of
 the restore (the sandbox is killed rather than left running with missing
-memory). The SDK's checksums of whole objects are off: they cannot check ranged
-reads, not every store accepts them on uploads, and checkpoint images carry
-their own page hashes.
+memory). With `pages_retry` `"while-running"`, reads of `pages.img` that fail
+as they may not again (connection errors, server errors, throttling, their
+deadline passing, a body that ends having delivered nothing) are made again
+after a backoff, for as long as the gofer runs: a random time up to a ceiling
+that starts at 1 s and doubles to at most 10 s ("full jitter", so that the
+reads that failed together do not all return at once). A store that restarts
+during a background restore then delays the pages it holds, as a slow store
+does, rather than ending the sandbox: the loader's waiters, an application
+that faults on a page not yet loaded among them, wait. The gofer's reader stops
+retrying as it is closed, which the sandbox's end does, so a sandbox whose
+store stays away is still destroyed at once. The SDK's checksums of whole
+objects are off: they cannot check ranged reads, not every store accepts them
+on uploads, and checkpoint images carry their own page hashes.
 
 **Layers** are objects too: the gofer serves
 `layers/<digest>/pages_meta.img` and `layers/<digest>/pages.img` for reading
@@ -248,10 +259,20 @@ CPUs), signed requests, images out of the store's page cache, median of 4:
     injection. The backend's unit tests read ranges, retry server errors and
     connection resets, resume short bodies, fail at a deadline on a stalled
     store, wake a waiting reader, write single objects and multipart uploads,
-    abort failed and unfinished uploads, refuse files outside an operation's
-    allowance, and check file permissions and that errors hold no credentials.
+    with `pages_retry` retry pages files' reads past `max_attempts` through a
+    store that is away or stalls (and fail at once on missing objects and
+    refused credentials, and on other files after `max_attempts`), and stop
+    retrying as the reader closes, abort failed and unfinished uploads, refuse
+    files outside an operation's allowance, and check file permissions and
+    that errors hold no credentials.
 -   `TestCheckpointRestoreS3` (`runsc/container`) checkpoints a container
     through the gofer to `s3test` and restores it with `--background`.
+    `TestCheckpointRestoreS3StoreAway` restores it with `pages_retry` while
+    the store is away for longer than `max_attempts` outlast, and checks its
+    data; `TestCheckpointRestoreS3StoreGoneKilled` kills the sandbox and
+    the gofer of a restore whose store went away for good, before and after
+    the restore returned, and checks that both end, the restore returns and the
+    container is destroyed at once.
 
 ## Open questions
 
