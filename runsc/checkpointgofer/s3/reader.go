@@ -19,12 +19,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -42,6 +46,7 @@ type Reader struct {
 	client       *s3.Client
 	obj          object
 	retry        retryPolicy
+	whileRunning bool
 	maxReadBytes uint64
 	maxRanges    int
 	subs         chan readSubmission
@@ -57,13 +62,15 @@ type readSubmission struct {
 	dst   stateio.LocalClientRanges
 }
 
-// newReader returns a Reader that reads from obj.
-func newReader(ctx context.Context, client *s3.Client, obj object, retry retryPolicy, maxReadBytes uint64, maxRanges, maxParallel int) *Reader {
+// newReader returns a Reader that reads from obj. If whileRunning, its reads
+// retry what may succeed later for as long as ctx lasts (see Reader.read).
+func newReader(ctx context.Context, client *s3.Client, obj object, policy retryPolicy, whileRunning bool, maxReadBytes uint64, maxRanges, maxParallel int) *Reader {
 	ctx, cancel := context.WithCancelCause(ctx)
 	r := &Reader{
 		client:       client,
 		obj:          obj,
-		retry:        retry,
+		retry:        policy,
+		whileRunning: whileRunning,
 		maxReadBytes: maxReadBytes,
 		maxRanges:    maxRanges,
 		subs:         make(chan readSubmission, maxParallel),
@@ -150,14 +157,40 @@ func (r *Reader) workerMain(ctx context.Context) {
 // each GET until it gets a response; if the response's body ends early, read
 // continues with a GET of the rest, until retry.maxAttempts GETs in a row
 // deliver nothing.
+//
+// If r.whileRunning, a GET that fails as one may that would succeed later (its
+// connection failing, its time running out, the store failing or throttling
+// it) or that delivers nothing is made again after a backoff (backoffBefore),
+// for as long as ctx lasts, rather than failing the read: a store that is away
+// for a while delays the read, rather than failing it for good.
 func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) {
 	var done uint64
 	dst := sub.dst
 	for failures := 0; ; {
 		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst)
 		done += n
-		if !errors.Is(err, errShortBody) {
+		if r.whileRunning && transient(err) {
+			if n != 0 {
+				failures = 0
+			} else {
+				failures++
+				if failures == 1 {
+					log.Warningf("s3.GetObject on %s failed, retried for as long as the sandbox runs: %v", r.obj, err)
+				}
+				select {
+				case <-ctx.Done():
+					return done, mapError(err, "GetObject", r.obj)
+				case <-time.After(backoffBefore(failures)):
+				}
+			}
+			dst = dst.DropFirst(n)
+			continue
+		}
+		switch {
+		case err == nil || err == io.EOF:
 			return done, err
+		case !errors.Is(err, errShortBody):
+			return done, mapError(err, "GetObject", r.obj)
 		}
 		if n != 0 {
 			failures = 0
@@ -168,8 +201,45 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) 
 	}
 }
 
+// pagesRetryFirstBackoff and pagesRetryMaxBackoff bound how long a read of
+// Reader.whileRunning waits before it makes a GET again (backoffBefore). They
+// are variables for tests.
+var (
+	pagesRetryFirstBackoff = time.Second
+	pagesRetryMaxBackoff   = 10 * time.Second
+)
+
+// backoffBefore returns how long a read waits before its GET after failures
+// GETs in a row delivered nothing: a random time up to a ceiling that is
+// pagesRetryFirstBackoff, then twice as long each time, at most
+// pagesRetryMaxBackoff ("full jitter"), so that the reads that failed
+// together do not all come back at once.
+func backoffBefore(failures int) time.Duration {
+	ceiling := pagesRetryMaxBackoff
+	if failures < 32 {
+		ceiling = min(ceiling, pagesRetryFirstBackoff<<(failures-1))
+	}
+	return rand.N(ceiling) + 1
+}
+
+// transient returns true if err, of a GET, may not recur when the GET is made
+// again: a short body, its attempt's time running out, or what the AWS SDK
+// retries (connection errors, server errors, throttling), each after its
+// client's own attempts. Errors of the request itself, as a missing object or
+// a refused credential, recur, as does a GET cancelled as its reader closes.
+func transient(err error) bool {
+	switch {
+	case err == nil || err == io.EOF:
+		return false
+	case errors.Is(err, errShortBody), errors.Is(err, context.DeadlineExceeded):
+		return true
+	}
+	return retry.IsErrorRetryables(retry.DefaultRetryables).IsErrorRetryable(err) == aws.TrueTernary
+}
+
 // readOnce reads up to total bytes at off into dst with one GET. It returns
-// io.EOF if the object ends before them.
+// io.EOF if the object ends before them. Its errors are the client's, which
+// read maps.
 func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges) (uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.retry.deadline(total))
 	defer cancel()
@@ -184,7 +254,7 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 			// off is at or past the end of the object.
 			return 0, io.EOF
 		}
-		return 0, mapError(err, "GetObject", r.obj)
+		return 0, err
 	}
 	defer out.Body.Close()
 	want := total
