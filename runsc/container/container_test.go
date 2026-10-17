@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -2467,7 +2468,7 @@ func TestCheckpointRestoreBackground(t *testing.T) {
 			if err := os.Chmod(dir, 0777); err != nil {
 				t.Fatalf("error chmoding file: %q, %v", dir, err)
 			}
-			testCheckpointRestoreBackground(t, conf, dir)
+			testCheckpointRestoreBackground(t, conf, dir, nil)
 		})
 	}
 }
@@ -2479,22 +2480,9 @@ func TestCheckpointRestoreS3(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
 			store := s3test.NewStore(t)
-			srv := httptest.NewServer(store)
-			defer srv.Close()
-			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
-			if err != nil {
-				t.Fatalf("os.MkdirTemp failed: %v", err)
-			}
-			defer os.RemoveAll(dir)
-			if err := os.Chmod(dir, 0777); err != nil {
-				t.Fatalf("error chmoding file: %q, %v", dir, err)
-			}
-			opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": "image/", "credentials": {"access_key_id": "key", "secret_access_key": "secret"}}`, srv.URL, s3test.Bucket)
-			if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), []byte(opts), 0600); err != nil {
-				t.Fatalf("error writing S3 options: %v", err)
-			}
+			dir := s3ImageDir(t, store, "")
 
-			testCheckpointRestoreBackground(t, conf, dir)
+			testCheckpointRestoreBackground(t, conf, dir, nil)
 
 			for _, name := range []string{checkpointfiles.StateFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
 				if _, ok := store.Object("image/" + name); !ok {
@@ -2508,10 +2496,255 @@ func TestCheckpointRestoreS3(t *testing.T) {
 	}
 }
 
+// pagesRetryOpts are the S3 options of the tests of pages_retry: reads of the
+// pages file retried while the sandbox runs, in reads of 1 MiB, so that a
+// 32 MiB container's pages load in many, and 2 attempts of each request,
+// whose one backoff lasts at most a second.
+const pagesRetryOpts = `, "pages_retry": "while-running", "read_bytes": 1048576, "max_attempts": 2`
+
+// isPagesRead returns true if r reads a pages file.
+func isPagesRead(r *http.Request, op string) bool {
+	return op == "GetObject" && strings.HasSuffix(r.URL.Path, "/"+checkpointfiles.PagesFileName)
+}
+
+// TestCheckpointRestoreS3StoreAway checks that a container restored with
+// --background from an S3-compatible object store, with pages_retry
+// "while-running", runs on and finds its data intact when the store goes away
+// for a while as its pages load, as a store that restarts does: the reads that
+// fail wait for the store rather than end the sandbox.
+func TestCheckpointRestoreS3StoreAway(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			store := s3test.NewStore(t)
+			dir := s3ImageDir(t, store, pagesRetryOpts)
+			var (
+				mu        sync.Mutex
+				restoring bool
+				reads     int
+				awayUntil time.Time
+				refused   int
+			)
+			store.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+				if !isPagesRead(r, op) {
+					return false
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				// Its first 4 reads of the restore served, the store is away
+				// for 5 seconds: longer than the client's own attempts of a
+				// GET last, so that only pages_retry outlasts it.
+				if !restoring {
+					return false
+				}
+				if reads++; reads <= 4 {
+					return false
+				}
+				if awayUntil.IsZero() {
+					awayUntil = time.Now().Add(5 * time.Second)
+				}
+				if time.Now().After(awayUntil) {
+					return false
+				}
+				refused++
+				s3test.ResetConnection(t, w, "")
+				return true
+			}
+			testCheckpointRestoreBackground(t, conf, dir, func() {
+				mu.Lock()
+				defer mu.Unlock()
+				restoring = true
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if refused == 0 {
+				t.Errorf("the store refused none of the restore's %d reads of its pages", reads)
+			}
+		})
+	}
+}
+
+// pidsWhere returns the pids of the processes whose command lines satisfy
+// match, zombies aside.
+func pidsWhere(t *testing.T, match func(argv []string) bool) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("reading /proc: %v", err)
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil || len(cmdline) == 0 {
+			// Gone, or a zombie, whose command line is empty.
+			continue
+		}
+		if match(strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// isCheckpointGofer returns true if argv is a checkpoint gofer's.
+func isCheckpointGofer(argv []string) bool {
+	return argv[0] == "runsc-checkpointgofer"
+}
+
+// TestCheckpointRestoreS3StoreGoneKilled checks that a restore with
+// --background from an S3-compatible object store that goes away for good,
+// with pages_retry "while-running", ends at once when its processes are
+// killed, as an orchestrator abandons a restore that does not come up: whether
+// its reads wait in its working set, before the restore returns, or in the
+// background after, its sandbox and its checkpoint gofer end, and the restore
+// returns.
+func TestCheckpointRestoreS3StoreGoneKilled(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, served := range []int{0, 2} {
+			t.Run(fmt.Sprintf("%s/%d reads served", name, served), func(t *testing.T) {
+				store := s3test.NewStore(t)
+				dir := s3ImageDir(t, store, pagesRetryOpts)
+				// The restore's first reads of its pages served, the store is
+				// away for good.
+				var (
+					mu        sync.Mutex
+					restoring bool
+					reads     int
+				)
+				store.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+					if !isPagesRead(r, op) {
+						return false
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if !restoring {
+						return false
+					}
+					if reads++; reads <= served {
+						return false
+					}
+					s3test.ResetConnection(t, w, "")
+					return true
+				}
+
+				outputPath := filepath.Join(dir, "output")
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+				defer outputFile.Close()
+				script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.2; done`, 32<<20, outputPath)
+				spec := testutil.NewSpecWithArgs("bash", "-c", script)
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				defer cleanup()
+				args := Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir}
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if err := cont.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				if err := waitForFileNotEmpty(outputFile); err != nil {
+					t.Fatalf("Failed to wait for output file: %v", err)
+				}
+				if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				cont.Destroy()
+
+				gofersBefore := pidsWhere(t, isCheckpointGofer)
+				cont2, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont2.Destroy()
+				mu.Lock()
+				restoring = true
+				mu.Unlock()
+				restored := make(chan error, 1)
+				go func() { restored <- cont2.Restore(conf, dir, sandbox.RestoreOpts{Background: true}) }()
+
+				// Its reads waiting for the store, the restore is abandoned: what
+				// runs it is killed.
+				time.Sleep(3 * time.Second)
+				sandboxes := pidsWhere(t, func(argv []string) bool {
+					return argv[0] == "runsc-sandbox" && slices.Contains(argv, "--bundle="+bundleDir)
+				})
+				if len(sandboxes) == 0 {
+					t.Fatalf("no sandbox runs for the restore")
+				}
+				var gofers []int
+				for _, pid := range pidsWhere(t, isCheckpointGofer) {
+					if !slices.Contains(gofersBefore, pid) {
+						gofers = append(gofers, pid)
+					}
+				}
+				if len(gofers) == 0 {
+					t.Fatalf("no checkpoint gofer runs for the restore")
+				}
+				for _, pid := range append(sandboxes, gofers...) {
+					unix.Kill(pid, unix.SIGKILL)
+				}
+				select {
+				case <-restored:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("the restore had not returned 10 s after its processes were killed")
+				}
+				if err := testutil.Poll(func() error {
+					for _, pid := range pidsWhere(t, isCheckpointGofer) {
+						if slices.Contains(gofers, pid) {
+							return fmt.Errorf("the checkpoint gofer %d runs on", pid)
+						}
+					}
+					return nil
+				}, 10*time.Second); err != nil {
+					t.Error(err)
+				}
+				destroyed := make(chan error, 1)
+				go func() { destroyed <- cont2.Destroy() }()
+				select {
+				case <-destroyed:
+				case <-time.After(10 * time.Second):
+					t.Errorf("destroying the abandoned container took more than 10 s")
+				}
+			})
+		}
+	}
+}
+
+// s3ImageDir returns an image path whose s3_opts.json has the checkpoint gofer
+// keep the image under "image/" in store, served for the test, with the S3
+// options extra besides (a JSON object's members, with a leading comma).
+func s3ImageDir(t *testing.T, store *s3test.Store, extra string) string {
+	srv := httptest.NewServer(store)
+	t.Cleanup(srv.Close)
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	opts := fmt.Sprintf(`{"endpoint": %q, "bucket": %q, "object_prefix": "image/", "credentials": {"access_key_id": "key", "secret_access_key": "secret"}%s}`, srv.URL, s3test.Bucket, extra)
+	if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), []byte(opts), 0600); err != nil {
+		t.Fatalf("error writing S3 options: %v", err)
+	}
+	return dir
+}
+
 // testCheckpointRestoreBackground checkpoints a container that holds 32 MiB of
 // data to imagePath, uncompressed, restores it with --background, and checks
-// that its data survived.
-func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePath string) {
+// that its data survived. beforeRestore, if not nil, is called just before the
+// restore.
+func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePath string, beforeRestore func()) {
 	outputPath := filepath.Join(imagePath, "output")
 	outputFile, err := createWriteableOutputFile(outputPath)
 	if err != nil {
@@ -2566,6 +2799,9 @@ func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePat
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
+	if beforeRestore != nil {
+		beforeRestore()
+	}
 	if err := cont2.Restore(conf, imagePath, sandbox.RestoreOpts{Background: true}); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
