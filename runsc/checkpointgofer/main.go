@@ -121,6 +121,13 @@ type S3Options struct {
 	// uploaded at once (default 32 MiB and 4).
 	WritePartBytes int `json:"write_part_bytes,omitzero"`
 	WriteParallel  int `json:"write_parallel,omitzero"`
+
+	// PagesRetry is how reads of pages files retry what may succeed later:
+	// "" as MaxAttempts says, or "while-running" for as long as the checkpoint
+	// gofer runs, with backoff of at most 10 seconds, so that a restore whose
+	// pages are loaded in the background waits for a store that is away for a
+	// while rather than never loading them.
+	PagesRetry string `json:"pages_retry,omitzero"`
 }
 
 // S3Credentials are static credentials for an S3-compatible object store.
@@ -310,6 +317,11 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 	default:
 		return fmt.Errorf("unknown addressing value %q", opts.Addressing)
 	}
+	whileRunning, err := s3.ParsePagesRetry(opts.PagesRetry)
+	if err != nil {
+		return err
+	}
+	s3fsOpts.PagesRetryWhileRunning = whileRunning
 	if c := opts.Credentials; c != nil {
 		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 			return fmt.Errorf("credentials must have an access_key_id and a secret_access_key")
