@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/waiter"
 
@@ -100,6 +101,13 @@ func (t *Task) killLocked() {
 		Code: linux.SI_USER,
 	}, nil)
 	t.interrupt()
+	// A wait for pages being loaded does not see t's interruption: cut it
+	// short, so that t exits rather than wait for its pages, however long
+	// their reads take. Task.run does so if its goroutine was not known here
+	// yet.
+	if g := t.goid.Load(); g != 0 {
+		pgalloc.CancelAwaits(g)
+	}
 }
 
 // Killed implements context.Blocker.Killed.
