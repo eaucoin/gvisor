@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -2003,6 +2004,11 @@ type aplWaiter struct {
 	// pending is the number of unloaded bytes that this waiter is waiting for.
 	// pending is protected by aplShared.mu.
 	pending uint64
+
+	// canceled is true once the await of the goroutine that registered this
+	// waiter is cut short (CancelAwaits), which then withdraws the waiter
+	// from the pages that remain to be loaded (withdrawAwait).
+	canceled atomicbitops.Bool
 }
 
 var aplWaiterPool = sync.Pool{
@@ -2111,7 +2117,9 @@ func (f *MemoryFile) AwaitLoadAll() error {
 	return nil
 }
 
-// awaitLoad blocks until data has been loaded for all pages in fr.
+// awaitLoad blocks until data has been loaded for all pages in fr, or until
+// the await of the calling goroutine is cut short (CancelAwaits), in which case
+// it returns linuxerr.EINTR.
 //
 // Preconditions: At least one reference must be held on all unloaded pages in
 // fr.
@@ -2123,11 +2131,18 @@ func (loads *asyncMemoryFileLoads) awaitLoad(fr memmap.FileRange) error {
 		waitersBuf [4]aplAwait
 		waiters    = waitersBuf[:0]
 		err        error
+		g          int64
 	)
 	for _, amfl := range loads.amfls {
 		// Lockless fast path:
 		if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
 			continue
+		}
+		if g == 0 {
+			g = goid.Get()
+			if awaitCanceled(g) {
+				return linuxerr.EINTR
+			}
 		}
 		w, werr := amfl.startAwait(fr)
 		if werr != nil && err == nil {
@@ -2137,12 +2152,105 @@ func (loads *asyncMemoryFileLoads) awaitLoad(fr memmap.FileRange) error {
 			waiters = append(waiters, aplAwait{amfl, w})
 		}
 	}
+	if len(waiters) == 0 {
+		return err
+	}
+	registerAwait(g, waiters)
+	canceled := false
 	for _, aw := range waiters {
-		if werr := aw.amfl.finishAwait(aw.w); werr != nil && err == nil {
+		werr := aw.amfl.finishAwait(aw.w)
+		if werr == linuxerr.EINTR {
+			canceled = true
+		} else if werr != nil && err == nil {
 			err = werr
 		}
 	}
+	// Only once CancelAwaits can reach them no more are the waiters reused.
+	unregisterAwait(g)
+	for _, aw := range waiters {
+		aplWaiterPool.Put(aw.w)
+	}
+	if canceled {
+		return linuxerr.EINTR
+	}
 	return err
+}
+
+// awaitCancels holds, by goroutine ID, the goroutines whose awaits of pages
+// being loaded are cut short (CancelAwaits), and the waiters of those that
+// await such pages now.
+var awaitCancels struct {
+	mu sync.Mutex
+
+	// canceled is the set of goroutines whose awaits are cut short.
+	canceled map[int64]struct{}
+
+	// waiting holds the waiters of each goroutine that awaits pages now.
+	waiting map[int64][]aplAwait
+}
+
+// CancelAwaits cuts short the awaits of pages being loaded asynchronously, by
+// any MemoryFile, of the goroutine with ID goid, now and until
+// ForgetCanceledAwaits(goid): MemoryFile methods that wait for such pages,
+// MapInternal and DataFD among them, return linuxerr.EINTR for the pages not
+// loaded yet, rather than wait for them, however long their reads take. A
+// task's goroutine is cut short as the task is killed, so that it ends at once
+// rather than when its pages are loaded: a page's read may wait as long as
+// its pages file's reader does, which may be for good (one reading from a
+// store that went away, and that retries for as long as the sandbox runs).
+// Pages loaded meanwhile load as before, the waiters cut short with them.
+func CancelAwaits(goid int64) {
+	awaitCancels.mu.Lock()
+	defer awaitCancels.mu.Unlock()
+	if awaitCancels.canceled == nil {
+		awaitCancels.canceled = make(map[int64]struct{})
+	}
+	awaitCancels.canceled[goid] = struct{}{}
+	for _, aw := range awaitCancels.waiting[goid] {
+		aw.w.canceled.Store(true)
+		aw.w.wakeup.Notify(1)
+	}
+}
+
+// ForgetCanceledAwaits ends the effect of CancelAwaits(goid), as the goroutine
+// with ID goid ends.
+func ForgetCanceledAwaits(goid int64) {
+	awaitCancels.mu.Lock()
+	defer awaitCancels.mu.Unlock()
+	delete(awaitCancels.canceled, goid)
+}
+
+// awaitCanceled returns true if the awaits of goroutine goid are cut short.
+func awaitCanceled(goid int64) bool {
+	awaitCancels.mu.Lock()
+	defer awaitCancels.mu.Unlock()
+	_, ok := awaitCancels.canceled[goid]
+	return ok
+}
+
+// registerAwait records waiters as goroutine goid's, cutting them short at
+// once if its awaits were cut short since awaitLoad checked.
+func registerAwait(goid int64, waiters []aplAwait) {
+	awaitCancels.mu.Lock()
+	defer awaitCancels.mu.Unlock()
+	if awaitCancels.waiting == nil {
+		awaitCancels.waiting = make(map[int64][]aplAwait)
+	}
+	awaitCancels.waiting[goid] = waiters
+	if _, ok := awaitCancels.canceled[goid]; ok {
+		for _, aw := range waiters {
+			aw.w.canceled.Store(true)
+			aw.w.wakeup.Notify(1)
+		}
+	}
+}
+
+// unregisterAwait forgets the waiters of goroutine goid, which awaitLoad
+// registered with registerAwait.
+func unregisterAwait(goid int64) {
+	awaitCancels.mu.Lock()
+	defer awaitCancels.mu.Unlock()
+	delete(awaitCancels.waiting, goid)
 }
 
 // aplAwait is a waiter registered with the loader of one layer.
@@ -2177,6 +2285,7 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 	w := aplWaiterPool.Get().(*aplWaiter)
 	w.fr = fr
 	w.pending = 0
+	w.canceled.Store(false)
 	prioritized := false
 	amfl.unloaded.MutateRange(fr, func(ulseg aplUnloadedIterator) bool {
 		ul := ulseg.ValuePtr()
@@ -2218,7 +2327,10 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 }
 
 // finishAwait blocks until all pages awaited by w, returned by
-// amfl.startAwait(), have been loaded.
+// amfl.startAwait(), have been loaded, or until w is cut short
+// (CancelAwaits), in which case it withdraws w from the pages that remain to
+// be loaded and returns linuxerr.EINTR. Either way, w is no longer reachable
+// by the loader when finishAwait returns.
 func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
 	if logAwaitedLoads {
 		log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), w.fr, w.fr.Length())
@@ -2228,8 +2340,10 @@ func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
 		waitNS := aplNanotime() - w.timeStart
 		log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), w.fr, w.fr.Length())
 	}
+	if w.canceled.Load() && amfl.withdrawAwait(w) {
+		return linuxerr.EINTR
+	}
 	fr := w.fr
-	aplWaiterPool.Put(w)
 	if err := amfl.pf.err(); err != nil {
 		// Pages loaded before the failure are usable.
 		amfl.pf.mu.Lock()
@@ -2240,6 +2354,41 @@ func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
 		}
 	}
 	return nil
+}
+
+// withdrawAwait removes w, cut short, from the waiters of the pages it awaits
+// that remain to be loaded, if any, and returns true if there were any.
+func (amfl *asyncMemoryFileLoad) withdrawAwait(w *aplWaiter) bool {
+	apfl := amfl.pf
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	if w.pending == 0 {
+		return false
+	}
+	// startAwait split amfl.unloaded around w.fr, and its segments with
+	// waiters are never merged.
+	for ulseg := amfl.unloaded.LowerBoundSegment(w.fr.Start); ulseg.Ok() && ulseg.Start() < w.fr.End; ulseg = ulseg.NextSegment() {
+		ul := ulseg.ValuePtr()
+		i := slices.Index(ul.waiters, w)
+		if i < 0 {
+			continue
+		}
+		// Elements of ul.waiters may be shared with other segments' (see
+		// aplUnloaded's split), so a new slice holds the others.
+		ul.waiters = slices.Concat(ul.waiters[:i:i], ul.waiters[i+1:])
+		w.pending -= ulseg.Range().Length()
+	}
+	if w.pending != 0 {
+		panic(fmt.Sprintf("MemoryFile(%p): waiter for %v withdrawn with %d bytes pending in no unloaded segment", amfl.f, w.fr, w.pending))
+	}
+	now := aplNanotime()
+	apfl.durWaitedTotal += time.Duration(now - w.timeStart)
+	apfl.numWaiters--
+	if apfl.numWaiters == 0 {
+		apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
+		apfl.timeStartWaiters = math.MaxInt64
+	}
+	return true
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
