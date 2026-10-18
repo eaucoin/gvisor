@@ -31,3 +31,5 @@ series/12-s3-checkpoint-gofer on series/13-pod-restore
 series/21-working-set on series/12-s3-checkpoint-gofer
 series/22-shim-incremental-checkpoints on series/21-working-set
 series/03-release-versions on series/22-shim-incremental-checkpoints
+# A task waiting for pages being loaded is killable (pgalloc, kernel, runsc/boot).
+series/23-killable-page-loads on series/03-release-versions
