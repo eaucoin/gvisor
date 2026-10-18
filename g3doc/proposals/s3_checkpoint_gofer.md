@@ -286,7 +286,9 @@ CPUs), signed requests, images out of the store's page cache, median of 4:
     data; `TestCheckpointRestoreS3StoreGoneKilled` kills the sandbox and
     the gofer of a restore whose store went away for good, before and after
     the restore returned, and checks that both end, the restore returns and the
-    container is destroyed at once.
+    container is destroyed at once; and, the restore returned, kills its
+    container with `runsc kill --all` and destroys it, as containerd's shim
+    does, each within 10 s, its threads waiting for pages in the meantime.
 
 ## Open questions
 

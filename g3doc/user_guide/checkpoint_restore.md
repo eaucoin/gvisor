@@ -171,6 +171,12 @@ for pages, as do the metrics `/checkpoint/async_load_waits`,
 `/checkpoint/async_load_wait_bytes` and `/checkpoint/async_load_wait_nanoseconds`
 (see [observability](observability.md)).
 
+A thread waiting for a page still loading is killable, as a Linux task waiting
+for I/O in a page fault is: killed (`SIGKILL`, `runsc kill`, the end of its
+process or of its container), it stops waiting and exits, however long the
+page's read takes, and `runsc kill --all` and `runsc delete` do not wait for
+the read. Its page goes on loading for the threads that remain.
+
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means
 that until the sandbox has fully restored (async page loading has completed):
@@ -798,7 +804,8 @@ Gateway and others), the file is `s3_opts.json`:
     credentials, still fail the restore at once, and the other files are read
     as `max_attempts` says, so that a restore whose store is away fails before
     it begins. A store that stays away keeps the sandbox waiting until it is
-    killed.
+    killed, which waits for none of its reads (see
+    [Background Restore](#background-restore)).
 -   `write_part_bytes` and `write_parallel` (default 32 MiB and 4): `pages.img`
     is uploaded in a multipart upload of parts of this size (at least 5 MiB; a
     file smaller than a part is uploaded at once), this many at a time. A
