@@ -3809,6 +3809,136 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestorePausedKilled checks that a container restored paused,
+// never resumed, is killed with runsc kill --all and destroyed, each within
+// 10 s, as the shim does as its pod is deleted, its sandbox then gone: whether
+// its restore succeeded, or failed, the root filesystem's executable having
+// changed since the checkpoint.
+func TestCheckpointRestorePausedKilled(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		failed bool
+	}{
+		{name: "restored"},
+		{name: "restore failed", failed: true},
+	} {
+		for name, conf := range configs(t, true /* noOverlay */) {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				if err := conf.RestoreValidateFiles.Set("rootfs"); err != nil {
+					t.Fatalf("error setting restore-validate-files: %v", err)
+				}
+				dir, err := os.MkdirTemp(testutil.TmpDir(), "paused-killed")
+				if err != nil {
+					t.Fatalf("os.MkdirTemp() failed: %v", err)
+				}
+				defer os.RemoveAll(dir)
+				rootfs := filepath.Join(dir, "rootfs")
+				imagePath := filepath.Join(dir, "image")
+				for _, d := range []string{rootfs, imagePath} {
+					if err := os.Mkdir(d, 0777); err != nil {
+						t.Fatalf("os.Mkdir(%q) failed: %v", d, err)
+					}
+					if err := os.Chmod(d, 0777); err != nil {
+						t.Fatalf("os.Chmod(%q) failed: %v", d, err)
+					}
+				}
+				if err := copyFile(app, filepath.Join(rootfs, "test_app")); err != nil {
+					t.Fatalf("error copying test_app: %v", err)
+				}
+				spec := testutil.NewSpecWithArgs("/test_app", "reaper")
+				spec.Root = &specs.Root{Path: rootfs, Readonly: true}
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				defer cleanup()
+				args := Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      spec,
+					BundleDir: bundleDir,
+				}
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if err := cont.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				cont.Destroy()
+
+				if tc.failed {
+					changed := filepath.Join(rootfs, "test_app")
+					f, err := os.OpenFile(changed, os.O_WRONLY|os.O_APPEND, 0)
+					if err != nil {
+						t.Fatalf("error opening %q: %v", changed, err)
+					}
+					_, err = f.Write([]byte("changed"))
+					f.Close()
+					if err != nil {
+						t.Fatalf("error changing %q: %v", changed, err)
+					}
+				}
+
+				args.ID = testutil.RandomContainerID()
+				cont2, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont2.Destroy()
+				err = cont2.Restore(conf, imagePath, sandbox.RestoreOpts{Paused: true})
+				switch {
+				case !tc.failed && err != nil:
+					t.Fatalf("error restoring container paused: %v", err)
+				case !tc.failed:
+					if got, want := cont2.State().Status, Paused; got != want {
+						t.Fatalf("restored container status: got %v, want %v", got, want)
+					}
+				default:
+					t.Logf("restore: %v; status: %v", err, cont2.State().Status)
+				}
+
+				sandboxPid := 0
+				if cont2.Sandbox != nil {
+					sandboxPid = cont2.Sandbox.Getpid()
+				}
+				killed := make(chan error, 1)
+				go func() { killed <- cont2.SignalContainer(unix.SIGKILL, true /* all */) }()
+				select {
+				case err := <-killed:
+					if err != nil && !tc.failed {
+						t.Errorf("error killing the container restored paused: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("killing the container restored paused took more than 10 s")
+				}
+				destroyed := make(chan error, 1)
+				go func() { destroyed <- cont2.Destroy() }()
+				select {
+				case err := <-destroyed:
+					if err != nil {
+						t.Errorf("error destroying the killed container: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("destroying the killed container took more than 10 s")
+				}
+				if sandboxPid != 0 {
+					if err := sandboxExits(sandboxPid, 10*time.Second); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestCheckpointRestoreLeaveRunningClone checks that restoring the checkpoint
 // of a container that kept running (runsc checkpoint --leave-running, or
 // containerd's checkpoint without exit) into a new container gives a clone:

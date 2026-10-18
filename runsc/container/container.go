@@ -838,7 +838,9 @@ func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 // has not been resumed since, and so has not started yet, every process of
 // the sandbox is killed, and every container of the sandbox ends. Each other
 // container of the sandbox that is Paused is then Running, as it is once the
-// sandbox is resumed with Resume, until it is found Stopped.
+// sandbox is resumed with Resume, until it is found Stopped. The root
+// container of a sandbox that cannot kill its processes itself, as one whose
+// restore is not done, is killed by destroying its sandbox.
 func (c *Container) killPaused(all bool) error {
 	resumed, err := func() (bool, error) {
 		if err := c.Saver.lock(BlockAcquire); err != nil {
@@ -874,7 +876,19 @@ func (c *Container) killPausedLocked(all bool) (bool, error) {
 		return false, err
 	}
 	if err := c.Sandbox.KillPaused(c.ID, all); err != nil {
-		return false, err
+		if !c.IsSandboxRoot() {
+			return false, err
+		}
+		// SIGKILL to the root container ends the sandbox. One that cannot
+		// do so itself, as one whose restore is not done (abandoned before
+		// all of its containers were restored), is ended by killing its
+		// process, as its destruction does.
+		log.Warningf("Killing paused root container %q failed, destroying its sandbox: %v", c.ID, err)
+		if derr := c.Sandbox.DestroyContainer(c.ID); derr != nil {
+			return false, fmt.Errorf("%w; destroying its sandbox: %v", err, derr)
+		}
+		c.changeStatus(Stopped)
+		return false, c.saveLocked()
 	}
 	c.changeStatus(Running)
 	return true, c.saveLocked()

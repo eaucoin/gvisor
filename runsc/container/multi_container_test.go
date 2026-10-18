@@ -3523,6 +3523,100 @@ func TestMultiContainerCheckpointRestorePausedKill(t *testing.T) {
 	}
 }
 
+// TestMultiContainerCheckpointRestorePausedAbandonedKill checks that a
+// sandbox whose restore was abandoned after its root container was restored
+// paused, before its other containers were, as an orchestrator abandons a pod
+// that does not come up, is killed with runsc kill --all of its root container
+// and destroyed, each within 10 s, its sandbox then gone.
+func TestMultiContainerCheckpointRestorePausedAbandonedKill(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	testSpecs, ids := createSpecs(sleepCmd, sleepCmd)
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	for _, cont := range conts {
+		cont.Destroy()
+	}
+
+	// Only the root container is restored, paused.
+	newIDs := []string{testutil.RandomContainerID(), testutil.RandomContainerID()}
+	testSpecs[1].Annotations[specutils.ContainerdSandboxIDAnnotation] = newIDs[0]
+	bundleDir, cleanupBundle, err := testutil.SetupBundleDir(testSpecs[0])
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanupBundle()
+	root, err := New(conf, Args{ID: newIDs[0], Spec: testSpecs[0], BundleDir: bundleDir})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer root.Destroy()
+	if err := root.Restore(conf, dir, sandbox.RestoreOpts{Paused: true}); err != nil {
+		t.Fatalf("error restoring the root container: %v", err)
+	}
+	sandboxPid := root.Sandbox.Getpid()
+
+	killed := make(chan error, 1)
+	go func() { killed <- root.SignalContainer(unix.SIGKILL, true /* all */) }()
+	select {
+	case err := <-killed:
+		if err != nil {
+			t.Errorf("error killing the root container of an abandoned restore: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("killing the root container of an abandoned restore took more than 10 s")
+	}
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- root.Destroy() }()
+	select {
+	case err := <-destroyed:
+		if err != nil {
+			t.Errorf("error destroying the killed root container: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("destroying the killed root container took more than 10 s")
+	}
+	if err := sandboxExits(sandboxPid, 10*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+// sandboxExits waits for the sandbox process pid to exit, for at most timeout.
+func sandboxExits(pid int, timeout time.Duration) error {
+	exited := make(chan error, 1)
+	go func() { exited <- blockUntilWaitable(pid) }()
+	select {
+	case err := <-exited:
+		if err != nil && err != unix.ECHILD {
+			return fmt.Errorf("error waiting for the sandbox %d to exit: %v", pid, err)
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("the sandbox %d runs on %v after", pid, timeout)
+	}
+}
+
 // TestMultiContainerPausedKill checks that SIGKILL sent to a Paused container
 // of a sandbox that has run, and was then paused, ends that container, and
 // resumes the sandbox, whose other containers run.
