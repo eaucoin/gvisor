@@ -2297,6 +2297,13 @@ func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, s
 // signalAllProcesses that belong to specified container. It's a noop if the
 // container hasn't started or has exited.
 func (l *Loader) signalAllProcesses(cid string, signo int32) error {
+	if signo == int32(linux.SIGKILL) {
+		// Kill first: the pause below waits for every task to stop, which
+		// a task waiting for pages being loaded does only once it is
+		// killed (kernel.Task.killLocked), however long their reads take.
+		// Processes created meanwhile are killed below.
+		_ = l.k.SendContainerSignal(cid, &linux.SignalInfo{Signo: signo})
+	}
 	// Pause the kernel to prevent new processes from being created while
 	// the signal is delivered. This prevents process leaks when SIGKILL is
 	// sent to the entire container.
