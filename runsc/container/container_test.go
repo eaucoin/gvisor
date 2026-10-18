@@ -2629,22 +2629,39 @@ func isCheckpointGofer(argv []string) bool {
 
 // TestCheckpointRestoreS3StoreGoneKilled checks that a restore with
 // --background from an S3-compatible object store that goes away for good,
-// with pages_retry "while-running", ends at once when its processes are
-// killed, as an orchestrator abandons a restore that does not come up: whether
-// its reads wait in its working set, before the restore returns, or in the
-// background after, its sandbox and its checkpoint gofer end, and the restore
-// returns.
+// with pages_retry "while-running", ends at once when it is killed, as an
+// orchestrator abandons a restore that does not come up: its processes
+// killed, whether its reads wait in its working set, before the restore
+// returns, or in the background after; or, once the restore has returned, its
+// container killed and destroyed, as containerd's shim kills and deletes it.
+// Its sandbox and its checkpoint gofer end, and the restore returns.
 func TestCheckpointRestoreS3StoreGoneKilled(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
-		for _, served := range []int{0, 2} {
-			t.Run(fmt.Sprintf("%s/%d reads served", name, served), func(t *testing.T) {
+		for _, tc := range []struct {
+			// served is how many reads of its pages the store serves before
+			// it goes away, its processes killed.
+			served int
+			// byContainer has the store serve the restore's reads until it
+			// returns, then go away, and kills the container with runsc kill
+			// --all, then destroys it, rather than kill its processes.
+			byContainer bool
+		}{{served: 0}, {served: 2}, {byContainer: true}} {
+			served := tc.served
+			how := fmt.Sprintf("%d reads served", served)
+			if tc.byContainer {
+				how = "restored, container killed"
+			}
+			t.Run(fmt.Sprintf("%s/%s", name, how), func(t *testing.T) {
 				store := s3test.NewStore(t)
 				dir := s3ImageDir(t, store, pagesRetryOpts)
 				// The restore's first reads of its pages served, the store is
-				// away for good.
+				// away for good; or, killing the container, its reads served,
+				// slowly, until the restore returns, so that its background
+				// reads remain, and the store away for good from then.
 				var (
 					mu        sync.Mutex
 					restoring bool
+					returned  bool
 					reads     int
 				)
 				store.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
@@ -2652,11 +2669,19 @@ func TestCheckpointRestoreS3StoreGoneKilled(t *testing.T) {
 						return false
 					}
 					mu.Lock()
-					defer mu.Unlock()
 					if !restoring {
+						mu.Unlock()
 						return false
 					}
-					if reads++; reads <= served {
+					if tc.byContainer && !returned {
+						mu.Unlock()
+						time.Sleep(100 * time.Millisecond)
+						return false
+					}
+					reads++
+					gone := tc.byContainer || reads > served
+					mu.Unlock()
+					if !gone {
 						return false
 					}
 					s3test.ResetConnection(t, w, "")
@@ -2703,7 +2728,70 @@ func TestCheckpointRestoreS3StoreGoneKilled(t *testing.T) {
 				restoring = true
 				mu.Unlock()
 				restored := make(chan error, 1)
-				go func() { restored <- cont2.Restore(conf, dir, sandbox.RestoreOpts{Background: true}) }()
+				go func() {
+					err := cont2.Restore(conf, dir, sandbox.RestoreOpts{Background: true})
+					mu.Lock()
+					returned = true
+					mu.Unlock()
+					restored <- err
+				}()
+
+				if tc.byContainer {
+					// Restored, its background reads waiting for the store, the
+					// container is killed and destroyed, as the shim does.
+					select {
+					case err := <-restored:
+						if err != nil {
+							t.Fatalf("error restoring container: %v", err)
+						}
+					case <-time.After(60 * time.Second):
+						t.Fatalf("the restore had not returned 60 s after it began")
+					}
+					time.Sleep(3 * time.Second)
+					var gofers []int
+					for _, pid := range pidsWhere(t, isCheckpointGofer) {
+						if !slices.Contains(gofersBefore, pid) {
+							gofers = append(gofers, pid)
+						}
+					}
+					if len(gofers) == 0 {
+						t.Fatalf("no checkpoint gofer runs for the restore")
+					}
+					killed := make(chan error, 1)
+					go func() { killed <- cont2.SignalContainer(unix.SIGKILL, true /* all */) }()
+					select {
+					case err := <-killed:
+						if err != nil {
+							t.Fatalf("error killing the container: %v", err)
+						}
+					case <-time.After(10 * time.Second):
+						stacks, err := cont2.Sandbox.Stacks()
+						t.Fatalf("killing the container, its reads waiting for the store, took more than 10 s; the sandbox's stacks (%v):\n%s", err, stacks)
+					}
+					destroyed := make(chan error, 1)
+					go func() { destroyed <- cont2.Destroy() }()
+					select {
+					case <-destroyed:
+					case <-time.After(10 * time.Second):
+						t.Fatalf("destroying the killed container took more than 10 s")
+					}
+					if err := testutil.Poll(func() error {
+						if pids := pidsWhere(t, func(argv []string) bool {
+							return argv[0] == "runsc-sandbox" && slices.Contains(argv, "--bundle="+bundleDir)
+						}); len(pids) != 0 {
+							return fmt.Errorf("the sandbox %v runs on", pids)
+						}
+						for _, pid := range pidsWhere(t, isCheckpointGofer) {
+							if slices.Contains(gofers, pid) {
+								return fmt.Errorf("the checkpoint gofer %d runs on", pid)
+							}
+						}
+						return nil
+					}, 10*time.Second); err != nil {
+						t.Error(err)
+					}
+					return
+				}
 
 				// Its reads waiting for the store, the restore is abandoned: what
 				// runs it is killed.
