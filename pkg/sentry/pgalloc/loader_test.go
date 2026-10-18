@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
@@ -553,6 +554,93 @@ func TestAsyncLoadErrorIsSticky(t *testing.T) {
 	if err := restored.AwaitLoadAll(); err != linuxerr.EIO {
 		t.Errorf("AwaitLoadAll after the failure: got %v, want EIO", err)
 	}
+}
+
+// TestAsyncLoadAwaitCanceled checks that CancelAwaits cuts short a
+// goroutine's awaits of pages being loaded, the one it is in and those it
+// starts after, until ForgetCanceledAwaits: each returns EINTR at once, its
+// waiter withdrawn, while other goroutines' awaits of the same pages, and the
+// loading of the pages, go on as before.
+func TestAsyncLoadAwaitCanceled(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 16*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	r.waitInflight(1)
+	page := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{fr.Start + i*hostarch.PageSize, fr.Start + (i+1)*hostarch.PageSize}
+	}
+
+	// A goroutine awaiting a page, cut short, and its later awaits.
+	type step struct {
+		fr memmap.FileRange
+		// then is closed when the goroutine may await fr.
+		then chan struct{}
+	}
+	steps := []step{
+		{page(8), nil},
+		{page(9), make(chan struct{})},
+		{page(10), make(chan struct{})},
+	}
+	gid := make(chan int64, 1)
+	results := make(chan error, len(steps))
+	go func() {
+		gid <- goid.Get()
+		for _, s := range steps {
+			if s.then != nil {
+				<-s.then
+			}
+			_, err := restored.MapInternal(s.fr, hostarch.Read)
+			results <- err
+		}
+	}()
+	g := <-gid
+	// Another goroutine's await of the same page goes on.
+	other := awaitAsync(restored, page(8))
+	waitForWaiters(t, l.apfl, 2)
+
+	CancelAwaits(g)
+	if err := receive(t, results, "the await cut short"); err != linuxerr.EINTR {
+		t.Errorf("await cut short: got %v, want EINTR", err)
+	}
+	waitForWaiters(t, l.apfl, 1)
+	// Cut short until forgotten: its next await of a page not loaded
+	// returns at once.
+	close(steps[1].then)
+	if err := receive(t, results, "an await after the goroutine was cut short"); err != linuxerr.EINTR {
+		t.Errorf("await after the goroutine was cut short: got %v, want EINTR", err)
+	}
+
+	// Forgotten, it waits again.
+	ForgetCanceledAwaits(g)
+	close(steps[2].then)
+	waitForWaiters(t, l.apfl, 2)
+
+	// The pages load; the awaits end as they do.
+	r.finish()
+	if err := receive(t, other, "the other goroutine's await"); err != nil {
+		t.Errorf("other goroutine's await: got %v, want success", err)
+	}
+	if err := receive(t, results, "an await once forgotten"); err != nil {
+		t.Errorf("await once forgotten: got %v, want success", err)
+	}
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+	l.apfl.mu.Lock()
+	numWaiters := l.apfl.numWaiters
+	l.apfl.mu.Unlock()
+	if numWaiters != 0 {
+		t.Errorf("%d waiters remain once loaded", numWaiters)
+	}
+	checkInvariants(t, restored)
 }
 
 // TestAsyncLoadErrorWakesLoadedWaiters checks that when a read fails, the
