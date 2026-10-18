@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -57,6 +58,11 @@ type taskRunState interface {
 // searching for Task.run()'s argument value.
 func (t *Task) run(threadID uintptr) {
 	t.goid.Store(goid.Get())
+	// Killed before its goroutine was known to killLocked, t's waits for
+	// pages being loaded are cut short here (see Task.killLocked).
+	if t.killed() {
+		pgalloc.CancelAwaits(t.goid.Load())
+	}
 
 	refs.CleanupSync.Add(1)
 	defer refs.CleanupSync.Done()
@@ -102,6 +108,7 @@ func (t *Task) run(threadID uintptr) {
 			ts.mu.Unlock()
 			ts.runningGoroutines.Done()
 
+			pgalloc.ForgetCanceledAwaits(t.goid.Load())
 			// Deferring this store triggers a false positive in the race
 			// detector (https://github.com/golang/go/issues/42599).
 			t.goid.Store(0)
@@ -282,6 +289,13 @@ func (app *runApp) execute(t *Task) taskRunState {
 				// The fault was handled appropriately.
 				// We can resume running the application.
 				t.throttleDirtying()
+				return (*runApp)(nil)
+			}
+			if t.killed() {
+				// The fault may have failed as t was killed while it waited
+				// for its pages (Task.killLocked): t exits, as the next run
+				// state finds, rather than receive a signal for it.
+				t.interruptSelf()
 				return (*runApp)(nil)
 			}
 
