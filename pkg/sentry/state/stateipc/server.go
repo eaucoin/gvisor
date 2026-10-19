@@ -299,6 +299,26 @@ func (s *AsyncFileServer) Wake(req *WakeRequest, resp *WakeResponse) error {
 	return nil
 }
 
+// Retrying tells whether the server's reader of the file with the given handle
+// retries a read that failed (stateio.RetryingAsyncReader), false if it does
+// not tell.
+func (s *AsyncFileServer) Retrying(req *RetryingRequest, resp *RetryingResponse) error {
+	s.filesMu.Lock()
+	f := s.files[req.Handle]
+	s.filesMu.Unlock()
+	if f == nil {
+		return fmt.Errorf("invalid file handle: %v", req.Handle)
+	}
+	rf, ok := f.impl.(*readFile)
+	if !ok {
+		return fmt.Errorf("file handle %v is not opened for reading", req.Handle)
+	}
+	if rr, ok := rf.ar.(stateio.RetryingAsyncReader); ok {
+		resp.Retrying = rr.Retrying()
+	}
+	return nil
+}
+
 // openFile represents an opened server file.
 type openFile struct {
 	// Immutable fields:
