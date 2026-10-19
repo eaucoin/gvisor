@@ -295,6 +295,167 @@ func TestPagesReadRetriesWhileRunning(t *testing.T) {
 	}
 }
 
+// TestPagesReadRetrying checks that a reader of a pages file read for as long
+// as the sandbox runs says it retries while one of its reads waits for the
+// store, and not before, nor once the read delivered: one that is away, from
+// its first attempt on, whatever MaxAttempts says; one that accepts requests
+// and never answers them, once pagesRetryWatchdogTimeout has passed; and one
+// that is slow to begin to answer, or stops in the middle of its answer, for
+// longer than that, though it then delivers, its GET going on rather than cut.
+func TestPagesReadRetrying(t *testing.T) {
+	watchdog := pagesRetryWatchdogTimeout
+	pagesRetryWatchdogTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { pagesRetryWatchdogTimeout = watchdog })
+	const stall = 5 * 200 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		// fault is the store's, until back is closed; it answers as it
+		// does by default once fault returns false.
+		fault func(t *testing.T, w http.ResponseWriter, r *http.Request, back <-chan struct{}) bool
+		// gets is the most requests the store may have had once the
+		// reader says it retries, if positive.
+		gets int
+	}{
+		{
+			name: "away",
+			fault: func(t *testing.T, w http.ResponseWriter, r *http.Request, back <-chan struct{}) bool {
+				s3test.ResetConnection(t, w, "")
+				return true
+			},
+			gets: 2,
+		},
+		{
+			name: "silent",
+			fault: func(t *testing.T, w http.ResponseWriter, r *http.Request, back <-chan struct{}) bool {
+				select {
+				case <-r.Context().Done():
+					return true
+				case <-back:
+					// Back as it waited: it answers.
+					return false
+				}
+			},
+		},
+		{
+			name: "slow to answer",
+			fault: func(t *testing.T, w http.ResponseWriter, r *http.Request, back <-chan struct{}) bool {
+				// It answers, once the test saw the read retrying.
+				<-back
+				return false
+			},
+			gets: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := s3test.NewStore(t)
+			obj := testObject(64 << 10)
+			s.SetObject(checkpointfiles.PagesFileName, obj)
+			back := make(chan struct{})
+			s.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+				select {
+				case <-back:
+					return false
+				default:
+				}
+				return tc.fault(t, w, r, back)
+			}
+			// MaxAttempts and RequestTimeout as by default, which the
+			// client's own attempts of a GET would take tens of seconds of.
+			ar := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, MaxAttempts: defaultMaxAttempts, PagesRetryWhileRunning: true}), checkpointfiles.PagesFileName)
+			r, ok := ar.(stateio.RetryingAsyncReader)
+			if !ok {
+				t.Fatalf("the pages file's reader, %T, does not say whether it retries", ar)
+			}
+			if r.Retrying() {
+				t.Errorf("Retrying before any read: got true, want false")
+			}
+			buf := make([]byte, len(obj))
+			done := make(chan stateio.Completion, 1)
+			start := time.Now()
+			go func() { done <- read(t, ar, 0, buf) }()
+			deadline := start.Add(10 * time.Second)
+			for !r.Retrying() {
+				if time.Now().After(deadline) {
+					t.Fatalf("Retrying while the store does not answer: got false for 10 s, want true")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if took := time.Since(start); took > stall {
+				t.Errorf("Retrying turned true %v after the read began, want within %v", took, stall)
+			}
+			if got := len(s.Ops()); tc.gets > 0 && got > tc.gets {
+				t.Errorf("Retrying turned true after %d requests, want at most %d", got, tc.gets)
+			}
+			close(back)
+			if c := <-done; c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj) {
+				t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+			}
+			if r.Retrying() {
+				t.Errorf("Retrying once the read delivered: got true, want false")
+			}
+		})
+	}
+}
+
+// TestPagesReadRetryingMidBody checks that a reader of a pages file read for
+// as long as the sandbox runs says it retries while the store, having begun to
+// answer one of its reads, sends no byte of it for longer than
+// pagesRetryWatchdogTimeout, and no longer once it sends the rest, which the
+// read delivers.
+func TestPagesReadRetryingMidBody(t *testing.T) {
+	watchdog := pagesRetryWatchdogTimeout
+	pagesRetryWatchdogTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { pagesRetryWatchdogTimeout = watchdog })
+	obj := testObject(64 << 10)
+	stalled := make(chan struct{})
+	resume := make(chan struct{})
+	// A store of its own, which sends half of the object, stalls, then sends
+	// the rest.
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(obj)))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(obj)-1, len(obj)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(obj[:len(obj)/2])
+		w.(http.Flusher).Flush()
+		close(stalled)
+		<-resume
+		w.Write(obj[len(obj)/2:])
+	}))
+	t.Cleanup(hs.Close)
+	srv, err := NewFileServer(context.Background(), &FileServerOptions{
+		Endpoint:               hs.URL,
+		Bucket:                 s3test.Bucket,
+		UsePathStyle:           true,
+		Credentials:            credentials.NewStaticCredentialsProvider("key", "secret", ""),
+		AllowCheckpointReads:   true,
+		PagesRetryWhileRunning: true,
+	})
+	if err != nil {
+		t.Fatalf("NewFileServer: %v", err)
+	}
+	t.Cleanup(srv.Destroy)
+	ar := openRead(t, srv, checkpointfiles.PagesFileName)
+	r := ar.(stateio.RetryingAsyncReader)
+	buf := make([]byte, len(obj))
+	done := make(chan stateio.Completion, 1)
+	go func() { done <- read(t, ar, 0, buf) }()
+	<-stalled
+	deadline := time.Now().Add(10 * time.Second)
+	for !r.Retrying() {
+		if time.Now().After(deadline) {
+			t.Fatalf("Retrying while the store sends nothing of its answer: got false for 10 s, want true")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(resume)
+	if c := <-done; c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj) {
+		t.Errorf("read: %d bytes, %v; want all bytes, nil", c.N, c.Err)
+	}
+	if r.Retrying() {
+		t.Errorf("Retrying once the read delivered: got true, want false")
+	}
+}
+
 func TestPagesReadRetriesStalledStoreWhileRunning(t *testing.T) {
 	s := s3test.NewStore(t)
 	obj := testObject(4096)
