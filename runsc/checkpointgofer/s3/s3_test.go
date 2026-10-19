@@ -128,6 +128,44 @@ func TestReadRanges(t *testing.T) {
 	}
 }
 
+// TestReadStopsAtTheEnd checks that once the store has said where an object
+// ends, in the Content-Range of an answer to a GET, a read at or past its end
+// ends there, without a GET the store would refuse, as a file's reader reads
+// ahead of its end; and that a read across it is answered as before.
+func TestReadStopsAtTheEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// first is where the read that tells the reader the object's size
+		// begins: within it, answered with its part, or past it, refused.
+		first int64
+	}{
+		{name: "told by a part", first: 0},
+		{name: "told by a refusal", first: 200 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := s3test.NewStore(t)
+			obj := testObject(100 << 10)
+			s.SetObject(checkpointfiles.StateFileName, obj)
+			r := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true}), checkpointfiles.StateFileName)
+			buf := make([]byte, 64<<10)
+			read(t, r, tc.first, buf)
+			asked := len(s.Ops())
+			for _, off := range []int64{int64(len(obj)), 128 << 10, 1 << 20} {
+				if c := read(t, r, off, buf); c.N != 0 || c.Err != io.EOF {
+					t.Errorf("read at %d: %d bytes, %v; want 0 bytes, EOF", off, c.N, c.Err)
+				}
+			}
+			if got := len(s.Ops()); got != asked {
+				t.Errorf("%d requests for reads past the end, want none", got-asked)
+			}
+			// Across the end, a GET of what is left.
+			if c := read(t, r, int64(len(obj))-4096, buf); c.N != 4096 || c.Err != io.EOF || !bytes.Equal(buf[:4096], obj[len(obj)-4096:]) {
+				t.Errorf("read across the end: %d bytes, %v; want 4096 bytes, EOF", c.N, c.Err)
+			}
+		})
+	}
+}
+
 func TestReadRetriesServerErrors(t *testing.T) {
 	s := s3test.NewStore(t)
 	obj := testObject(64 << 10)
