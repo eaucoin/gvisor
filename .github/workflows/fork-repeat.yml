@@ -137,16 +137,25 @@ jobs:
           fi
           sed 's/^/    /' "${RUNNER_TEMP}/summary" >>"${GITHUB_STEP_SUMMARY}"
           # A filter that matches no test of a target passes it: go test says
-          # so in each run's log (Bazel's build events name them all), which
-          # fails the job.
-          unmatched=""
+          # so in the log of each of its shards and runs (Bazel's build events
+          # name them all). A shard whose tests the filter does not match says
+          # so too, so a target fails the job only if every one of its logs
+          # says it.
+          declare -A logs unmatched
           while read -r label log; do
+            logs["${label}"]=$((${logs["${label}"]:-0} + 1))
             if grep -qs '^testing: warning: no tests to run' "${log}"; then
-              unmatched+=" ${label}"
+              unmatched["${label}"]=$((${unmatched["${label}"]:-0} + 1))
             fi
           done < <(jq -r 'select(.testResult?) | .id.testResult.label as $label | .testResult.testActionOutput[]? | select(.name == "test.log") | "\($label) \(.uri)"' .build_events.json | sed -e 's|file://||')
-          if [[ -n "${unmatched}" ]]; then
-            echo "::error::No test of${unmatched} matched the filter."
+          none=""
+          for label in "${!logs[@]}"; do
+            if [[ "${unmatched["${label}"]:-0}" -eq "${logs["${label}"]}" ]]; then
+              none+=" ${label}"
+            fi
+          done
+          if [[ -n "${none}" ]]; then
+            echo "::error::No test of${none} matched the filter, in any of its shards and runs."
             exit 1
           fi
           exit "${status}"
