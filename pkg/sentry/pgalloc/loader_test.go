@@ -643,6 +643,69 @@ func TestAsyncLoadAwaitCanceled(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// TestAsyncPageLoadProgress checks what a load says it does: loading while it
+// has pages left to load, and stalled only while it keeps waiters waiting as
+// its pages file's reader retries a read that failed; and that
+// CurrentAsyncPageLoadProgress says it of every load in progress, from its
+// start until it ends.
+func TestAsyncPageLoadProgress(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 16*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	r.waitInflight(1)
+	check := func(what string, want AsyncPageLoadProgress) {
+		t.Helper()
+		if got := l.apfl.progress(); got != want {
+			t.Errorf("progress %s: got %+v, want %+v", what, got, want)
+		}
+		// Other tests' loads may still be ending, but none is stalled.
+		if got := CurrentAsyncPageLoadProgress(); !got.Loading && want.Loading || got.Stalled != want.Stalled {
+			t.Errorf("CurrentAsyncPageLoadProgress %s: got %+v, want %+v", what, got, want)
+		}
+	}
+
+	// Its reads not completing, but with no waiter: loading.
+	check("with no waiter", AsyncPageLoadProgress{Loading: true})
+	// Its reader retrying, with no waiter: still no stall.
+	r.retrying.Store(true)
+	check("retrying with no waiter", AsyncPageLoadProgress{Loading: true})
+
+	// A waiter, as the reader retries: stalled.
+	waited := awaitAsync(restored, memmap.FileRange{fr.Start + 8*hostarch.PageSize, fr.Start + 9*hostarch.PageSize})
+	waitForWaiters(t, l.apfl, 1)
+	check("retrying with a waiter", AsyncPageLoadProgress{Loading: true, Stalled: true})
+	// The reader no more retrying, the waiter still waiting: no stall.
+	r.retrying.Store(false)
+	check("not retrying with a waiter", AsyncPageLoadProgress{Loading: true})
+
+	// Loaded, the load has no page left, and is no more in progress once it
+	// ended.
+	r.finish()
+	if err := receive(t, waited, "the waiter's await"); err != nil {
+		t.Errorf("await: got %v, want success", err)
+	}
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	if got := l.apfl.progress(); got.Loading || got.Stalled {
+		t.Errorf("progress once loaded: got %+v, want neither loading nor stalled", got)
+	}
+	activeLoads.mu.Lock()
+	_, ok := activeLoads.loads[l.apfl]
+	activeLoads.mu.Unlock()
+	if ok {
+		t.Errorf("the load is in progress once it ended")
+	}
+	gens.checkPages(t, restored, fr)
+}
+
 // TestAsyncLoadErrorWakesLoadedWaiters checks that when a read fails, the
 // waiters for pages loaded by reads completed in the same batch are woken.
 func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
