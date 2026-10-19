@@ -19,6 +19,7 @@ import (
 	"io"
 	"io/fs"
 	"math/bits"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -621,4 +622,90 @@ func TestClientWatchdog(t *testing.T) {
 		t.Errorf("AsyncReader.Wait after shutdown got error nil, completions: %+v", cs)
 	}
 	t.Logf("AsyncReader.Wait after shutdown got error: %v", err)
+}
+
+// retryingReader is an AsyncReader that says it retries as its test sets.
+type retryingReader struct {
+	stateio.AsyncReader
+	retrying *atomic.Bool
+}
+
+// Retrying implements stateio.RetryingAsyncReader.Retrying.
+func (r retryingReader) Retrying() bool {
+	return r.retrying.Load()
+}
+
+// testRetryingServer serves two files: "retrying", whose reader says whether
+// it retries as retrying is set, and "plain", whose reader does not tell.
+type testRetryingServer struct {
+	retrying atomic.Bool
+}
+
+func (s *testRetryingServer) Destroy() {}
+
+func (s *testRetryingServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	ar := stateio.NewIOReader(bytes.NewReader(make([]byte, 4096)), 4096, 1 /* maxRanges */, 1 /* maxParallel */)
+	switch path {
+	case "retrying":
+		return retryingReader{ar, &s.retrying}, nil
+	case "plain":
+		return ar, nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+func (s *testRetryingServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// TestReadRetrying checks that a client's reader says it retries as the
+// server's reader of the file says, and not where the server's does not tell.
+func TestReadRetrying(t *testing.T) {
+	impl := &testRetryingServer{}
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(impl)
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	retryingOf := func(path string) stateio.RetryingAsyncReader {
+		t.Helper()
+		ar, err := client.OpenRead(path)
+		if err != nil {
+			t.Fatalf("failed to open remote file %q: %v", path, err)
+		}
+		t.Cleanup(func() { ar.Close() })
+		r, ok := ar.(stateio.RetryingAsyncReader)
+		if !ok {
+			t.Fatalf("the client's reader, %T, does not say whether it retries", ar)
+		}
+		return r
+	}
+	r := retryingOf("retrying")
+	if r.Retrying() {
+		t.Errorf("Retrying while the server's reader does not: got true, want false")
+	}
+	impl.retrying.Store(true)
+	if !r.Retrying() {
+		t.Errorf("Retrying while the server's reader does: got false, want true")
+	}
+	impl.retrying.Store(false)
+	if r.Retrying() {
+		t.Errorf("Retrying once the server's reader no more does: got true, want false")
+	}
+	impl.retrying.Store(true)
+	if retryingOf("plain").Retrying() {
+		t.Errorf("Retrying of a file whose server's reader does not tell: got true, want false")
+	}
 }

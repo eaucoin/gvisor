@@ -454,6 +454,22 @@ func (rw *asyncReadWriter) wait(cs []stateio.Completion, minCompletions int, wak
 	return cs, nil
 }
 
+// Retrying implements stateio.RetryingAsyncReader.Retrying, for a file opened
+// for reading, as the server's reader of it says with
+// AsyncFileServer.Retrying; false where it cannot be asked.
+func (rw *asyncReadWriter) Retrying() bool {
+	if !rw.isReader {
+		return false
+	}
+	req := RetryingRequest{Handle: rw.handle}
+	var resp RetryingResponse
+	if err := rw.client.uc.Call("AsyncFileServer.Retrying", &req, &resp); err != nil {
+		log.Debugf("stateipc.asyncReadWriter(%d): AsyncFileServer.Retrying failed: %v", rw.handle, err)
+		return false
+	}
+	return resp.Retrying
+}
+
 // Reserve implements stateio.AsyncWriter.Reserve.
 func (rw *asyncReadWriter) Reserve(size uint64) {
 	rw.reserve = size
