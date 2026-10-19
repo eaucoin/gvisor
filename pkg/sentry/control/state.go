@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
@@ -465,6 +466,84 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 	return postRestoreCuda(k, timeline)
 }
 
+// saveRestoreExecTick is how often waitWithin asks what async page loads are
+// doing, and so how much later than its timeout it may tell that the timeout
+// ran out. It is a variable for tests.
+var saveRestoreExecTick = 100 * time.Millisecond
+
+// waitWithin waits for done to be closed for up to timeout, and returns true
+// if it was. Where async page loads have pages left to load as it begins
+// (progress says so), timeout counts none of the time in which progress finds
+// them stalled: tasks waiting for pages while a pages file's reader retries
+// reads that failed, as the reader of a store that is away for a while does.
+// The save/restore binary that runs after a lazy restore touches pages that
+// load after the restore began, so that the time it waits for a store to come
+// back is not its own. Otherwise, as for a save, timeout counts all of the
+// time, as it always did.
+//
+// progress may take long to answer, or never answer, as when it asks a pages
+// file's reader in another process that is wedged: it is asked off the wait,
+// once at a time, and a tick with no answer since the one before counts, so
+// that timeout still bounds the wait.
+func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pgalloc.AsyncPageLoadProgress) bool {
+	start := time.Now()
+	answers := make(chan pgalloc.AsyncPageLoadProgress, 1)
+	asking := false
+	ask := func() {
+		asking = true
+		go func() { answers <- progress() }()
+	}
+	ask()
+	// stalled is true if an answer since the last tick, or since start, said
+	// the loads stall.
+	stalled := false
+	select {
+	case <-done:
+		return true
+	case p := <-answers:
+		asking = false
+		stalled = p.Stalled
+		if !p.Loading {
+			select {
+			case <-done:
+				return true
+			case <-time.After(timeout - time.Since(start)):
+				return false
+			}
+		}
+	case <-time.After(saveRestoreExecTick):
+		// No answer yet: loads may be stalled behind a reader that does not
+		// answer, which the ticks below count against timeout.
+	}
+	ticker := time.NewTicker(saveRestoreExecTick)
+	defer ticker.Stop()
+	last := start
+	for counted := time.Duration(0); counted < timeout; {
+		select {
+		case <-done:
+			return true
+		case p := <-answers:
+			asking = false
+			stalled = stalled || p.Stalled
+		case now := <-ticker.C:
+			if !stalled {
+				counted += now.Sub(last)
+			}
+			stalled = false
+			last = now
+			if !asking {
+				ask()
+			}
+		}
+	}
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
 // SaveRestoreExec creates a new process that executes the save/restore
 // binary specified by k.SaveRestoreExecConfig and waits for it to finish.
 //
@@ -543,16 +622,14 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 	waitC := make(chan struct{})
 	go func() {
 		tg.WaitExited()
-		waitC <- struct{}{}
+		close(waitC)
 	}()
-	select {
-	case <-waitC:
-		if tg.ExitStatus() != 0 {
-			return fmt.Errorf("%v exited with non-zero status %d", argv[0], tg.ExitStatus())
-		}
-	case <-time.After(timeout):
+	if !waitWithin(waitC, timeout, pgalloc.CurrentAsyncPageLoadProgress) {
 		tg.SendSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		return fmt.Errorf("%s timed out after %v", argv[0], timeout)
+	}
+	if tg.ExitStatus() != 0 {
+		return fmt.Errorf("%v exited with non-zero status %d", argv[0], tg.ExitStatus())
 	}
 	log.Debugf("save/restore binary %s output: %s", argv[0], execOut.String())
 	return nil
