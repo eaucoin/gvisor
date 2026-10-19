@@ -69,6 +69,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/socket/netstack",
         "//pkg/sentry/state",
         "//pkg/sentry/state/checkpointfiles",
@@ -98,6 +99,7 @@ go_test(
     srcs = [
         "fs_test.go",
         "proc_test.go",
+        "state_test.go",
     ],
     library = ":control",
     deps = [
@@ -108,6 +110,7 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/ktime",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/usermem",
