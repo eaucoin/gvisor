@@ -21,6 +21,8 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -70,6 +72,14 @@ type Reader struct {
 	// retrying is the number of reads that failed and have delivered no byte
 	// since, as they wait to be made again (see read).
 	retrying atomic.Int32
+
+	// size is the object's size, once the store has said it in the
+	// Content-Range of an answer to a GET, or -1 before: a read that would
+	// begin at or past it then ends there, without a GET the store would
+	// refuse (see read). It is kept for as long as the Reader is, as a
+	// checkpoint's objects, its layers' among them, are written once and
+	// never change while they are read.
+	size atomic.Int64
 }
 
 type readSubmission struct {
@@ -94,6 +104,7 @@ func newReader(ctx context.Context, client *s3.Client, obj object, policy retryP
 		cmps:         make(chan stateio.Completion, maxParallel),
 		cancel:       cancel,
 	}
+	r.size.Store(-1)
 	r.workers.Add(maxParallel)
 	for range maxParallel {
 		go r.workerMain(ctx)
@@ -293,6 +304,12 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) 
 	s := &readState{r: r}
 	defer s.set(false)
 	for failures := 0; ; {
+		// A file's reader reads ahead of its end, as stateio.BufReader does
+		// in parallel: once the store has said where the object ends, a read
+		// past it ends there.
+		if size := r.size.Load(); size >= 0 && sub.off+int64(done) >= size {
+			return done, io.EOF
+		}
 		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s)
 		done += n
 		if r.whileRunning && transient(err) {
@@ -326,6 +343,19 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) 
 			return done, mapError(err, "GetObject", r.obj)
 		}
 		dst = dst.DropFirst(n)
+	}
+}
+
+// learnSize records the size of r's object that contentRange, the
+// Content-Range of an answer to a GET ("bytes <first>-<last>/<size>", or
+// "bytes */<size>"), says, if it says one.
+func (r *Reader) learnSize(contentRange string) {
+	_, total, ok := strings.Cut(contentRange, "/")
+	if !ok {
+		return
+	}
+	if size, err := strconv.ParseInt(total, 10, 64); err == nil && size >= 0 {
+		r.size.Store(size)
 	}
 }
 
@@ -388,11 +418,16 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	if err != nil {
 		var respErr *awshttp.ResponseError
 		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
-			// off is at or past the end of the object.
+			// off is at or past the end of the object, which the answer
+			// says, as "bytes */<size>".
+			if respErr.Response != nil {
+				r.learnSize(respErr.Response.Header.Get("Content-Range"))
+			}
 			return 0, io.EOF
 		}
 		return 0, err
 	}
+	r.learnSize(aws.ToString(out.ContentRange))
 	defer out.Body.Close()
 	body := io.Reader(out.Body)
 	if r.whileRunning {
