@@ -1564,6 +1564,11 @@ type AsyncPagesFileLoad struct {
 	// otherwise. waitOr is immutable.
 	waitOr stateio.WaitOrAsyncReader
 
+	// retrying is ar if it implements stateio.RetryingAsyncReader, and nil
+	// otherwise. Unlike ar, it may be used by any goroutine
+	// (CurrentAsyncPageLoadProgress). retrying is immutable.
+	retrying stateio.RetryingAsyncReader
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -2079,6 +2084,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		ops:              make([]aplOp, maxParallel),
 	}
 	apfl.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
+	apfl.retrying, _ = ar.(stateio.RetryingAsyncReader)
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
 		apfl.opsBusy.Add(uint32(i))
@@ -2091,8 +2097,87 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		op.iovecs = make([]unix.Iovec, 0, maxRanges)
 	}
 	apfl.lfStatus.Init()
+	activeLoads.add(apfl)
 	go apfl.main()
 	return apfl, nil
+}
+
+// activeLoads holds the asynchronous loads of pages files in progress, from
+// StartAsyncPagesFileLoad until their async page loader goroutines end, for
+// CurrentAsyncPageLoadProgress.
+var activeLoads aplRegistry
+
+// aplRegistry is a set of AsyncPagesFileLoads.
+type aplRegistry struct {
+	mu    sync.Mutex
+	loads map[*AsyncPagesFileLoad]struct{}
+}
+
+func (r *aplRegistry) add(apfl *AsyncPagesFileLoad) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.loads == nil {
+		r.loads = make(map[*AsyncPagesFileLoad]struct{})
+	}
+	r.loads[apfl] = struct{}{}
+}
+
+func (r *aplRegistry) remove(apfl *AsyncPagesFileLoad) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.loads, apfl)
+}
+
+// AsyncPageLoadProgress is what the asynchronous page loads in progress, of
+// every pages file, are doing at one moment.
+type AsyncPageLoadProgress struct {
+	// Loading is true if one of them has pages left to load.
+	Loading bool
+
+	// Stalled is true if one of them keeps waiters waiting for pages while
+	// its pages file's reader retries a read that failed
+	// (stateio.RetryingAsyncReader), as the reader of a store that is away
+	// for a while does (pages_retry): the waiters wait for the store, not for
+	// the load's own pace. It is of the load, not of each waiter: some load
+	// has waiters and some read of its pages file retries, whether or not
+	// that read is of the pages the waiters wait for; as the reads of one
+	// pages file reach the same store, the time it says so is bounded by
+	// that read's failures.
+	Stalled bool
+}
+
+// CurrentAsyncPageLoadProgress returns what the asynchronous page loads in
+// progress are doing now.
+func CurrentAsyncPageLoadProgress() AsyncPageLoadProgress {
+	activeLoads.mu.Lock()
+	loads := make([]*AsyncPagesFileLoad, 0, len(activeLoads.loads))
+	for apfl := range activeLoads.loads {
+		loads = append(loads, apfl)
+	}
+	activeLoads.mu.Unlock()
+	var p AsyncPageLoadProgress
+	for _, apfl := range loads {
+		lp := apfl.progress()
+		p.Loading = p.Loading || lp.Loading
+		p.Stalled = p.Stalled || lp.Stalled
+	}
+	return p
+}
+
+// progress returns what apfl is doing now, as CurrentAsyncPageLoadProgress
+// says of every load.
+func (apfl *AsyncPagesFileLoad) progress() AsyncPageLoadProgress {
+	apfl.amflsMu.Lock()
+	apfl.mu.Lock()
+	left := !apfl.amfls.Empty()
+	waiters := apfl.numWaiters
+	apfl.mu.Unlock()
+	apfl.amflsMu.Unlock()
+	// Asked with no lock held, as the reader may ask another process.
+	return AsyncPageLoadProgress{
+		Loading: left,
+		Stalled: waiters > 0 && apfl.retrying != nil && apfl.retrying.Retrying(),
+	}
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -2597,6 +2682,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		asyncLoadWaitNanoseconds.IncrementBy(uint64(apfl.durWaitedTotal.Nanoseconds()))
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
+		activeLoads.remove(apfl)
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
