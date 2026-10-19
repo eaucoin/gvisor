@@ -21,6 +21,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,6 +39,18 @@ import (
 // before it delivered its bytes, as when its connection resets.
 var errShortBody = errors.New("response body ended early")
 
+// pagesRetryWatchdogTimeout is how long a GET of a read retried for as long as
+// the sandbox runs (Reader.whileRunning) may go without the store beginning
+// to answer, or sending a byte of its answer, before the read counts as
+// retrying (Reader.Retrying), as when the store is away: the GET goes on,
+// within its own deadline, and the read no longer counts once a byte comes. A
+// store that accepts requests and never answers them is thus known as such
+// within it, well within the timeouts that save/restore binaries are given
+// (tens of seconds), which the time spent waiting for such a store does not
+// count against (pkg/sentry/control's SaveRestoreExec); a store that is only
+// slow still delivers. It is a variable for tests.
+var pagesRetryWatchdogTimeout = 10 * time.Second
+
 // Reader implements stateio.WaitOrAsyncReader for an S3 object, with one
 // ranged GET per read.
 type Reader struct {
@@ -53,6 +66,10 @@ type Reader struct {
 	cmps         chan stateio.Completion
 	cancel       context.CancelCauseFunc
 	workers      sync.WaitGroup
+
+	// retrying is the number of reads that failed and have delivered no byte
+	// since, as they wait to be made again (see read).
+	retrying atomic.Int32
 }
 
 type readSubmission struct {
@@ -82,6 +99,113 @@ func newReader(ctx context.Context, client *s3.Client, obj object, policy retryP
 		go r.workerMain(ctx)
 	}
 	return r
+}
+
+// readState is a read's part in its Reader's count of the reads that retry
+// (Reader.retrying), and the watchdog of its GETs (pagesRetryWatchdogTimeout).
+type readState struct {
+	r *Reader
+
+	mu sync.Mutex
+	// retrying is true while the read counts in r.retrying.
+	retrying bool
+	// watched is true while a GET of the read is watched, for up to timeout
+	// past last, the time of the store's last sign of answering.
+	watched bool
+	timeout time.Duration
+	last    time.Time
+	timer   *time.Timer
+}
+
+// set has the read count, or no longer count, as retrying.
+func (s *readState) set(retrying bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setLocked(retrying)
+}
+
+// Preconditions: s.mu must be locked.
+func (s *readState) setLocked(retrying bool) {
+	if retrying == s.retrying {
+		return
+	}
+	s.retrying = retrying
+	if retrying {
+		s.r.retrying.Add(1)
+	} else {
+		s.r.retrying.Add(-1)
+	}
+}
+
+// watch begins to watch a GET of the read: if the store gives no sign of
+// answering (progress) for timeout, the read counts as retrying, until it does.
+func (s *readState) watch(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watched = true
+	s.timeout = timeout
+	s.last = time.Now()
+	if s.timer == nil {
+		s.timer = time.AfterFunc(timeout, s.fire)
+	} else {
+		s.timer.Reset(timeout)
+	}
+}
+
+// progress tells of a sign of the store answering the GET watched: its answer
+// begun, or a byte of it.
+func (s *readState) progress() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.last = time.Now()
+	s.setLocked(false)
+}
+
+// unwatch ends the watch of the read's GET.
+func (s *readState) unwatch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watched = false
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+}
+
+// fire is the watchdog's: the read counts as retrying if the store gave no
+// sign of answering for the watch's timeout, or else is watched on.
+func (s *readState) fire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.watched {
+		return
+	}
+	if left := s.timeout - time.Since(s.last); left > 0 {
+		s.timer.Reset(left)
+		return
+	}
+	s.setLocked(true)
+}
+
+// progressReader tells s of each byte it reads of the answer to a GET.
+type progressReader struct {
+	io.Reader
+	s *readState
+}
+
+// Read implements io.Reader.Read.
+func (p progressReader) Read(b []byte) (int, error) {
+	n, err := p.Reader.Read(b)
+	if n > 0 {
+		p.s.progress()
+	}
+	return n, err
+}
+
+// Retrying implements stateio.RetryingAsyncReader.Retrying: true while one of
+// r's reads, of a pages file read for as long as the sandbox runs, failed as
+// one that may succeed later does and has delivered no byte since.
+func (r *Reader) Retrying() bool {
+	return r.retrying.Load() > 0
 }
 
 // Close implements stateio.AsyncReader.Close.
@@ -166,17 +290,21 @@ func (r *Reader) workerMain(ctx context.Context) {
 func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) {
 	var done uint64
 	dst := sub.dst
+	s := &readState{r: r}
+	defer s.set(false)
 	for failures := 0; ; {
-		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst)
+		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s)
 		done += n
 		if r.whileRunning && transient(err) {
 			if n != 0 {
 				failures = 0
+				s.set(false)
 			} else {
 				failures++
 				if failures == 1 {
 					log.Warningf("s3.GetObject on %s failed, retried for as long as the sandbox runs: %v", r.obj, err)
 				}
+				s.set(true)
 				select {
 				case <-ctx.Done():
 					return done, mapError(err, "GetObject", r.obj)
@@ -240,14 +368,23 @@ func transient(err error) bool {
 // readOnce reads up to total bytes at off into dst with one GET. It returns
 // io.EOF if the object ends before them. Its errors are the client's, which
 // read maps.
-func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges) (uint64, error) {
+func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges, s *readState) (uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.retry.deadline(total))
 	defer cancel()
+	var optFns []func(*s3.Options)
+	if r.whileRunning {
+		// Made once by the client, as the read retries it after a backoff of
+		// its own; watched, so that the read counts as retrying while the
+		// store neither begins to answer nor sends a byte.
+		optFns = append(optFns, func(o *s3.Options) { o.RetryMaxAttempts = 1 })
+		s.watch(pagesRetryWatchdogTimeout)
+		defer s.unwatch()
+	}
 	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r.obj.bucket),
 		Key:    aws.String(r.obj.key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(total)-1)),
-	})
+	}, optFns...)
 	if err != nil {
 		var respErr *awshttp.ResponseError
 		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
@@ -257,6 +394,13 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 		return 0, err
 	}
 	defer out.Body.Close()
+	body := io.Reader(out.Body)
+	if r.whileRunning {
+		// The store began to answer: the read no longer counts as retrying,
+		// and each byte of its answer after keeps it from counting again.
+		s.progress()
+		body = progressReader{out.Body, s}
+	}
 	want := total
 	if out.ContentLength != nil {
 		want = min(want, uint64(*out.ContentLength))
@@ -268,7 +412,7 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 			break
 		}
 		m = m[:min(uint64(len(m)), want-done)]
-		n, err := io.ReadFull(out.Body, m)
+		n, err := io.ReadFull(body, m)
 		done += uint64(n)
 		if err != nil {
 			bodyErr = err
