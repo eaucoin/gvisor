@@ -161,6 +161,13 @@ func (r *RateLimitedReader) WaitOr(cs []Completion, wake <-chan struct{}) ([]Com
 	return r.limiter.wait(r.AsyncReader.Wait, cs, 1, wake)
 }
 
+// Retrying implements RetryingAsyncReader.Retrying: it is the reader's that r
+// limits, if that reader tells, and false otherwise.
+func (r *RateLimitedReader) Retrying() bool {
+	rr, ok := r.AsyncReader.(RetryingAsyncReader)
+	return ok && rr.Retrying()
+}
+
 // RateLimitedWriter is an AsyncWriter that completes the writes of another no
 // sooner than a device storing a fixed number of bytes per second, in the
 // order the writes were issued, would: as a disk throttled by cgroup io.max,
