@@ -137,6 +137,20 @@ type WaitOrAsyncReader interface {
 	WaitOr(cs []Completion, wake <-chan struct{}) ([]Completion, error)
 }
 
+// RetryingAsyncReader is an AsyncReader that tells whether it retries a read
+// that failed, as the reader of a store that is away for a while retries the
+// reads that may succeed later rather than fail them.
+type RetryingAsyncReader interface {
+	AsyncReader
+
+	// Retrying returns true if one of the AsyncReader's reads in flight failed
+	// and has delivered no byte since, as it waits to be made again or is
+	// being made again. Retrying may be called concurrently with the
+	// AsyncReader's other methods, including after Close, when it returns
+	// false.
+	Retrying() bool
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be
