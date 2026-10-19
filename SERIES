@@ -33,3 +33,5 @@ series/22-shim-incremental-checkpoints on series/21-working-set
 series/03-release-versions on series/22-shim-incremental-checkpoints
 # A task waiting for pages being loaded is killable (pgalloc, kernel, runsc/boot).
 series/23-killable-page-loads on series/03-release-versions
+# The save/restore binary that runs after a lazy restore outlasts a store that is away (control, pgalloc).
+series/24-post-restore-hook-stalls on series/23-killable-page-loads
