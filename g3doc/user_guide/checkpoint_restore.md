@@ -800,7 +800,13 @@ Gateway and others), the file is `s3_opts.json`:
     background (`--background`) then waits for a store that is away for a
     while, as when it restarts, instead of failing the load and ending the
     sandbox: meanwhile, an application that touches a page not yet loaded
-    waits for it. Errors that recur, as a missing object or refused
+    waits for it. Such a read's GET is made once by the S3 client
+    (`max_attempts` does not apply to it), and while the store neither begins
+    to answer it nor sends a byte of its answer for 10 seconds, the read
+    counts as retrying, its GET going on within its own time: a store that is
+    away, or accepts requests and never answers them, is known as such within
+    seconds, and one that is only slow still delivers. Errors that recur, as a
+    missing object or refused
     credentials, still fail the restore at once, and the other files are read
     as `max_attempts` says, so that a restore whose store is away fails before
     it begins. A store that stays away keeps the sandbox waiting until it is
