@@ -2597,6 +2597,200 @@ func TestCheckpointRestoreS3StoreAway(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreS3StoreAwayHook checks the save/restore binary that runs
+// after a restore with --background from an S3-compatible object store, with
+// pages_retry "while-running": as the store goes away for longer than the
+// binary's timeout while the pages it touches load, it waits for them, the
+// time it waits not counting against its timeout, and completes once the
+// store is back, past its timeout, the container running on, its data intact.
+// One that hangs, its pages loaded, is still killed at its timeout, which ends
+// the sandbox; one that hangs once the store that kept it waiting is back is
+// killed then, its wait not counted.
+func TestCheckpointRestoreS3StoreAwayHook(t *testing.T) {
+	const hookTimeout = 2 * time.Second
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, tc := range []struct {
+			name string
+			// away is how long the store is away once the restore's first
+			// reads of its pages were served; none if 0.
+			away time.Duration
+			// hang has the binary hang after a restore rather than end.
+			hang bool
+		}{
+			{name: "store away", away: 4 * hookTimeout},
+			{name: "hook hangs", hang: true},
+			{name: "hook hangs, store away", away: 4 * hookTimeout, hang: true},
+		} {
+			t.Run(fmt.Sprintf("%s/%s", name, tc.name), func(t *testing.T) {
+				store := s3test.NewStore(t)
+				// The gofer's attempts of a GET as by default, which it makes
+				// once for a pages read retried while the sandbox runs.
+				dir := s3ImageDir(t, store, `, "pages_retry": "while-running", "read_bytes": 1048576`)
+				var (
+					mu        sync.Mutex
+					restoring bool
+					reads     int
+					awayUntil time.Time
+					refused   int
+				)
+				store.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+					if tc.away == 0 || !isPagesRead(r, op) {
+						return false
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if !restoring {
+						return false
+					}
+					if reads++; reads <= 4 {
+						return false
+					}
+					if awayUntil.IsZero() {
+						awayUntil = time.Now().Add(tc.away)
+					}
+					if time.Now().After(awayUntil) {
+						return false
+					}
+					refused++
+					s3test.ResetConnection(t, w, "")
+					return true
+				}
+
+				// The application holds 32 MiB in a file of a tmpfs of the
+				// sentry's, whose pages the binary reads after the restore,
+				// and writes their checksum on.
+				outputPath := filepath.Join(dir, "output")
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+				defer outputFile.Close()
+				script := fmt.Sprintf(`head -c %d /dev/urandom > /etc/held; while true; do md5sum /etc/held >> %q; sleep 0.2; done`, 32<<20, outputPath)
+				hookLogPath := filepath.Join(dir, "hook.log")
+				hookPath := filepath.Join(dir, "hook.sh")
+				hook := fmt.Sprintf("md5sum /etc/held > /dev/null\necho $GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE >> %q\n", hookLogPath)
+				if tc.hang {
+					hook += "if [ \"$GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE\" = restore ]; then sleep 1000; fi\n"
+				}
+				if err := os.WriteFile(hookPath, []byte(hook), 0755); err != nil {
+					t.Fatalf("error writing hook: %v", err)
+				}
+				spec := testutil.NewSpecWithArgs("bash", "-c", script)
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				defer cleanup()
+				args := Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir}
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if err := cont.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				if err := waitForFileNotEmpty(outputFile); err != nil {
+					t.Fatalf("Failed to wait for output file: %v", err)
+				}
+				want, err := firstLine(outputPath)
+				if err != nil {
+					t.Fatalf("error reading output: %v", err)
+				}
+				if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{
+					Compression:                statefile.CompressionLevelNone,
+					SaveRestoreExecArgv:        "/bin/bash " + hookPath,
+					SaveRestoreExecTimeout:     hookTimeout,
+					SaveRestoreExecContainerID: cont.ID,
+				}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				cont.Destroy()
+				if err := os.Remove(outputPath); err != nil {
+					t.Fatalf("error removing file: %v", err)
+				}
+				outputFile2, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+				defer outputFile2.Close()
+
+				cont2, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont2.Destroy()
+				mu.Lock()
+				restoring = true
+				mu.Unlock()
+				restoreStart := time.Now()
+				if err := cont2.Restore(conf, dir, sandbox.RestoreOpts{Background: true}); err != nil {
+					t.Fatalf("error restoring container: %v", err)
+				}
+
+				if tc.hang {
+					// The binary hangs, its pages loaded: killed at its
+					// timeout, it ends the sandbox; not before the store that
+					// kept it waiting is back, if one did.
+					exited := make(chan error, 1)
+					go func() {
+						_, err := cont2.Wait()
+						exited <- err
+					}()
+					select {
+					case <-exited:
+					case <-time.After(tc.away + hookTimeout + 30*time.Second):
+						t.Fatalf("the sandbox whose save/restore binary hung ran on %v past the binary's timeout", 30*time.Second)
+					}
+					if took := time.Since(restoreStart); took < tc.away {
+						t.Errorf("the sandbox whose save/restore binary hung ended %v after the restore began, before the store was back, %v after", took, tc.away)
+					}
+					return
+				}
+
+				// The binary completes once the store is back, past its
+				// timeout, and the application runs on, its data intact.
+				if err := testutil.Poll(func() error {
+					got, err := os.ReadFile(hookLogPath)
+					if err != nil {
+						return err
+					}
+					if string(got) != "save\nrestore\n" {
+						return fmt.Errorf("hook log %q", got)
+					}
+					return nil
+				}, tc.away+30*time.Second); err != nil {
+					t.Fatalf("the save/restore binary did not complete after the restore: %v", err)
+				}
+				// Past its timeout, which its wait for the store did not use up.
+				if fi, err := os.Stat(hookLogPath); err != nil {
+					t.Fatalf("error with hook log: %v", err)
+				} else if took := fi.ModTime().Sub(restoreStart); took <= hookTimeout {
+					t.Errorf("the save/restore binary completed %v after the restore began, within its timeout, %v: it did not wait for the store", took, hookTimeout)
+				}
+				if got, want := cont2.State().Status, Running; got != want {
+					t.Fatalf("restored container status: got %v, want %v", got, want)
+				}
+				if err := waitForFileNotEmpty(outputFile2); err != nil {
+					t.Fatalf("Failed to wait for output file: %v", err)
+				}
+				got, err := firstLine(outputPath)
+				if err != nil {
+					t.Fatalf("error reading output: %v", err)
+				}
+				if got != want {
+					t.Errorf("checksum of the application's data after the restore is %q, want %q as before the checkpoint", got, want)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if refused == 0 {
+					t.Errorf("the store refused none of the restore's %d reads of its pages", reads)
+				}
+			})
+		}
+	}
+}
+
 // pidsWhere returns the pids of the processes whose command lines satisfy
 // match, zombies aside.
 func pidsWhere(t *testing.T, match func(argv []string) bool) []int {

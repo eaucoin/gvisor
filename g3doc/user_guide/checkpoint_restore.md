@@ -800,18 +800,22 @@ Gateway and others), the file is `s3_opts.json`:
     background (`--background`) then waits for a store that is away for a
     while, as when it restarts, instead of failing the load and ending the
     sandbox: meanwhile, an application that touches a page not yet loaded
-    waits for it. Such a read's GET is made once by the S3 client
-    (`max_attempts` does not apply to it), and while the store neither begins
-    to answer it nor sends a byte of its answer for 10 seconds, the read
-    counts as retrying, its GET going on within its own time: a store that is
-    away, or accepts requests and never answers them, is known as such within
-    seconds, and one that is only slow still delivers. Errors that recur, as a
-    missing object or refused
-    credentials, still fail the restore at once, and the other files are read
-    as `max_attempts` says, so that a restore whose store is away fails before
-    it begins. A store that stays away keeps the sandbox waiting until it is
-    killed, which waits for none of its reads (see
-    [Background Restore](#background-restore)).
+    waits for it. So does the save/restore exec binary that runs after the
+    restore, whose timeout skips the time while tasks wait for pages and the
+    pages file's reader retries reads that failed: a store away for longer
+    than the timeout does not end the sandbox through it, and a binary that
+    hangs otherwise is still killed at its timeout, which ends the sandbox.
+    Such a read's GET is made once by the S3 client (`max_attempts` does not
+    apply to it), and while the store neither begins to answer it nor sends a
+    byte of its answer for 10 seconds, the read counts as retrying, its GET
+    going on within its own time: a store that is away, or accepts requests
+    and never answers them, is known as such within seconds, and one that is
+    only slow still delivers. Errors that recur,
+    as a missing object or refused credentials, still fail the restore at
+    once, and the other files are read as `max_attempts` says, so that a
+    restore whose store is away fails before it begins. A store that stays
+    away keeps the sandbox waiting until it is killed, which waits for none of
+    its reads (see [Background Restore](#background-restore)).
 -   `write_part_bytes` and `write_parallel` (default 32 MiB and 4): `pages.img`
     is uploaded in a multipart upload of parts of this size (at least 5 MiB; a
     file smaller than a part is uploaded at once), this many at a time. A
