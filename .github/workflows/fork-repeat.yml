@@ -26,8 +26,13 @@ name: Fork repeat
         description: Bazel test targets, separated by spaces
         required: true
         type: string
+      test_filter:
+        description: Tests to run, a regular expression of their names as go test -run takes it (e.g. TestFoo|TestBar), passed to Bazel's --test_filter as it is (all if empty)
+        required: false
+        default: ""
+        type: string
       options:
-        description: More Bazel options, quoted for the shell (e.g. --test_env=CGROUPV2=true '--test_filter=TestFoo' --test_arg=--test_platforms=kvm)
+        description: More Bazel options, quoted for the shell (e.g. --test_env=CGROUPV2=true --test_arg=--test_platforms=kvm)
         required: false
         default: ""
         type: string
@@ -103,16 +108,25 @@ jobs:
           SUITE: ${{ inputs.suite }}
           SHA: ${{ steps.resolve.outputs.sha }}
           TARGETS: ${{ inputs.targets }}
+          FILTER: ${{ inputs.test_filter }}
           EXTRA: ${{ inputs.options }}
           RUNS: ${{ inputs.runs }}
         run: |
           [[ "${RUNS}" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive number."; exit 1; }
-          echo "make ${SUITE}: ${TARGETS} at ${REF} (${SHA}), ${RUNS} runs each, options: ${EXTRA:-none}" >>"${GITHUB_STEP_SUMMARY}"
+          echo "make ${SUITE}: ${TARGETS} at ${REF} (${SHA}), ${RUNS} runs each, filter: ${FILTER:-none}, options: ${EXTRA:-none}" >>"${GITHUB_STEP_SUMMARY}"
+          # The filter, quoted for the shell that tools/bazel.mk runs Bazel
+          # in, so that none of it is word-split or taken as the shell's own
+          # (as a "|" between names would be).
+          filter=""
+          if [[ -n "${FILTER}" ]]; then
+            filter="$(printf -- '--test_filter=%q' "${FILTER}")"
+          fi
           set +e
           # tools/bazel.mk adds BAZEL_REMOTE_CACHE and TEST_OPTIONS; make
           # would expand a "$" in the options (as in a test filter's regular
           # expression), so it is doubled.
-          make "${SUITE}" TARGETS="${TARGETS}" OPTIONS="--runs_per_test=${RUNS} ${EXTRA//\$/\$\$}" 2>&1 |
+          options="--runs_per_test=${RUNS} ${filter} ${EXTRA}"
+          make "${SUITE}" TARGETS="${TARGETS}" OPTIONS="${options//\$/\$\$}" 2>&1 |
             tee "${RUNNER_TEMP}/test.log"
           status=$?
           set -e
@@ -122,6 +136,19 @@ jobs:
             exit 1
           fi
           sed 's/^/    /' "${RUNNER_TEMP}/summary" >>"${GITHUB_STEP_SUMMARY}"
+          # A filter that matches no test of a target passes it: go test says
+          # so in each run's log (Bazel's build events name them all), which
+          # fails the job.
+          unmatched=""
+          while read -r label log; do
+            if grep -qs '^testing: warning: no tests to run' "${log}"; then
+              unmatched+=" ${label}"
+            fi
+          done < <(jq -r 'select(.testResult?) | .id.testResult.label as $label | .testResult.testActionOutput[]? | select(.name == "test.log") | "\($label) \(.uri)"' .build_events.json | sed -e 's|file://||')
+          if [[ -n "${unmatched}" ]]; then
+            echo "::error::No test of${unmatched} matched the filter."
+            exit 1
+          fi
           exit "${status}"
       - name: Test logs
         if: failure()
