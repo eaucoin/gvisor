@@ -35,3 +35,5 @@ series/03-release-versions on series/22-shim-incremental-checkpoints
 series/23-killable-page-loads on series/03-release-versions
 # The save/restore binary that runs after a lazy restore outlasts a store that is away (control, pgalloc).
 series/24-post-restore-hook-stalls on series/23-killable-page-loads
+# A checkpoint gofer's reads past an object's end end there, without a GET (s3 reader).
+series/26-s3-reads-stop-at-end on series/24-post-restore-hook-stalls
