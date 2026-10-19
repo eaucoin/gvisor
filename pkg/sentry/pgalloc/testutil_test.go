@@ -25,6 +25,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -541,6 +542,15 @@ type testPagesFile struct {
 	failOff int64
 
 	closed bool
+
+	// retrying is what r says it does (stateio.RetryingAsyncReader), as the
+	// test sets it.
+	retrying atomic.Bool
+}
+
+// Retrying implements stateio.RetryingAsyncReader.Retrying.
+func (r *testPagesFile) Retrying() bool {
+	return r.retrying.Load()
 }
 
 // testRead is a read submitted to a testPagesFile.
