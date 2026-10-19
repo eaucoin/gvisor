@@ -128,6 +128,20 @@ type WakeResponse struct {
 	// empty
 }
 
+// RetryingRequest is the request type for AsyncFileServer.Retrying.
+type RetryingRequest struct {
+	// Handle is the handle of the opened server file, which must be opened for
+	// reading.
+	Handle uint32 `json:"handle"`
+}
+
+// RetryingResponse is the response type for AsyncFileServer.Retrying.
+type RetryingResponse struct {
+	// Retrying is what the server's reader of the file says of itself
+	// (stateio.RetryingAsyncReader.Retrying), or false if it does not tell.
+	Retrying bool `json:"retrying"`
+}
+
 // The following types are used on per-file Flipcall I/O connections.
 //
 // For connections serving reads, the datagram sent from client to server
