@@ -182,6 +182,8 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if start >= len(obj) {
+			// As S3 says where the object ends.
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(obj)))
 			WriteError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange")
 			return
 		}
