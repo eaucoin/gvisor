@@ -58,6 +58,7 @@ go_test(
         "precopy_test.go",
         "shared_volume_test.go",
         "trace_test.go",
+        "write_errors_test.go",
     ],
     # Only run the default platform for the tsan test, which should
     # be compatible. For non-tsan builds, run all platforms.
@@ -117,6 +118,8 @@ go_test(
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_creack_pty//:go_default_library",
         "@com_github_google_go_cmp//cmp:go_default_library",
+        "@com_github_hanwen_go_fuse_v2//fs:go_default_library",
+        "@com_github_hanwen_go_fuse_v2//fuse:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",

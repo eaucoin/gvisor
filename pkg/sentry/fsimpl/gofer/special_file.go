@@ -153,7 +153,11 @@ func (fd *specialFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	return flush(ctx, fd.handle.fdLisa)
+	if fd.handle.fdLisa.Ok() {
+		return flush(ctx, fd.handle.fdLisa)
+	}
+	// Its host FD, which Release closes discarding what the close says.
+	return flushHostFD(int(fd.handle.fd))
 }
 
 // Readiness implements waiter.Waitable.Readiness.

@@ -463,11 +463,33 @@ func (i *inode) flush(ctx context.Context) error {
 	case *lisafsInode:
 		return flush(ctx, it.writeFDLisa)
 	case *directfsInode:
-		// Nothing to do here.
-		return nil
+		return flushHostFD(int(i.writeFD.RacyLoad()))
 	default:
 		panic("unknown inode implementation")
 	}
+}
+
+// flushHostFD flushes the host file description of fd as close(2) does,
+// returning what the host's close says of it: remote filesystems, FUSE and
+// NFS among them, may report there the failure of a write they committed
+// asynchronously. close(2) of fd itself would end it, which the inode still
+// uses, so a duplicate of it is closed instead. A negative fd, or one that
+// cannot be duplicated, flushes nothing.
+func flushHostFD(fd int) error {
+	if fd < 0 {
+		return nil
+	}
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return nil
+	}
+	// The duplicate is gone whatever close(2) returns, EINTR included, as on
+	// Linux: it is not closed again, since its number may already name
+	// another file.
+	if err := unix.Close(dup); err != nil && err != unix.EINTR {
+		return err
+	}
+	return nil
 }
 
 // Precondition: !d.isSynthetic().
