@@ -1,0 +1,21 @@
+base release-20260921.0
+series/fork-infra 64bd81d6e2f3fc510c41b1ed9904496d4d8f209c 23
+series/00-base-fixes 7ad8dc78b858518d9ea534a115f70f9f2c3efc3b 7
+series/10-pgalloc-save-restore-tests 19122d496f7137c5e167ff73ff00edf53b18daf5 2
+series/17-image-format-v2 6c09bbacfc2bd4cf49ac7ce78ab1b45ee5160750 6
+series/18-image-tooling 5bc63f480174a65421bc8fa5986da2130a9662b9 4
+series/11-fault-first-restore dec80a4fc0008beb9931e45da3aab99549e132f0 7
+series/14-dirty-tracking-framework ec04a957a2c18df8fa023af68c24336b7211027b 3
+series/15-dirty-source-write-protection 22d0718b36d7a33414a3a8da5433964545125bb2 3
+series/19-incremental-save 0cae13a106b6d0bd8ecf077ff5c45481a0069b54 5
+series/20-precopy 5e15720aa7ec1508830eeda462e482e4f65cdf6a 6
+series/16-dirty-source-uffd-wp a5c9fdc3a0fd2ab4ff10e55762e42afc10aaac3b 4
+series/13-pod-restore f1bab456546df93ede6e6afb242672d6aea7455e 22
+series/12-s3-checkpoint-gofer 2fc7f34ca482524aea1f2fe5a711a2e4b3b25cec 8
+series/21-working-set cdd6e55b0da8ca7115bd9afc2451cd08b68cca14 2
+series/22-shim-incremental-checkpoints 7624b2c24ea138fd6d7f9f85b77c264af5fc07bd 1
+series/03-release-versions 7d0ce2a34c552b2da1e65b98719485ab44430376 1
+series/23-killable-page-loads 8105410036f33686f88983e3558041bdaab7d335 3
+series/24-post-restore-hook-stalls 4367ec13ffb089d473cae894d226dff866c52242 4
+series/26-s3-reads-stop-at-end f3563a9fa0411b537771a2e67c292b71d5303669 1
+series/27-gofer-sync-errors 97454b96587186296cacf5a18280702152f71fe7 1
