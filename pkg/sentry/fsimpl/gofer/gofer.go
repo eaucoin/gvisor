@@ -2297,20 +2297,26 @@ func (d *dentry) syncRemoteFile(ctx context.Context, dataOnly bool) error {
 func (d *dentry) syncRemoteFileLocked(ctx context.Context, dataOnly bool) error {
 	// Prefer syncing write handles over read handles, since some remote
 	// filesystem implementations may not sync changes made through write
-	// handles otherwise.
+	// handles otherwise. The write handle's error is the sync's: a remote
+	// filesystem that commits written data asynchronously, as FUSE ones may,
+	// reports a failed commit there and nowhere else
+	// (https://github.com/google/gvisor/issues/16043).
 	wh := d.inode.writeHandle()
+	var err error
 	if dataOnly {
-		wh.syncData(ctx)
+		err = wh.syncData(ctx)
 	} else {
-		wh.sync(ctx)
+		err = wh.sync(ctx)
 	}
+	// Nothing was written through the read handle, so a failure to sync it
+	// loses nothing written.
 	rh := d.inode.readHandle()
 	if dataOnly {
 		rh.syncData(ctx)
 	} else {
 		rh.sync(ctx)
 	}
-	return nil
+	return err
 }
 
 func (d *dentry) syncCachedFile(ctx context.Context, forFilesystemSync bool, dataOnly bool) error {
