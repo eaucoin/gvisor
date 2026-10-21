@@ -37,3 +37,5 @@ series/23-killable-page-loads on series/03-release-versions
 series/24-post-restore-hook-stalls on series/23-killable-page-loads
 # A checkpoint gofer's reads past an object's end end there, without a GET (s3 reader).
 series/26-s3-reads-stop-at-end on series/24-post-restore-hook-stalls
+# fsync(2) and close(2) fail where the host's do on gofer-mounted files (gofer client).
+series/27-gofer-sync-errors on series/26-s3-reads-stop-at-end
