@@ -473,15 +473,16 @@ func (f *readFile) handleReadSubmission(cs []stateio.Completion) []stateio.Compl
 
 	if numRanges == 1 {
 		fr := f.ioep.scanFileRanges(1)[0]
-		if !isValidFileRange(fr, len(df.mapping)) {
-			log.Warningf("stateipc.readFile(%s): invalid destination file range %v for destination handle %d, file size %d", f.path, fr, dfh, len(df.mapping))
+		dst, ok := df.slice(fr)
+		if !ok {
+			log.Warningf("stateipc.readFile(%s): invalid destination file range %v for destination handle %d, file size %d, discard %d", f.path, fr, dfh, len(df.mapping), len(df.discard))
 			return appendErrnoCompletion(cs, id, unix.EINVAL)
 		}
 		if fr.Length() > uint64(f.maxIOBytes) {
 			log.Warningf("stateipc.readFile(%s): oversize read (%d bytes) after destination file range %v", f.path, fr.Length(), fr)
 			return appendErrnoCompletion(cs, id, unix.EINVAL)
 		}
-		f.ar.AddRead(int(id), subHdr.Offset, df.df, fr, df.mapping[fr.Start:fr.End])
+		f.ar.AddRead(int(id), subHdr.Offset, df.df, fr, dst)
 		f.ids.set(id)
 		f.slicesUsed[id] = asyncIOSlices{}
 		return cs
@@ -491,8 +492,9 @@ func (f *readFile) handleReadSubmission(cs []stateio.Completion) []stateio.Compl
 	copy(slices.frs, f.ioep.scanFileRanges(numRanges))
 	total := uint64(0)
 	for i, fr := range slices.frs {
-		if !isValidFileRange(fr, len(df.mapping)) {
-			log.Warningf("stateipc.readFile(%s): invalid destination file range %v for destination file size %d", f.path, fr, len(df.mapping))
+		dst, ok := df.slice(fr)
+		if !ok {
+			log.Warningf("stateipc.readFile(%s): invalid destination file range %v for destination file size %d, discard %d", f.path, fr, len(df.mapping), len(df.discard))
 			f.putSlices(slices)
 			return appendErrnoCompletion(cs, id, unix.EINVAL)
 		}
@@ -504,7 +506,7 @@ func (f *readFile) handleReadSubmission(cs []stateio.Completion) []stateio.Compl
 		}
 		total = newTotal
 		slices.iovecs[i] = unix.Iovec{
-			Base: &df.mapping[fr.Start],
+			Base: &dst[0],
 			Len:  fr.Length(),
 		}
 	}
@@ -518,23 +520,37 @@ func (f *readFile) registerClientFD(req *RegisterClientFileRequest, fd int32, ma
 	if !req.Writable {
 		return 0, fmt.Errorf("client file must be writable for readable server file")
 	}
-	df, err := f.ar.RegisterDestinationFD(fd, req.Size, req.Settings)
+	if req.Discard > math.MaxInt {
+		return 0, fmt.Errorf("invalid discard size %d", req.Discard)
+	}
+	df, err := f.ar.RegisterDestinationFD(fd, req.Size, req.Discard, req.Settings)
 	if err != nil {
 		return 0, fmt.Errorf("failed to register destination FD: %w", err)
+	}
+	var discard []byte
+	if req.Discard > 0 {
+		discard, err = unix.Mmap(-1, 0 /* offset */, int(req.Discard), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_NORESERVE)
+		if err != nil {
+			return 0, fmt.Errorf("failed to map %d bytes to discard: %w", req.Discard, err)
+		}
 	}
 	handle := f.nextDstFileHandle
 	f.nextDstFileHandle++
 	if f.dstFiles.CompareAndSwap(handle, nil, &destinationFile{
 		df:      df,
 		mapping: mapping,
+		discard: discard,
 	}) != nil {
 		// This should only be possible due to wraparound, which shouldn't
 		// happen under normal operation.
+		if discard != nil {
+			unix.Munmap(discard)
+		}
 		log.Warningf("stateipc.readFile(%s): destination file handle reuse at handle %d", f.path, handle)
 		return 0, fmt.Errorf("all destination file handles in use")
 	}
 	if log.IsLogging(log.Debug) {
-		log.Debugf("stateipc.readFile(%s): registered destination file handle %d, size %d", f.path, handle, req.Size)
+		log.Debugf("stateipc.readFile(%s): registered destination file handle %d, size %d, discard %d", f.path, handle, req.Size, req.Discard)
 	}
 	return handle, nil
 }
@@ -543,11 +559,33 @@ func (f *readFile) registerClientFD(req *RegisterClientFileRequest, fd int32, ma
 type destinationFile struct {
 	df      stateio.DestinationFile
 	mapping []byte
+
+	// discard is private memory standing for the bytes past mapping's that
+	// reads may write to, which are dropped
+	// (RegisterClientFileRequest.Discard).
+	discard []byte
+}
+
+// slice returns the memory that reads write to the given range of df through,
+// and false if the range is not one of df's: it lies within either the
+// registered file or the bytes past it that are discarded.
+func (df *destinationFile) slice(fr memmap.FileRange) ([]byte, bool) {
+	size := uint64(len(df.mapping))
+	if isValidFileRange(fr, len(df.mapping)) {
+		return df.mapping[fr.Start:fr.End], true
+	}
+	if fr.Start >= size && isValidFileRange(memmap.FileRange{Start: fr.Start - size, End: fr.End - size}, len(df.discard)) {
+		return df.discard[fr.Start-size : fr.End-size], true
+	}
+	return nil, false
 }
 
 func (df *destinationFile) destroy() {
 	if df.mapping != nil {
 		unix.Munmap(df.mapping)
+	}
+	if df.discard != nil {
+		unix.Munmap(df.discard)
 	}
 }
 
@@ -725,6 +763,9 @@ func (f *writeFile) handleWriteSubmission(cs []stateio.Completion) []stateio.Com
 }
 
 func (f *writeFile) registerClientFD(req *RegisterClientFileRequest, fd int32, mapping []byte) (uint32, error) {
+	if req.Discard != 0 {
+		return 0, fmt.Errorf("client file must have no bytes to discard (got %d) for writable server file", req.Discard)
+	}
 	sf, err := f.aw.RegisterSourceFD(fd, req.Size, req.Settings)
 	if err != nil {
 		return 0, fmt.Errorf("failed to register source FD: %w", err)

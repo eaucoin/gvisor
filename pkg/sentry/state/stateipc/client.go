@@ -275,16 +275,16 @@ func (rw *asyncReadWriter) NeedRegisterSourceFD() bool {
 }
 
 // RegisterDestinationFD implements stateio.AsyncReader.RegisterDestinationFD.
-func (rw *asyncReadWriter) RegisterDestinationFD(fd int32, size uint64, settings []stateio.ClientFileRangeSetting) (stateio.DestinationFile, error) {
-	return rw.registerClientFD(fd, size, settings)
+func (rw *asyncReadWriter) RegisterDestinationFD(fd int32, size, discard uint64, settings []stateio.ClientFileRangeSetting) (stateio.DestinationFile, error) {
+	return rw.registerClientFD(fd, size, discard, settings)
 }
 
 // RegisterSourceFD implements stateio.AsyncWriter.RegisterSourceFD.
 func (rw *asyncReadWriter) RegisterSourceFD(fd int32, size uint64, settings []stateio.ClientFileRangeSetting) (stateio.SourceFile, error) {
-	return rw.registerClientFD(fd, size, settings)
+	return rw.registerClientFD(fd, size, 0 /* discard */, settings)
 }
 
-func (rw *asyncReadWriter) registerClientFD(fd int32, size uint64, settings []stateio.ClientFileRangeSetting) (clientFileHandle, error) {
+func (rw *asyncReadWriter) registerClientFD(fd int32, size, discard uint64, settings []stateio.ClientFileRangeSetting) (clientFileHandle, error) {
 	dupFD, err := unix.Dup(int(fd))
 	if err != nil {
 		return 0, fmt.Errorf("failed to dup registered FD: %w", err)
@@ -295,6 +295,7 @@ func (rw *asyncReadWriter) registerClientFD(fd int32, size uint64, settings []st
 			Files: []*os.File{os.NewFile(uintptr(dupFD), "stateipc_client_fd")},
 		},
 		Size:     size,
+		Discard:  discard,
 		Writable: rw.isReader,
 		Settings: settings,
 	}
