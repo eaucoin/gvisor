@@ -792,6 +792,74 @@ func (r *testPagesFile) complete(rd *testRead) stateio.Completion {
 	return c
 }
 
+// lastCompletion returns the virtual time at which the last read submitted to r
+// completes.
+func (r *testPagesFile) lastCompletion() time.Duration {
+	var last time.Duration
+	for _, rd := range r.readsSnapshot() {
+		last = max(last, rd.completed)
+	}
+	return last
+}
+
+// registeringPagesFile is a testPagesFile read in another process, as through
+// stateipc: destinations must be registered with it, and it reads into them
+// by their FileRanges. It fails the test if a read's ranges are not within
+// the registered file or the bytes to discard past it.
+type registeringPagesFile struct {
+	*testPagesFile
+
+	// size and discard are as registered. discarded is the number of bytes
+	// that reads put past size. These fields are protected by mu.
+	mu        sync.Mutex
+	size      uint64
+	discard   uint64
+	discarded uint64
+}
+
+// NeedRegisterDestinationFD implements
+// stateio.AsyncReader.NeedRegisterDestinationFD.
+func (r *registeringPagesFile) NeedRegisterDestinationFD() bool {
+	return true
+}
+
+// RegisterDestinationFD implements stateio.AsyncReader.RegisterDestinationFD.
+func (r *registeringPagesFile) RegisterDestinationFD(fd int32, size, discard uint64, settings []stateio.ClientFileRangeSetting) (stateio.DestinationFile, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.size, r.discard = size, discard
+	return r, nil
+}
+
+// AddRead implements stateio.AsyncReader.AddRead.
+func (r *registeringPagesFile) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.check(dstFile, []memmap.FileRange{dstFR})
+	r.testPagesFile.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+// AddReadv implements stateio.AsyncReader.AddReadv.
+func (r *registeringPagesFile) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.check(dstFile, dstFRs)
+	r.testPagesFile.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+func (r *registeringPagesFile) check(dstFile stateio.DestinationFile, frs []memmap.FileRange) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if dstFile != r {
+		r.t.Errorf("read into %v, which is not registered", dstFile)
+	}
+	for _, fr := range frs {
+		switch {
+		case fr.End <= r.size:
+		case fr.Start >= r.size && fr.End <= r.size+r.discard:
+			r.discarded += fr.Length()
+		default:
+			r.t.Errorf("read into %v, beyond the %d bytes registered and the %d bytes to discard past them", fr, r.size, r.discard)
+		}
+	}
+}
+
 // nanotime returns r's virtual time in nanoseconds.
 func (r *testPagesFile) nanotime() int64 {
 	r.mu.Lock()
