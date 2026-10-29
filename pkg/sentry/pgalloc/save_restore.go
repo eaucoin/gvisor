@@ -1574,6 +1574,14 @@ type AsyncPagesFileLoad struct {
 	// immutable.
 	maxReadBytes uint64
 
+	// discard is the memory that reads put the bytes of the gaps they read
+	// through, and drop, into (see appendGap): a slot of discardSlot bytes per
+	// op, standing for the same slot of the bytes to discard past each
+	// MemoryFile's that it registered with ar. discard and discardSlot are
+	// immutable.
+	discard     []byte
+	discardSlot uint64
+
 	// qavail is unused capacity in ar.
 	qavail int
 
@@ -1603,9 +1611,14 @@ type AsyncPagesFileLoad struct {
 	firstRoundStart  int64
 	firstRoundClosed bool
 
+	// gapBytesRead is the number of bytes of gaps that completed reads read
+	// through and dropped.
+	gapBytesRead uint64
+
 	// The async page loader combines multiple loads with contiguous pages file
-	// offsets (the common case) into a single read, even if their
-	// corresponding memmap.FileRanges and mappings are discontiguous. If curOp
+	// offsets (the common case), or background loads separated by short gaps
+	// (see combine), into a single read, even if their corresponding
+	// memmap.FileRanges and mappings are discontiguous. If curOp
 	// is not nil, it is the current aplOp under construction, and curOpID is
 	// its index into ops.
 	curOp   *aplOp
@@ -1760,8 +1773,10 @@ func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, page
 			continue
 		}
 		if amfl.pf.ar.NeedRegisterDestinationFD() {
+			// Past the MemoryFile's bytes, a slot per read to put the bytes of
+			// the gaps it reads through into (see appendGap).
 			var err error
-			amfl.df, err = amfl.pf.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, 0 /* discard */, f.getClientFileRangeSettings(fileSize))
+			amfl.df, err = amfl.pf.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, uint64(len(amfl.pf.discard)), f.getClientFileRangeSettings(fileSize))
 			if err != nil {
 				loads.unregister(i)
 				return nil, fmt.Errorf("failed to register MemoryFile with the pages file of layer %d: %w", i, err)
@@ -2036,11 +2051,16 @@ type aplOp struct {
 	// amfl represents the MemoryFile being loaded.
 	amfl *asyncMemoryFileLoad
 
-	// frs are the MemoryFile ranges being loaded.
+	// frs are the MemoryFile ranges being loaded, and the ranges past the
+	// MemoryFile's that the bytes of gaps between them are read into and
+	// dropped from (see appendGap).
 	frs []memmap.FileRange
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// gap is the number of bytes of gaps that the read drops.
+	gap uint64
 
 	// If tempRef is true, a temporary reference is held on pages in frs that
 	// should be dropped after completion. This is the case for background
@@ -2062,6 +2082,12 @@ func (op *aplOp) off() int64 {
 	return int64(op.end - op.total)
 }
 
+// loads returns true if fr, one of op.frs, is a range of the MemoryFile rather
+// than one of the bytes it drops.
+func (op *aplOp) loads(fr memmap.FileRange) bool {
+	return fr.Start < op.amfl.loads.fileSize
+}
+
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
 func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
@@ -2072,6 +2098,12 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	}
 	// Cap maxParallel due to the uint32 range of bitmap.Bitmap.
 	maxParallel := min(ar.MaxParallel(), 1<<30)
+	discardSlot := min(aplDiscardSlotBytes, maxReadBytes)
+	discard, err := unix.Mmap(-1, 0 /* offset */, int(discardSlot)*maxParallel, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_NORESERVE)
+	if err != nil {
+		ar.Close()
+		return nil, fmt.Errorf("failed to map memory for the bytes of gaps between pages: %w", err)
+	}
 	apfl := &AsyncPagesFileLoad{
 		timeStartWaiters: math.MaxInt64,
 		timeline:         timeline.Fork("async page loading"),
@@ -2079,6 +2111,8 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		wake:             make(chan struct{}, 1),
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		discard:          discard,
+		discardSlot:      discardSlot,
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -2549,6 +2583,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			apfl.opsBusy.Add(id)
 			op := &apfl.ops[id]
 			op.total = 0
+			op.gap = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
 			apfl.curOp = op
@@ -2575,17 +2610,8 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
-		if op.end != off {
-			// Non-contiguous in the pages file.
-			return 0
-		}
 		if op.amfl != amfl {
 			// Differing MemoryFile.
-			return 0
-		}
-		if len(op.frs) == cap(op.frs) && op.frs[len(op.frs)-1].End != fr.Start {
-			// Non-contiguous in the MemoryFile, and we're out of space for
-			// FileRanges.
 			return 0
 		}
 		if op.tempRef != tempRef {
@@ -2593,6 +2619,30 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			// by making tempRef per-FileRange, but it's very unlikely that an
 			// awaited load (tempRef=false) will happen to be followed by an
 			// unawaited load (tempRef=true) at the correct offset.
+			return 0
+		}
+		if op.end != off {
+			// Non-contiguous in the pages file. A background read reads on
+			// through a gap short enough (see aplBackgroundBudget.gapBytes)
+			// and drops its bytes: pages that another layer replaced, or that
+			// this pages file holds again later, scatter a layer's pages in
+			// its pages file, which reads of each run alone would cost a
+			// read's latency each. The first background read reads through
+			// no gap: short where pages are scattered, it takes about the
+			// pages file's latency, which bounds the gaps of later reads.
+			if !tempRef || off < op.end || apfl.firstRoundReads == 0 {
+				return 0
+			}
+			gap := off - op.end
+			// The gap's ranges, then at least a page of fr.
+			ranges := int((gap + apfl.discardSlot - 1) / apfl.discardSlot)
+			if gap > apfl.bgBudget.gapBytes() || op.total+gap >= apfl.maxReadBytes || len(op.frs)+ranges >= cap(op.frs) || len(op.iovecs)+ranges >= cap(op.iovecs) {
+				return 0
+			}
+			apfl.appendGap(gap)
+		} else if len(op.frs) == cap(op.frs) && op.frs[len(op.frs)-1].End != fr.Start {
+			// Non-contiguous in the MemoryFile, and we're out of space for
+			// FileRanges.
 			return 0
 		}
 	}
@@ -2647,6 +2697,42 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	return n
 }
 
+// aplFullReadSlack divides maxReadBytes into what a background read may lack of
+// it and still count as full-size (aplReadFullBackground): a read through gaps
+// ends where the next gap and the pages past it no longer fit, short of
+// maxReadBytes by up to a gap.
+const aplFullReadSlack = 8
+
+// aplDiscardSlotBytes is the size of the memory that each read puts the bytes
+// of the gaps it reads through into, as many times over as they need: the
+// larger, the fewer of a read's ranges a gap takes; the smaller, the less
+// memory reads write to.
+const aplDiscardSlotBytes = 64 << 10
+
+// appendGap appends to apfl.curOp the next gap bytes of the pages file, which
+// it reads into the discard slot of its own, as many times over as they need,
+// and drops.
+//
+// Preconditions:
+//   - apfl.curOp.total != 0.
+//   - apfl.curOp has room for the gap's ranges.
+func (apfl *AsyncPagesFileLoad) appendGap(gap uint64) {
+	op := apfl.curOp
+	slot := uint64(apfl.curOpID) * apfl.discardSlot
+	// The MemoryFile's bytes to discard follow the first fileSize bytes that
+	// it registered with the pages file (see startAsyncLoads).
+	start := op.amfl.loads.fileSize + slot
+	for rem := gap; rem != 0; {
+		n := min(rem, apfl.discardSlot)
+		op.frs = append(op.frs, memmap.FileRange{Start: start, End: start + n})
+		op.iovecs = append(op.iovecs, unix.Iovec{Base: &apfl.discard[slot], Len: n})
+		rem -= n
+	}
+	op.end += gap
+	op.total += gap
+	op.gap += gap
+}
+
 func (apfl *AsyncPagesFileLoad) main() {
 	defer func() {
 		// Close ar first since this synchronously stops inflight I/O.
@@ -2654,6 +2740,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// Completed reads are complete irrespective of err, so log err
 			// rather than propagating it.
 			log.Warningf("Async page loading: stateio.AsyncReader.Close failed: %v", err)
+		}
+		if err := unix.Munmap(apfl.discard); err != nil {
+			log.Warningf("Async page loading: failed to unmap the memory for the bytes of gaps between pages: %v", err)
 		}
 		apfl.timeline.End()
 		// Wake up any remaining waiters so that they can observe apfl.err().
@@ -2883,7 +2972,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// Successfully completed all loading for all MemoryFiles.
 				durTotal := time.Duration(aplNanotime() - timeStart)
 				apfl.mu.Lock()
-				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s)", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget)
+				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s); %d bytes of gaps between pages read through", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget, apfl.gapBytesRead)
 				if apfl.prefetchTotal != 0 {
 					log.Infof("Async page loading read %d of %d bytes of working sets first", apfl.prefetched, apfl.prefetchTotal)
 				}
@@ -2924,7 +3013,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			kind := aplReadAwaited
 			if op.tempRef {
 				kind = aplReadBackground
-				if op.total == apfl.maxReadBytes {
+				if op.total >= apfl.maxReadBytes-apfl.maxReadBytes/aplFullReadSlack {
 					kind = aplReadFullBackground
 				}
 			}
@@ -2941,7 +3030,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// reference => asyncMemoryFileLoad.cancelWasteLoad() =>
 				// apfl.mu.Lock().
 				for _, fr := range op.frs {
-					decRefs = append(decRefs, aplFileRange{op.amfl, fr})
+					if op.loads(fr) {
+						decRefs = append(decRefs, aplFileRange{op.amfl, fr})
+					}
 				}
 			}
 			if failed {
@@ -2957,10 +3048,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 				failed = true
 				continue
 			}
-			apfl.bytesLoaded += op.total
+			apfl.bytesLoaded += op.total - op.gap
+			apfl.gapBytesRead += op.gap
 			amfl := op.amfl
 			haveWaiters := false
 			for _, fr := range op.frs {
+				if !op.loads(fr) {
+					continue
+				}
 				// All pages in fr have been started and were split around fr
 				// when they were started (above), and fr.amfl.unloaded never
 				// merges started segments. Thus, we don't need to split around
