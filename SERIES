@@ -39,3 +39,5 @@ series/24-post-restore-hook-stalls on series/23-killable-page-loads
 series/26-s3-reads-stop-at-end on series/24-post-restore-hook-stalls
 # fsync(2) and close(2) fail where the host's do on gofer-mounted files (gofer client).
 series/27-gofer-sync-errors on series/26-s3-reads-stop-at-end
+# A lazy restore's background page loads read through short gaps between a parent layer's pages (pgalloc, stateio).
+series/28-coalesced-page-loads on series/27-gofer-sync-errors
