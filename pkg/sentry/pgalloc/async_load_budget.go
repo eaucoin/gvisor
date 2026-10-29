@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/gohacks"
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 // The async page loader reads pages that no one waits for ("background reads")
@@ -148,7 +149,9 @@ const (
 	// size.
 	aplReadBackground
 
-	// aplReadFullBackground is a background read of the maximum read size.
+	// aplReadFullBackground is a background read of the maximum read size,
+	// or short of it by less than a gap that reads read through
+	// (aplFullReadSlack).
 	aplReadFullBackground
 )
 
@@ -177,6 +180,11 @@ type aplBackgroundBudget struct {
 	// latencyKnown is true; latencyKnown is false until one completes.
 	minLatency   time.Duration
 	latencyKnown bool
+
+	// quickest is the minimum latency of reads of any size, if quickestKnown
+	// is true.
+	quickest      time.Duration
+	quickestKnown bool
 
 	// windowStart is the start of the current bandwidth window, and
 	// windowBytes the number of bytes of reads completed in it.
@@ -265,6 +273,9 @@ func (b *aplBackgroundBudget) init(now int64, readBytes, maxBytes uint64) {
 func (b *aplBackgroundBudget) readCompleted(now int64, n uint64, issued int64, kind aplReadKind, inflight uint64) {
 	b.windowBytes += n
 	latency := time.Duration(now - issued)
+	if !b.quickestKnown || latency < b.quickest {
+		b.quickest, b.quickestKnown = latency, true
+	}
 	switch kind {
 	case aplReadAwaited:
 		b.awaitedReadCompleted(now, n, latency, issued)
@@ -432,6 +443,21 @@ func (b *aplBackgroundBudget) setBandwidthDelayProduct(now int64) {
 	}
 }
 
+// gapBytes returns the length of the longest gap in the pages file between
+// pages that a background read reads through, dropping its bytes, rather than
+// ending before it and leaving the pages past it to another read: what a
+// full-size read delivers in the latency of the quickest read, which a read of
+// the pages past the gap would take before delivering any. The quickest read
+// is mostly latency if it is short, as awaited reads are. Until one completes
+// in less time than a full-size read, a gap may be as long as a full-size
+// read, which then costs a read at the pages file's bandwidth.
+func (b *aplBackgroundBudget) gapBytes() uint64 {
+	if !b.latencyKnown || b.minLatency == 0 {
+		return b.minBytes
+	}
+	return hostarch.PageRoundDown(uint64(float64(b.minBytes) * b.quickest.Seconds() / b.minLatency.Seconds()))
+}
+
 // bandwidth returns the bandwidth in bytes per second over the last
 // aplBandwidthWindows windows.
 func (b *aplBackgroundBudget) bandwidth() float64 {
@@ -449,5 +475,5 @@ func (b *aplBackgroundBudget) bandwidth() float64 {
 
 // String implements fmt.Stringer.String.
 func (b *aplBackgroundBudget) String() string {
-	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, parallel %t, floor %d reads; probes kept %d, failed %d; dropped for awaited reads %d times", b.startup, b.bandwidth()*1e-6, b.minLatency, b.parallel, b.floor, b.probesKept, b.probesFailed, b.drops)
+	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, quickest read %v, parallel %t, floor %d reads; probes kept %d, failed %d; dropped for awaited reads %d times; gaps read through up to %d bytes", b.startup, b.bandwidth()*1e-6, b.minLatency, b.quickest, b.parallel, b.floor, b.probesKept, b.probesFailed, b.drops, b.gapBytes())
 }
