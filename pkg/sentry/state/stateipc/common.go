@@ -101,6 +101,11 @@ type RegisterClientFileRequest struct {
 	// Size is the number of bytes in the file to register.
 	Size uint64 `json:"size"`
 
+	// Discard is the number of bytes past Size that reads may write to and
+	// that the server drops (stateio.AsyncReader.RegisterDestinationFD). It
+	// must be 0 unless the server file is opened for reading.
+	Discard uint64 `json:"discard"`
+
 	// Writable is true if the registered client file must be writable.
 	// Writable must be set to true if the server file is opened for reading.
 	Writable bool `json:"writable"`
