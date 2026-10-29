@@ -1761,7 +1761,7 @@ func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, page
 		}
 		if amfl.pf.ar.NeedRegisterDestinationFD() {
 			var err error
-			amfl.df, err = amfl.pf.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
+			amfl.df, err = amfl.pf.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, 0 /* discard */, f.getClientFileRangeSettings(fileSize))
 			if err != nil {
 				loads.unregister(i)
 				return nil, fmt.Errorf("failed to register MemoryFile with the pages file of layer %d: %w", i, err)

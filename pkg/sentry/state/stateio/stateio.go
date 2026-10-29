@@ -74,12 +74,18 @@ type AsyncReader interface {
 	// the AsyncReader that returned it. fd does not need to remain valid
 	// beyond the call to RegisterDestinationFD.
 	//
+	// The discard bytes past the first size bytes are a valid destination
+	// too, for bytes that the caller reads only to drop them, as a read
+	// through a gap between the parts of the file that the caller wants does:
+	// they are not fd's, and what reads write there is lost. The mapping that
+	// a read passes for such a range is memory that the caller drops too.
+	//
 	// There is no way to unregister individual DestinationFiles; all
 	// DestinationFiles are invalidated by AsyncReader.Close.
 	//
 	// It is safe, though unnecessary, to call RegisterDestinationFD even if
 	// NeedRegisterDestinationFD returns false.
-	RegisterDestinationFD(fd int32, size uint64, settings []ClientFileRangeSetting) (DestinationFile, error)
+	RegisterDestinationFD(fd int32, size, discard uint64, settings []ClientFileRangeSetting) (DestinationFile, error)
 
 	// AddRead enqueues a read of size dstFR.Length() bytes, from the file
 	// starting at the given offset, to dstFile starting at dstFR.Start. dstMap
