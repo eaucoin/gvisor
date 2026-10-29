@@ -818,3 +818,100 @@ func TestAsyncLoadWaitMetrics(t *testing.T) {
 	}
 	gens.checkPages(t, restored, fr)
 }
+
+// TestAsyncLoadScatteredLayer checks loading from the parent layer of a delta,
+// whose pages that the delta left to it are scattered across its pages file in
+// runs of a page or two, as the pages that a delta replaced, and those that
+// later rounds of a live save copied again, scatter a layer's: its background
+// reads read through the gaps between them and drop their bytes, none of which
+// reaches the MemoryFile, so that the layer loads in about as few reads as a
+// whole image of its pages file length, and as fast, from an object store;
+// and, from a disk, no slower than it would read the whole pages file. Before
+// reads read through gaps, they read each run alone: 6144 reads from the
+// object store, which took 5 times as long; and before reads short of a full
+// read by less than a gap counted as full-size, the budget never grew past
+// its first reads, which took a third longer.
+func TestAsyncLoadScatteredLayer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts testPagesFileOpts
+		// maxSlowdown bounds the time to load the layer over the time to load
+		// a whole image of its pages file length.
+		maxSlowdown float64
+		// fewReads is true if the layer must be read in about as many reads
+		// as a whole image.
+		fewReads bool
+	}{
+		{name: "object store", opts: testObjectStore, maxSlowdown: 1.25, fewReads: true},
+		{name: "disk", opts: testDisk, maxSlowdown: 1.1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One range per page of a read, as readers of pages files
+			// provision (stateio.NewPagesFileFDReader).
+			tc.opts.maxRanges = int(tc.opts.maxReadBytes / hostarch.PageSize)
+			// The parent holds every page but every third, which is zero; the
+			// delta writes every fourth page and zeroes the page after it,
+			// leaving the parent the third and fourth of every four.
+			const pages = 24576
+			tf := newImageTestFile(t, pages)
+			parent := saveTestImage(t, tf.f, nil, nil)
+			for i := uint64(0); i < pages; i += 4 {
+				tf.write(i, 1)
+				tf.zero(i + 1)
+			}
+			delta := saveTestImage(t, tf.f, parent, tf.clean)
+			parentPages := delta.layers[1]
+
+			_, _, whole := loaderTestImage(t, uint64(len(parentPages)))
+			ref := newTestPagesFile(t, whole.pages, tc.opts)
+			ref.useClock()
+			wholeRestored := newTestMemoryFile(t, testMemoryFileOpts{})
+			l := startLoad(t, whole, ref, wholeRestored)
+			t.Cleanup(func() { releaseAll(t, wholeRestored) })
+			if err := l.wait(t); err != nil {
+				t.Fatalf("async page loading of a whole image: %v", err)
+			}
+
+			r := &registeringPagesFile{testPagesFile: newTestPagesFile(t, parentPages, tc.opts)}
+			r.useClock()
+			restored := loadTestImage(t, delta, stateio.NewIOReader(bytes.NewReader(delta.layers[0]), 64<<10, 16, 4), r)
+			// Awaiting the pages would read them for the waiter, in order, not
+			// in the background.
+			for deadline := time.Now().Add(testWaitTimeout); restored.IsAsyncLoading(); time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("timed out after %v waiting for async page loading to complete", testWaitTimeout)
+				}
+			}
+			// The pages that the delta zeroed are zero, although the parent's
+			// pages file holds what they were in its gaps.
+			checkSameContents(t, restored, tf.f, tf.fr)
+
+			var loaded uint64
+			for _, e := range delta.mfImage().Extents {
+				if e.Layer == 1 {
+					loaded += e.End - e.Start
+				}
+			}
+			var read uint64
+			reads := r.readsSnapshot()
+			for _, rd := range reads {
+				read += rd.len
+			}
+			r.mu.Lock()
+			discarded := r.discarded
+			r.mu.Unlock()
+			if read != loaded+discarded {
+				t.Errorf("read %d bytes, want the %d bytes of the parent's pages and the %d bytes of gaps read through", read, loaded, discarded)
+			}
+			took, wholeTook := r.lastCompletion(), ref.lastCompletion()
+			wholeReads := (uint64(len(parentPages)) + tc.opts.maxReadBytes - 1) / tc.opts.maxReadBytes
+			t.Logf("loaded %d bytes in %d reads of %d bytes, %d bytes of gaps, in %v; a whole image of %d bytes loads in %v", loaded, len(reads), read, discarded, took, len(parentPages), wholeTook)
+			if tc.fewReads && uint64(len(reads)) > 2*wholeReads {
+				t.Errorf("loaded the layer in %d reads, want at most twice the %d reads of a whole image", len(reads), wholeReads)
+			}
+			if limit := time.Duration(float64(wholeTook) * tc.maxSlowdown); took > limit {
+				t.Errorf("loading the layer took %v, want at most %v (%.2f times the %v that a whole image takes)", took, limit, tc.maxSlowdown, wholeTook)
+			}
+		})
+	}
+}
