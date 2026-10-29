@@ -33,7 +33,7 @@ func (NoRegisterClientFD) NeedRegisterDestinationFD() bool {
 }
 
 // RegisterDestinationFD implements AsyncReader.RegisterDestinationFD.
-func (NoRegisterClientFD) RegisterDestinationFD(fd int32, size uint64, settings []ClientFileRangeSetting) (DestinationFile, error) {
+func (NoRegisterClientFD) RegisterDestinationFD(fd int32, size, discard uint64, settings []ClientFileRangeSetting) (DestinationFile, error) {
 	return nil, nil
 }
 
