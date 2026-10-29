@@ -129,7 +129,7 @@ func TestRead(t *testing.T) {
 	defer ar.Close()
 
 	// Read the file using async reads.
-	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), nil)
+	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), 0 /* discard */, nil)
 	if err != nil {
 		t.Fatalf("failed to register destination file: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestReadv(t *testing.T) {
 	defer ar.Close()
 
 	// Read the file using async vectorized reads.
-	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), nil)
+	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), 0 /* discard */, nil)
 	if err != nil {
 		t.Fatalf("failed to register destination file: %v", err)
 	}
@@ -252,6 +252,98 @@ func TestReadv(t *testing.T) {
 
 	if !bytes.Equal(data, buf) {
 		t.Errorf("bytes differ")
+	}
+}
+
+// TestReadvDiscard checks that reads may write bytes that the client drops past
+// the end of the destination file, up to the bytes registered to discard, and
+// that those bytes do not reach the file.
+func TestReadvDiscard(t *testing.T) {
+	// Random data: chunks 0 and 2 are read into the destination file, chunks
+	// 1 and 3 are discarded.
+	const testPath = "testfile"
+	const chunkSize = 4096
+	const dataLen = 4 * chunkSize
+	data := make([]byte, dataLen)
+	_, _ = rand.Read(data)
+
+	// The destination file, of two chunks, then a chunk of bytes to discard.
+	const fileLen = 2 * chunkSize
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestReadvDiscard", fileLen)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+	discarded := make([]byte, chunkSize)
+
+	// Set up the server and client.
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&testReadServer{
+		path:         testPath,
+		data:         data,
+		maxReadBytes: 2 * chunkSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	ar, err := client.OpenRead(testPath)
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	df, err := ar.RegisterDestinationFD(memfd, fileLen, chunkSize /* discard */, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+
+	discard := memmap.FileRange{Start: fileLen, End: fileLen + chunkSize}
+	for i := 0; i < 2; i++ {
+		frs := []memmap.FileRange{{Start: uint64(i) * chunkSize, End: uint64(i+1) * chunkSize}, discard}
+		iovecs := []unix.Iovec{
+			{Base: &buf[i*chunkSize], Len: chunkSize},
+			{Base: &discarded[0], Len: chunkSize},
+		}
+		ar.AddReadv(i, int64(2*i*chunkSize), 2*chunkSize, df, frs, iovecs)
+	}
+	// Ranges past the bytes to discard, or across the end of the file, are
+	// refused.
+	ar.AddRead(2, 0, df, memmap.FileRange{Start: fileLen + chunkSize, End: fileLen + 2*chunkSize}, discarded)
+	ar.AddRead(3, 0, df, memmap.FileRange{Start: chunkSize, End: fileLen + chunkSize}, discarded)
+	cs, err := ar.Wait(nil, 4 /* minCompletions */)
+	if err != nil {
+		t.Fatalf("AsyncReader.Wait failed: %v", err)
+	}
+	for _, c := range cs {
+		switch c.ID {
+		case 0, 1:
+			if c.N != 2*chunkSize || (c.Err != nil && c.Err != io.EOF) {
+				t.Errorf("read %d completed with %d bytes, error %v; want %d bytes", c.ID, c.N, c.Err, 2*chunkSize)
+			}
+		default:
+			if c.N != 0 || c.Err == nil {
+				t.Errorf("read %d of an invalid range completed with %d bytes, error %v; want an error", c.ID, c.N, c.Err)
+			}
+		}
+	}
+
+	if !bytes.Equal(buf[:chunkSize], data[:chunkSize]) || !bytes.Equal(buf[chunkSize:], data[2*chunkSize:3*chunkSize]) {
+		t.Errorf("destination file differs from chunks 0 and 2")
+	}
+	if !bytes.Equal(discarded, make([]byte, chunkSize)) {
+		t.Errorf("the server wrote to the client's memory for discarded bytes")
 	}
 }
 
@@ -498,7 +590,7 @@ func TestReadWaitOr(t *testing.T) {
 	if !ok {
 		t.Fatalf("client reader %T does not implement stateio.WaitOrAsyncReader", ar)
 	}
-	df, err := ar.RegisterDestinationFD(memfd, 4096, nil)
+	df, err := ar.RegisterDestinationFD(memfd, 4096, 0 /* discard */, nil)
 	if err != nil {
 		t.Fatalf("failed to register destination file: %v", err)
 	}
@@ -593,7 +685,7 @@ func TestClientWatchdog(t *testing.T) {
 	defer ar.Close()
 
 	// Read one chunk from the file.
-	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), nil)
+	df, err := ar.RegisterDestinationFD(memfd, uint64(dataLen), 0 /* discard */, nil)
 	if err != nil {
 		t.Fatalf("failed to register destination file: %v", err)
 	}

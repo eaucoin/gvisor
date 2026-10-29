@@ -96,7 +96,7 @@ func NewBufReader(ar AsyncReader, size int) (*BufReader, error) {
 		return nil, err
 	}
 	defer unix.Close(int(memfd))
-	df, err := ar.RegisterDestinationFD(memfd, uint64(bufSize), nil)
+	df, err := ar.RegisterDestinationFD(memfd, uint64(bufSize), 0 /* discard */, nil)
 	if err != nil {
 		unix.Munmap(buf)
 		ar.Close()
