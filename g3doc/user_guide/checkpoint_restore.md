@@ -171,6 +171,16 @@ for pages, as do the metrics `/checkpoint/async_load_waits`,
 `/checkpoint/async_load_wait_bytes` and `/checkpoint/async_load_wait_nanoseconds`
 (see [observability](observability.md)).
 
+The pages that an image keeps in a parent layer are scattered across that
+layer's pages file, between the pages that later layers replaced. A background
+read reads on through a gap between them and drops its bytes, rather than end
+there and leave the pages past it to a read of their own, as long as the gap
+is no longer than what a full-size read delivers in the time the quickest read
+took, which is about what another read would spend before delivering
+anything; so a parent layer loads in about as many full-size reads as an
+image of its length would, rather than in a read per run of pages. The log
+line "Async page loading completed" reports the bytes of gaps read through.
+
 A thread waiting for a page still loading is killable, as a Linux task waiting
 for I/O in a page fault is: killed (`SIGKILL`, `runsc kill`, the end of its
 process or of its container), it stops waiting and exits, however long the
