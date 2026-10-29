@@ -319,3 +319,28 @@ func TestBackgroundBudgetProbeFaultLatency(t *testing.T) {
 		t.Errorf("after an awaited read 6 ms slower: probe %d, floor %d, budget %d (bandwidth-delay product %d), next probe at %v; want the bandwidth-delay product and probing deferred", b.probe, b.floor, b.bytes, b.bdpBytes, time.Duration(b.nextProbe))
 	}
 }
+
+// TestBackgroundBudgetGapBytes checks that a background read reads through gaps
+// as long as a full-size read until one completed, then through gaps as long as
+// what a full-size read delivers in the latency of the quickest read.
+func TestBackgroundBudgetGapBytes(t *testing.T) {
+	var b aplBackgroundBudget
+	b.init(0, testBudgetRead, testBudgetMax)
+	ms := int64(time.Millisecond)
+	// A short read completes first, in 1 ms.
+	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadBackground, hostarch.PageSize)
+	if got := b.gapBytes(); got != testBudgetRead {
+		t.Errorf("gapBytes() before a full-size read completed = %d, want %d", got, testBudgetRead)
+	}
+	// A full-size read takes 8 ms: it delivers an eighth of its bytes in the
+	// 1 ms that the short read took.
+	b.readCompleted(8*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	if got, want := b.gapBytes(), uint64(testBudgetRead/8); got != want {
+		t.Errorf("gapBytes() = %d, want %d", got, want)
+	}
+	// A quicker awaited read lowers it, to whole pages.
+	b.readCompleted(9*ms, hostarch.PageSize, 9*ms-ms/3, aplReadAwaited, 0)
+	if got, want := b.gapBytes(), hostarch.PageRoundDown(uint64(testBudgetRead/24)); got != want {
+		t.Errorf("gapBytes() after a read of 1/3 ms = %d, want %d", got, want)
+	}
+}
