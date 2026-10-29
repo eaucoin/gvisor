@@ -215,15 +215,26 @@ func loadTestImage(t *testing.T, ti *testImage, readers ...stateio.AsyncReader) 
 		} else {
 			ar = stateio.NewIOReader(bytes.NewReader(layer), 64<<10, 16, 4)
 		}
+		done := make(chan struct{})
 		apfl, err := StartAsyncPagesFileLoad(ar, func(err error) {
 			if err != nil {
 				t.Errorf("async page loading from layer %d: %v", i, err)
 			}
+			close(done)
 		}, nil)
 		if err != nil {
 			t.Fatalf("StartAsyncPagesFileLoad: %v", err)
 		}
-		t.Cleanup(apfl.MemoryFilesDone)
+		// Loading stops before the test ends, so that a test may replace its
+		// clock (testPagesFile.useClock).
+		t.Cleanup(func() {
+			apfl.MemoryFilesDone()
+			select {
+			case <-done:
+			case <-time.After(testWaitTimeout):
+				t.Errorf("timed out after %v waiting for async page loading from layer %d to stop", testWaitTimeout, i)
+			}
+		})
 		opts.PagesFiles = append(opts.PagesFiles, apfl)
 	}
 	if err := f.LoadFrom(context.Background(), ti.img.MemoryFileRecords(), &opts); err != nil {
