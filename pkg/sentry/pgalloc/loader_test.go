@@ -127,6 +127,14 @@ var testContendedObjectStore = testPagesFileOpts{
 	contention:   0.5,
 }
 
+// testParallelObjectStore is testObjectStore saying that it serves every read
+// that loading may have in flight at once (stateio.ParallelAsyncReader).
+var testParallelObjectStore = func() testPagesFileOpts {
+	opts := testObjectStore
+	opts.parallelReads = opts.maxParallel - 1
+	return opts
+}()
+
 // transferTime returns how long opts's device takes to transfer n bytes.
 func (opts testPagesFileOpts) transferTime(n uint64) time.Duration {
 	return time.Duration(n * uint64(time.Second) / opts.bandwidth)
@@ -171,6 +179,15 @@ func TestAsyncLoadFaultWait(t *testing.T) {
 			size:    64 << 20,
 			at:      60 * time.Millisecond,
 			maxWait: testObjectStore.transferTime(hostarch.PageSize) + testObjectStore.latency,
+		},
+		{
+			// Every slot but the fault's holds a background read from
+			// the start, as the pages file serves them all at once.
+			name:    "object store serving reads in parallel",
+			opts:    testParallelObjectStore,
+			size:    64 << 20,
+			at:      60 * time.Millisecond,
+			maxWait: testParallelObjectStore.transferTime(hostarch.PageSize) + testParallelObjectStore.latency,
 		},
 		{
 			// While probing raises the reads in flight, which slows each
@@ -351,6 +368,55 @@ func TestAsyncLoadProbesParallelPagesFile(t *testing.T) {
 	// and loading took 492 ms.
 	if took > 2*all {
 		t.Errorf("loading took %v, want at most twice the %v that %v reads at once take", took, all, parallel)
+	}
+}
+
+// TestAsyncLoadParallelReads checks that loading from a pages file that says
+// how many reads it serves at once keeps at least that many background reads
+// in flight from its start to its last reads, on a store whose reads slow as
+// more are in flight, where the slow start ends at a few reads and the
+// bandwidth-delay product is about one.
+func TestAsyncLoadParallelReads(t *testing.T) {
+	const (
+		size     = 64 << 20
+		parallel = 8
+	)
+	opts := testContendedObjectStore
+	opts.parallelReads = parallel
+	fr, gens, img := loaderTestImage(t, size)
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+
+	reads := r.readsSnapshot()
+	var lastSubmitted time.Duration
+	for _, rd := range reads {
+		lastSubmitted = max(lastSubmitted, rd.submitted)
+	}
+	// At each completion before the last read was submitted, once the reads
+	// that it lets start are submitted.
+	least := len(reads)
+	for _, c := range reads {
+		if c.completed >= lastSubmitted {
+			continue
+		}
+		inflight := 0
+		for _, rd := range reads {
+			if rd.submitted <= c.completed && rd.completed > c.completed {
+				inflight++
+			}
+		}
+		least = min(least, inflight)
+	}
+	t.Logf("at least %d reads in flight until the last was submitted; %v", least, &l.apfl.bgBudget)
+	if least < parallel {
+		t.Errorf("as few as %d reads in flight before the last was submitted, want at least the %d that the pages file serves at once", least, parallel)
 	}
 }
 
