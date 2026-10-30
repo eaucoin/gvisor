@@ -295,9 +295,8 @@ func TestBackgroundBudgetProbe(t *testing.T) {
 
 // TestBackgroundBudgetProbeFaultLatency checks that when an awaited read
 // issued while probing raised the budget takes aplQueueDelay longer than
-// awaited reads did before, or than its bytes take at the rate of one
-// full-size read alone, the budget drops to the bandwidth-delay product and
-// probing is deferred.
+// awaited reads did before, or than it would take alone, the budget drops to
+// the bandwidth-delay product and probing is deferred.
 func TestBackgroundBudgetProbeFaultLatency(t *testing.T) {
 	ms := int64(time.Millisecond)
 	// An awaited read took 1 ms before the probe for 2 reads.
@@ -306,17 +305,18 @@ func TestBackgroundBudgetProbeFaultLatency(t *testing.T) {
 	if b.probe != 2 {
 		t.Fatalf("probe = %d, want a probe for 2 reads", b.probe)
 	}
-	// A page takes 0.16 ms at the rate of one read alone (256 KiB in 10
-	// ms), less than an awaited read took before probing. While probing,
-	// an awaited read of a page takes 2 ms: still fine.
-	b.readCompleted(24*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead)
-	if b.probe != 2 {
-		t.Fatalf("an awaited read taking 2 ms ended the probe")
-	}
-	// One that takes 3 ms ends it.
+	// A page alone takes the quickest read's 1 ms plus 0.14 ms at the rate
+	// of a full-size read (256 KiB in 10 ms), more than the awaited read
+	// before probing took. While probing, an awaited read of a page takes
+	// 3 ms: still fine.
 	b.readCompleted(25*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead)
-	if b.probe != 0 || b.floor != 0 || b.bytes != b.bdpBytes || b.nextProbe <= 25*ms {
-		t.Errorf("after an awaited read 6 ms slower: probe %d, floor %d, budget %d (bandwidth-delay product %d), next probe at %v; want the bandwidth-delay product and probing deferred", b.probe, b.floor, b.bytes, b.bdpBytes, time.Duration(b.nextProbe))
+	if b.probe != 2 {
+		t.Fatalf("an awaited read taking 3 ms ended the probe")
+	}
+	// One that takes 4 ms ends it.
+	b.readCompleted(26*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead)
+	if b.probe != 0 || b.floor != 0 || b.bytes != b.bdpBytes || b.nextProbe <= 26*ms {
+		t.Errorf("after an awaited read 3 ms slower: probe %d, floor %d, budget %d (bandwidth-delay product %d), next probe at %v; want the bandwidth-delay product and probing deferred", b.probe, b.floor, b.bytes, b.bdpBytes, time.Duration(b.nextProbe))
 	}
 }
 
