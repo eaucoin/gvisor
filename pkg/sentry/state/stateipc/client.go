@@ -152,12 +152,13 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 	pwFD := resp.FilePayload.Files[0].Fd()
 	defer resp.FilePayload.Files[0].Close()
 	rw := &asyncReadWriter{
-		client:      c,
-		maxIOBytes:  resp.MaxIOBytes,
-		maxRanges:   resp.MaxRanges,
-		maxParallel: resp.MaxParallel,
-		handle:      resp.Handle,
-		isReader:    mode == OpenModeRead,
+		client:        c,
+		maxIOBytes:    resp.MaxIOBytes,
+		maxRanges:     resp.MaxRanges,
+		maxParallel:   resp.MaxParallel,
+		parallelReads: resp.ParallelReads,
+		handle:        resp.Handle,
+		isReader:      mode == OpenModeRead,
 	}
 	if err := rw.ioep.Init(flipcall.ClientSide, flipcall.PacketWindowDescriptor{
 		FD:     int(pwFD),
@@ -184,12 +185,13 @@ func (c *AsyncFileClient) open(path string, mode int) (*asyncReadWriter, error) 
 // AsyncWriter, never both at the same time.
 type asyncReadWriter struct {
 	// Immutable fields:
-	client      *AsyncFileClient
-	maxIOBytes  uint32
-	maxRanges   uint32
-	maxParallel uint32
-	handle      uint32
-	isReader    bool
+	client        *AsyncFileClient
+	maxIOBytes    uint32
+	maxRanges     uint32
+	maxParallel   uint32
+	parallelReads uint32
+	handle        uint32
+	isReader      bool
 
 	// destroyed is true if ioep.Destroy() has been called. destroyed
 	// is protected by client.filesMu.
@@ -260,6 +262,12 @@ func (rw *asyncReadWriter) MaxRanges() int {
 // stateio.AsyncWriter.MaxParallel.
 func (rw *asyncReadWriter) MaxParallel() int {
 	return int(rw.maxParallel)
+}
+
+// ParallelReads implements stateio.ParallelAsyncReader.ParallelReads, as the
+// server's reader of the file says it (OpenResponse.ParallelReads).
+func (rw *asyncReadWriter) ParallelReads() int {
+	return int(rw.parallelReads)
 }
 
 // NeedRegisterDestinationFD implements
