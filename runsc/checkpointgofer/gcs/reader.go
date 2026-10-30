@@ -86,6 +86,12 @@ func (r *Reader) MaxParallel() int {
 	return cap(r.subs)
 }
 
+// ParallelReads implements stateio.ParallelAsyncReader.ParallelReads: each of
+// r's workers makes its reads, a ranged read of the object each, on a connection of its own.
+func (r *Reader) ParallelReads() int {
+	return cap(r.subs)
+}
+
 // AddRead implements stateio.AsyncReader.AddRead.
 func (r *Reader) AddRead(id int, off int64, _ stateio.DestinationFile, _ memmap.FileRange, dstMap []byte) {
 	r.subs <- readSubmission{
