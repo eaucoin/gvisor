@@ -1569,6 +1569,11 @@ type AsyncPagesFileLoad struct {
 	// (CurrentAsyncPageLoadProgress). retrying is immutable.
 	retrying stateio.RetryingAsyncReader
 
+	// parallelReads is the number of reads that ar serves at once, each at
+	// the rate of one alone, if it implements stateio.ParallelAsyncReader,
+	// and 0 otherwise. parallelReads is immutable.
+	parallelReads uint64
+
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
@@ -2119,6 +2124,9 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	}
 	apfl.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
 	apfl.retrying, _ = ar.(stateio.RetryingAsyncReader)
+	if pr, ok := ar.(stateio.ParallelAsyncReader); ok {
+		apfl.parallelReads = uint64(max(pr.ParallelReads(), 0))
+	}
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
 		apfl.opsBusy.Add(uint32(i))
@@ -2800,7 +2808,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 	timeStart := aplNanotime()
 	// Background reads may use every slot but one, which is kept for awaited
 	// reads (see mayStartBackgroundRead).
-	apfl.bgBudget.init(timeStart, apfl.maxReadBytes, uint64(max(maxParallel-1, 1))*apfl.maxReadBytes)
+	apfl.bgBudget.init(timeStart, apfl.maxReadBytes, uint64(max(maxParallel-1, 1))*apfl.maxReadBytes, apfl.parallelReads)
 	apfl.timeline.Reached("async page loading started")
 	if log.IsLogging(log.Debug) {
 		log.Debugf("Async page loading started")

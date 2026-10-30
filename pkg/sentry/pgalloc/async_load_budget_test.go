@@ -31,7 +31,7 @@ const (
 // and drops to the bandwidth-delay product at the first read that queued.
 func TestBackgroundBudgetSlowStart(t *testing.T) {
 	var b aplBackgroundBudget
-	b.init(0, testBudgetRead, testBudgetMax)
+	b.init(0, testBudgetRead, testBudgetMax, 0)
 	if want := uint64(aplInitialReads * testBudgetRead); b.bytes != want {
 		t.Fatalf("initial budget = %d, want %d", b.bytes, want)
 	}
@@ -83,7 +83,7 @@ func TestBackgroundBudgetSlowStartDelay(t *testing.T) {
 		{minLatency: time.Second, queued: 17 * time.Millisecond, exits: true},
 	} {
 		var b aplBackgroundBudget
-		b.init(0, testBudgetRead, testBudgetMax)
+		b.init(0, testBudgetRead, testBudgetMax, 0)
 		now := int64(tc.minLatency)
 		b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
 		b.update(now)
@@ -139,7 +139,7 @@ func TestBackgroundBudgetBandwidthDelayProduct(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var b aplBackgroundBudget
-			b.init(0, testBudgetRead, testBudgetMax)
+			b.init(0, testBudgetRead, testBudgetMax, 0)
 			// The first read measures the latency and ends the first window;
 			// a read that queued ends the slow start.
 			now := int64(tc.latency)
@@ -194,7 +194,7 @@ func TestBackgroundBudgetBandwidthDelayProduct(t *testing.T) {
 func TestBackgroundBudgetTokenBucket(t *testing.T) {
 	const latency = 500 * time.Microsecond
 	var b aplBackgroundBudget
-	b.init(0, testBudgetRead, testBudgetMax)
+	b.init(0, testBudgetRead, testBudgetMax, 0)
 	// The first read measures the latency and ends the first window; a read
 	// that queued ends the slow start.
 	now := int64(latency)
@@ -221,7 +221,7 @@ func TestBackgroundBudgetTokenBucket(t *testing.T) {
 // taken 10 ms, at 15 ms. An awaited read took 1 ms before.
 func startParallel(exitLatency time.Duration) *aplBackgroundBudget {
 	b := &aplBackgroundBudget{}
-	b.init(0, testBudgetRead, testBudgetMax)
+	b.init(0, testBudgetRead, testBudgetMax, 0)
 	ms := int64(time.Millisecond)
 	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadAwaited, 0)
 	b.readCompleted(10*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
@@ -320,12 +320,82 @@ func TestBackgroundBudgetProbeFaultLatency(t *testing.T) {
 	}
 }
 
+// TestBackgroundBudgetParallelReads checks that the budget allows at least the
+// reads that the pages file serves at once, as it says, from the start of the
+// slow start and past its end, where the bandwidth-delay product is about one
+// read.
+func TestBackgroundBudgetParallelReads(t *testing.T) {
+	var b aplBackgroundBudget
+	b.init(0, testBudgetRead, testBudgetMax, 8)
+	if want := uint64(8 * testBudgetRead); b.bytes != want {
+		t.Fatalf("initial budget = %d, want %d: the 8 reads that the pages file serves at once", b.bytes, want)
+	}
+	// A read alone takes 30 ms; one issued with the 8 in flight takes 50 ms,
+	// which ends the slow start with a bandwidth-delay product of one read.
+	ms := int64(time.Millisecond)
+	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.update(30 * ms)
+	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead)
+	if b.startup || !b.parallel {
+		t.Fatalf("slow start %t, parallel %t; want false, true", b.startup, b.parallel)
+	}
+	if b.bdpBytes >= 2*testBudgetRead || b.bytes != 8*testBudgetRead {
+		t.Errorf("after the slow start: bandwidth-delay product %d, budget %d; want less than 2 reads, and 8 reads", b.bdpBytes, b.bytes)
+	}
+	// More than the reads it can have in flight are not allowed.
+	b.init(0, testBudgetRead, testBudgetMax, 1000)
+	if b.bytes != testBudgetMax {
+		t.Errorf("initial budget of a pages file that serves 1000 reads at once = %d, want the maximum %d", b.bytes, uint64(testBudgetMax))
+	}
+}
+
+// TestBackgroundBudgetParallelReadsFaultLatency checks that an awaited read
+// issued while the reads that the pages file serves at once raise the budget
+// is slowed by them only if it takes aplQueueDelay longer than it would alone,
+// the latency of the quickest read plus its bytes at the rate of a full-size
+// read; that one that was drops the budget to the bandwidth-delay product; and
+// that those reads return once the backoff is over.
+func TestBackgroundBudgetParallelReadsFaultLatency(t *testing.T) {
+	ms := int64(time.Millisecond)
+	var b aplBackgroundBudget
+	b.init(0, testBudgetRead, testBudgetMax, 8)
+	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.update(30 * ms)
+	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead)
+	b.update(50 * ms)
+	if !b.raised {
+		t.Fatalf("the 8 reads do not raise the budget above the bandwidth-delay product")
+	}
+	// A page read in 21 ms, mostly the store's latency to a first byte,
+	// against 0.47 ms at the rate of a full-size read: not slowed, since no
+	// read was quicker. Another in 23 ms is within aplQueueDelay of it.
+	b.readCompleted(71*ms, hostarch.PageSize, 50*ms, aplReadAwaited, 8*testBudgetRead)
+	b.readCompleted(95*ms, hostarch.PageSize, 72*ms, aplReadAwaited, 8*testBudgetRead)
+	if b.drops != 0 || b.floor != 8 {
+		t.Fatalf("awaited reads of 21 and 23 ms, the quickest read 21 ms: %d drops, floor %d; want none and 8", b.drops, b.floor)
+	}
+	// One in 24 ms was slowed.
+	now := 120 * ms
+	b.readCompleted(now, hostarch.PageSize, now-24*ms, aplReadAwaited, 8*testBudgetRead)
+	if b.drops != 1 || b.floor != 0 || b.bytes != b.bdpBytes {
+		t.Fatalf("after an awaited read of 24 ms: %d drops, floor %d, budget %d (bandwidth-delay product %d); want the bandwidth-delay product", b.drops, b.floor, b.bytes, b.bdpBytes)
+	}
+	b.update(b.nextProbe - 1)
+	if b.floor != 0 {
+		t.Errorf("floor = %d before the backoff is over, want 0", b.floor)
+	}
+	b.update(b.nextProbe)
+	if b.floor != 8 || b.bytes < 8*testBudgetRead {
+		t.Errorf("once the backoff is over: floor %d, budget %d; want 8 reads", b.floor, b.bytes)
+	}
+}
+
 // TestBackgroundBudgetGapBytes checks that a background read reads through gaps
 // as long as a full-size read until one completed, then through gaps as long as
 // what a full-size read delivers in the latency of the quickest read.
 func TestBackgroundBudgetGapBytes(t *testing.T) {
 	var b aplBackgroundBudget
-	b.init(0, testBudgetRead, testBudgetMax)
+	b.init(0, testBudgetRead, testBudgetMax, 0)
 	ms := int64(time.Millisecond)
 	// A short read completes first, in 1 ms.
 	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadBackground, hostarch.PageSize)
