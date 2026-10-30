@@ -157,6 +157,22 @@ type RetryingAsyncReader interface {
 	Retrying() bool
 }
 
+// ParallelAsyncReader is an AsyncReader that serves reads in parallel, each at
+// the rate of one alone, as an object store does that serves each read on a
+// connection of its own: up to ParallelReads reads in flight, the more there
+// are, the more the file delivers. Callers that bound their reads in flight to
+// what the file delivers with fewer, as async page loading does, keep at least
+// ParallelReads in flight.
+type ParallelAsyncReader interface {
+	AsyncReader
+
+	// ParallelReads returns the number of reads that the AsyncReader serves
+	// at once, each at the rate of one alone, at most MaxParallel; 0 if it
+	// does not tell. All calls to ParallelReads for a given AsyncReader must
+	// return the same value.
+	ParallelReads() int
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

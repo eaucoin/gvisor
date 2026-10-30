@@ -801,3 +801,82 @@ func TestReadRetrying(t *testing.T) {
 		t.Errorf("Retrying of a file whose server's reader does not tell: got true, want false")
 	}
 }
+
+// parallelReader is an AsyncReader that says it serves parallel reads at once.
+type parallelReader struct {
+	stateio.AsyncReader
+	parallel int
+}
+
+// ParallelReads implements stateio.ParallelAsyncReader.ParallelReads.
+func (r parallelReader) ParallelReads() int {
+	return r.parallel
+}
+
+// testParallelServer serves files whose readers have 8 slots: "parallel",
+// whose reader says it serves 6 reads at once, "excess", whose reader says 100,
+// and "plain", whose reader does not tell.
+type testParallelServer struct{}
+
+func (s *testParallelServer) Destroy() {}
+
+func (s *testParallelServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	ar := stateio.NewIOReader(bytes.NewReader(make([]byte, 4096)), 4096, 1 /* maxRanges */, 8 /* maxParallel */)
+	switch path {
+	case "parallel":
+		return parallelReader{ar, 6}, nil
+	case "excess":
+		return parallelReader{ar, 100}, nil
+	case "plain":
+		return ar, nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+func (s *testParallelServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// TestReadParallelReads checks that a client's reader says it serves as many
+// reads at once as the server's reader of the file says, at most as many as
+// it may have in flight, and none where the server's does not tell.
+func TestReadParallelReads(t *testing.T) {
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(&testParallelServer{})
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"parallel", 6},
+		{"excess", 8},
+		{"plain", 0},
+	} {
+		ar, err := client.OpenRead(tc.path)
+		if err != nil {
+			t.Fatalf("failed to open remote file %q: %v", tc.path, err)
+		}
+		r, ok := ar.(stateio.ParallelAsyncReader)
+		if !ok {
+			t.Fatalf("the client's reader, %T, does not say how many reads it serves at once", ar)
+		}
+		if got := r.ParallelReads(); got != tc.want {
+			t.Errorf("ParallelReads of %q: got %d, want %d", tc.path, got, tc.want)
+		}
+		ar.Close()
+	}
+}
