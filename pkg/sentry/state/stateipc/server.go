@@ -121,6 +121,9 @@ func (s *AsyncFileServer) Open(req *OpenRequest, resp *OpenResponse) error {
 			wake: make(chan struct{}, 1),
 		}
 		rf.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
+		if pr, ok := ar.(stateio.ParallelAsyncReader); ok {
+			resp.ParallelReads = uint32(min(max(pr.ParallelReads(), 0), maxParallel))
+		}
 		rf.impl = rf
 		f = &rf.openFile
 	case OpenModeWrite:
