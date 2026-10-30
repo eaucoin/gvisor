@@ -128,6 +128,22 @@ func TestReadRanges(t *testing.T) {
 	}
 }
 
+// TestPagesReadParallelReads checks that a reader of the pages file says it
+// serves as many reads at once as it reads with, each on a connection of its
+// own.
+func TestPagesReadParallelReads(t *testing.T) {
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, testObject(4096))
+	r := openRead(t, newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, PagesFileReadParallel: 12}), checkpointfiles.PagesFileName)
+	pr, ok := r.(stateio.ParallelAsyncReader)
+	if !ok {
+		t.Fatalf("the pages file's reader, %T, does not say how many reads it serves at once", r)
+	}
+	if got := pr.ParallelReads(); got != 12 || r.MaxParallel() != 12 {
+		t.Errorf("ParallelReads = %d, MaxParallel = %d; want 12 and 12", got, r.MaxParallel())
+	}
+}
+
 // TestReadStopsAtTheEnd checks that once the store has said where an object
 // ends, in the Content-Range of an answer to a GET, a read at or past its end
 // ends there, without a GET the store would refuse, as a file's reader reads
