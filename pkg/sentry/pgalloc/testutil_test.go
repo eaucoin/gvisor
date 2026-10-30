@@ -493,6 +493,10 @@ type testPagesFileOpts struct {
 	// takes longer than one alone.
 	contention float64
 
+	// parallelReads is what the pages file says of the reads it serves at
+	// once (stateio.ParallelAsyncReader): 0 (the default) says nothing.
+	parallelReads int
+
 	// If manual is true, virtual time advances only when the test calls
 	// advance; otherwise Wait advances it to the completion it waits for.
 	manual bool
@@ -551,6 +555,11 @@ type testPagesFile struct {
 // Retrying implements stateio.RetryingAsyncReader.Retrying.
 func (r *testPagesFile) Retrying() bool {
 	return r.retrying.Load()
+}
+
+// ParallelReads implements stateio.ParallelAsyncReader.ParallelReads.
+func (r *testPagesFile) ParallelReads() int {
+	return r.opts.parallelReads
 }
 
 // testRead is a read submitted to a testPagesFile.
