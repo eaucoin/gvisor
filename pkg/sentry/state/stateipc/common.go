@@ -64,6 +64,12 @@ type OpenResponse struct {
 	// MaxParallel is the maximum number of parallel read/write requests.
 	MaxParallel uint32 `json:"max_parallel"`
 
+	// ParallelReads is the number of reads that the server's reader of a file
+	// opened for reading serves at once, each at the rate of one alone
+	// (stateio.ParallelAsyncReader.ParallelReads), at most MaxParallel; 0 if
+	// it does not tell.
+	ParallelReads uint32 `json:"parallel_reads"`
+
 	// FilePayload.Files[0] backs the Flipcall packet window for this file's
 	// read/write requests.
 	urpc.FilePayload
