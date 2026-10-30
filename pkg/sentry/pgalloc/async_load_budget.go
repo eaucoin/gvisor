@@ -93,9 +93,10 @@ import (
 // the minimum latency, whichever is longer, and the floor drops back to the
 // bandwidth-delay product, and probing backs off, as soon as an awaited read
 // issued while the budget was raised took aplQueueDelay longer than the
-// shortest awaited read issued while it was not, or than its bytes take at
-// the rate of one full-size read alone: probing must not cost page faults
-// what the bandwidth-delay product spares them.
+// shortest awaited read issued while it was not, or than it would take alone
+// (the latency of the quickest read, plus its bytes at the rate of one
+// full-size read): probing must not cost page faults what the bandwidth-delay
+// product spares them.
 var (
 	// aplQueueDelay is the time an awaited read may wait behind the
 	// background reads in flight, beyond their own latency.
@@ -273,14 +274,14 @@ func (b *aplBackgroundBudget) init(now int64, readBytes, maxBytes uint64) {
 func (b *aplBackgroundBudget) readCompleted(now int64, n uint64, issued int64, kind aplReadKind, inflight uint64) {
 	b.windowBytes += n
 	latency := time.Duration(now - issued)
+	// An awaited read is judged against the quickest read before it.
+	if kind == aplReadAwaited {
+		b.awaitedReadCompleted(now, n, latency, issued)
+	}
 	if !b.quickestKnown || latency < b.quickest {
 		b.quickest, b.quickestKnown = latency, true
 	}
-	switch kind {
-	case aplReadAwaited:
-		b.awaitedReadCompleted(now, n, latency, issued)
-		return
-	case aplReadBackground:
+	if kind != aplReadFullBackground {
 		return
 	}
 	reads := min((inflight+b.minBytes-1)/b.minBytes, uint64(len(b.latencies)-1))
@@ -361,8 +362,9 @@ func (b *aplBackgroundBudget) bandwidthAtMost(reads uint64) (float64, bool) {
 // awaitedReadCompleted records the completion at now of an awaited read of n
 // bytes issued at issued, which took latency, and drops the floor if the read
 // was issued while the budget was raised and took more than aplQueueDelay
-// longer than an awaited read did while it was not, or than the pages file
-// takes to deliver n bytes at the rate of one full-size read alone.
+// longer than an awaited read did while it was not, or than it would take
+// alone: the latency of the quickest read, which is mostly the pages file's
+// latency to a first byte, plus n bytes at the rate of one full-size read.
 func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency time.Duration, issued int64) {
 	b.lastAwaited = now
 	if !b.raised || issued < b.raisedAt {
@@ -371,7 +373,7 @@ func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency 
 		}
 		return
 	}
-	usual := time.Duration(float64(b.minLatency) * float64(n) / float64(b.minBytes))
+	usual := b.quickest + time.Duration(float64(b.minLatency-b.quickest)*float64(n)/float64(b.minBytes))
 	if b.awaitedLatencyKnown {
 		usual = min(usual, b.awaitedLatency)
 	}
