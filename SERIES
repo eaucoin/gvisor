@@ -41,3 +41,5 @@ series/26-s3-reads-stop-at-end on series/24-post-restore-hook-stalls
 series/27-gofer-sync-errors on series/26-s3-reads-stop-at-end
 # A lazy restore's background page loads read through short gaps between a parent layer's pages (pgalloc, stateio).
 series/28-coalesced-page-loads on series/27-gofer-sync-errors
+# A lazy restore keeps as many background reads in flight as its pages file serves at once (pgalloc, stateio, checkpoint gofers).
+series/29-parallel-reads on series/28-coalesced-page-loads
