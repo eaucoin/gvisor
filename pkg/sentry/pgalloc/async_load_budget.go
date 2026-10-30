@@ -97,6 +97,21 @@ import (
 // (the latency of the quickest read, plus its bytes at the rate of one
 // full-size read): probing must not cost page faults what the bandwidth-delay
 // product spares them.
+//
+// A pages file may say how many reads it serves at once, each at the rate of
+// one alone (stateio.ParallelAsyncReader), as an object store does that serves
+// each read on a connection of its own. Loading from it keeps at least that
+// many full-size reads in flight from its start, a floor that neither the slow
+// start nor the bandwidth-delay product lowers. Without it, on an object store
+// that caps the rate of each connection, as S3 does at 85-90 MB/s, and shares
+// its CPUs, the slow start ends at a few reads, and the page faults of a
+// restored application, which touches most of its memory, keep loading from
+// ever being quiet enough to probe: restoring 3 GiB from an S3-like store, the
+// budget stayed at one 16 MiB read, 40-90 MB/s, where eight connections
+// delivered 194 MB/s. Awaited reads still go first, in the slot kept for them,
+// and the check on their latency still holds: an awaited read that the floor's
+// reads slowed drops it to the bandwidth-delay product for a backoff that
+// doubles at each drop, after which it returns.
 var (
 	// aplQueueDelay is the time an awaited read may wait behind the
 	// background reads in flight, beyond their own latency.
@@ -205,8 +220,16 @@ type aplBackgroundBudget struct {
 	parallel bool
 
 	// floor is the number of full-size reads that the budget allows at least,
-	// as probing found them worth it (0 if it found none).
+	// as the pages file says it serves them in parallel (parallelReads) or as
+	// probing found them worth it (0 if neither).
 	floor uint64
+
+	// parallelReads is the number of full-size reads that the pages file
+	// serves at once, each at the rate of one alone, as it says
+	// (stateio.ParallelAsyncReader), within the budget's bounds; 0 if it says
+	// none. The floor is at least parallelReads, except while an awaited read
+	// that they slowed defers it (until nextProbe).
+	parallelReads uint64
 
 	// reads is the number of full-size reads that the budget allows.
 	reads uint64
@@ -255,16 +278,20 @@ type aplBackgroundBudget struct {
 }
 
 // init starts the budget at now, for reads of readBytes, with at most maxBytes
-// in flight.
-func (b *aplBackgroundBudget) init(now int64, readBytes, maxBytes uint64) {
+// in flight, from a pages file that serves parallelReads reads at once (0 if
+// it does not say).
+func (b *aplBackgroundBudget) init(now int64, readBytes, maxBytes, parallelReads uint64) {
 	maxBytes = max(readBytes, maxBytes)
+	parallelReads = min(parallelReads, maxBytes/readBytes)
 	*b = aplBackgroundBudget{
-		minBytes:    readBytes,
-		maxBytes:    maxBytes,
-		bytes:       min(aplInitialReads*readBytes, maxBytes),
-		startup:     true,
-		windowStart: now,
-		latencies:   make([]time.Duration, maxBytes/readBytes+1),
+		minBytes:      readBytes,
+		maxBytes:      maxBytes,
+		bytes:         min(max(aplInitialReads, parallelReads)*readBytes, maxBytes),
+		startup:       true,
+		windowStart:   now,
+		latencies:     make([]time.Duration, maxBytes/readBytes+1),
+		floor:         parallelReads,
+		parallelReads: parallelReads,
 	}
 }
 
@@ -316,7 +343,7 @@ func (b *aplBackgroundBudget) endStartup(now int64, latency time.Duration, reads
 	// By Little's law, the bandwidth that the read saw, over that of one
 	// read alone.
 	ratio := float64(reads)
-	b.parallel = reads > 1 && ratio*b.minLatency.Seconds()/latency.Seconds() >= aplFullPipeGain(ratio)
+	b.parallel = b.parallelReads > 1 || (reads > 1 && ratio*b.minLatency.Seconds()/latency.Seconds() >= aplFullPipeGain(ratio))
 	if b.parallel {
 		b.step = b.reads
 		b.nextProbe = now
@@ -409,6 +436,12 @@ func (b *aplBackgroundBudget) update(now int64) {
 			b.setBandwidthDelayProduct(now)
 		}
 	}
+	if b.floor < b.parallelReads && b.probe == 0 && now >= b.nextProbe {
+		// The backoff after an awaited read that the reads the pages file
+		// serves in parallel slowed is over.
+		b.floor = b.parallelReads
+		b.setBandwidthDelayProduct(now)
+	}
 	quiet := now-b.lastAwaited >= int64(max(aplBandwidthWindow, b.minLatency))
 	if maxReads := b.maxBytes / b.minBytes; b.parallel && quiet && b.probe == 0 && now >= b.nextProbe && b.reads < maxReads {
 		if _, ok := b.bandwidthAtMost(b.reads); ok {
@@ -477,5 +510,5 @@ func (b *aplBackgroundBudget) bandwidth() float64 {
 
 // String implements fmt.Stringer.String.
 func (b *aplBackgroundBudget) String() string {
-	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, quickest read %v, parallel %t, floor %d reads; probes kept %d, failed %d; dropped for awaited reads %d times; gaps read through up to %d bytes", b.startup, b.bandwidth()*1e-6, b.minLatency, b.quickest, b.parallel, b.floor, b.probesKept, b.probesFailed, b.drops, b.gapBytes())
+	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, quickest read %v, parallel %t (%d reads said), floor %d reads; probes kept %d, failed %d; dropped for awaited reads %d times; gaps read through up to %d bytes", b.startup, b.bandwidth()*1e-6, b.minLatency, b.quickest, b.parallel, b.parallelReads, b.floor, b.probesKept, b.probesFailed, b.drops, b.gapBytes())
 }

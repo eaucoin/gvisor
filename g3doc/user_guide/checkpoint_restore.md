@@ -165,7 +165,12 @@ with reads of 1 MiB as with reads of 16 MiB). On a disk, which serves reads in
 order, a touched page then waits for about one background read and 2 ms; on a
 store that serves reads in parallel, such as an object store behind the
 checkpoint gofer, it does not wait for them at all. Loading starts with four reads in flight and grows
-until reads begin to queue, as TCP's slow start does. The log line "Async page
+until reads begin to queue, as TCP's slow start does. The checkpoint gofer's
+store serves each read on a connection of its own, at the rate of one alone,
+and says so: loading from it keeps all of its reads in flight but one, which is
+left for the pages the application touches, from the start, whatever the
+bandwidth of fewer reads suggests, unless a touched page's read takes longer
+than it would alone, which drops them back for a while. The log line "Async page
 loading completed" reports how many times and how long the application waited
 for pages, as do the metrics `/checkpoint/async_load_waits`,
 `/checkpoint/async_load_wait_bytes` and `/checkpoint/async_load_wait_nanoseconds`
@@ -801,7 +806,10 @@ Gateway and others), the file is `s3_opts.json`:
     fails after this time plus the time its bytes take at 1 MiB/s, so that a
     stalled store fails a checkpoint or restore rather than hangs it.
 -   `read_bytes` and `read_parallel` (default 16 MiB and 8): the size of reads
-    of `pages.img` and the number in flight.
+    of `pages.img` and the number in flight, each on a connection of its own.
+    A background restore keeps all of them in flight but one; an S3 connection
+    delivers 85-90 MB/s, so `read_parallel` sets the bandwidth a restore asks
+    of the store.
 -   `pages_retry` (default none): `"while-running"` retries reads of
     `pages.img`, the image's and its layers', for as long as the sandbox runs
     rather than `max_attempts` times, after a backoff of up to 10 seconds that
