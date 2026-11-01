@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -176,7 +177,7 @@ func loadImage(t *testing.T, ctx context.Context, img *checkpointimage.Image, im
 		if err != nil {
 			t.Fatalf("opening the pages file of %s: %v", dir, err)
 		}
-		pagesFiles = append(pagesFiles, stateio.NewPagesFileFDReaderDefault(int32(fd)))
+		pagesFiles = append(pagesFiles, stateio.NewPagesFileFDReaderDefault(int32(fd), runtime.NumCPU()))
 	}
 	memfd, err := memutil.CreateMemFD("restored", 0)
 	if err != nil {

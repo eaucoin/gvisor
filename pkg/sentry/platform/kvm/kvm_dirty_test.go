@@ -22,6 +22,8 @@ import (
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -29,7 +31,11 @@ import (
 // tracks dirty pages into the guest, writable, does not report them dirty:
 // the application's writes to them are recorded by dirty tracking's source.
 func TestMapFileDirtyTracking(t *testing.T) {
-	deviceFile, err := OpenDevice("")
+	desc, err := platformdesc.Lookup("kvm")
+	if err != nil {
+		t.Fatalf("error looking up platform: %v", err)
+	}
+	deviceFile, err := desc.OpenDevice("")
 	if err != nil {
 		t.Fatalf("error opening device file: %v", err)
 	}
@@ -38,7 +44,7 @@ func TestMapFileDirtyTracking(t *testing.T) {
 		t.Fatalf("error creating KVM instance: %v", err)
 	}
 	defer k.machine.Destroy()
-	as, err := k.NewAddressSpace()
+	as, err := k.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		t.Fatalf("error creating address space: %v", err)
 	}

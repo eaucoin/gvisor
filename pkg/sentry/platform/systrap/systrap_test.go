@@ -198,7 +198,7 @@ func TestSwitchThreadIDVisibility(t *testing.T) {
 }
 
 func TestSpinningQueueLayout(t *testing.T) {
-	newSystrapTest(t)
+	newSystrapTest(t, nil)
 	queueStart := stubContextQueueRegion + stubContextQueueRegionLen
 	if stubSpinningThreadQueueAddr < queueStart || stubSpinningThreadQueueAddr+sysmsg.SpinningQueueMemSize > stubContextRegion {
 		t.Errorf("spinning queue %#x not in [%#x, %#x)", stubSpinningThreadQueueAddr, queueStart, stubContextRegion)

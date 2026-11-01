@@ -197,7 +197,7 @@ func TestRunscRestoreCLI(t *testing.T) {
 			},
 			want: []string{
 				"restore", "--bundle=/bundles/app-1", "--image-path=/ckpt",
-				"--detach", "--direct", "--background",
+				"--detach", "--direct-io=on", "--background",
 				"--layer-path=/parent", "--layer-path=/grandparent", "--paused", "cid-1",
 			},
 		},

@@ -131,29 +131,3 @@ jobs:
           cache: false
       - name: Lint
         run: make lint
-
-  go:
-    name: Go branch build
-    # It passed at be15019ec0 (run 41310522894), and only test files change
-    # since: run again once the Bazel job passes, at the end.
-    if: false
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: false
-      - name: Generate the go branch
-        run: |
-          git config --global user.name "gVisor bot"
-          git config --global user.email "gvisor-bot@google.com"
-          tools/go_branch.sh
-          git checkout go
-          git clean -xffd
-      - name: go build ./...
-        run: go build ./...

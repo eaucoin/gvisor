@@ -129,6 +129,8 @@ func (pma *pma) armDirtyIfTracked() {
 //   - mm.activeMu must be locked for writing.
 //   - pseg.ValuePtr().dirtyArmed.
 //   - vseg.Range().IsSupersetOf(pseg.Range().Intersect(ar)).
+//
+// +checklocks:mm.activeMu
 func (mm *MemoryManager) disarmDirtyLocked(vseg vmaIterator, pseg pmaIterator, ar hostarch.AddrRange) pmaIterator {
 	unit := mm.dirtyUnit
 	if pseg.ValuePtr().huge {

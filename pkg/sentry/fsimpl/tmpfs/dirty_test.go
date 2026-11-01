@@ -70,9 +70,15 @@ func newDiskBackedFile(t *testing.T, ctx context.Context, mf *pgalloc.MemoryFile
 
 // TestDirtyTrackingDiskBackedWrite checks that writes to tmpfs files whose
 // data is on a disk-backed MemoryFile, which tmpfs writes through the
-// MemoryFile's FD rather than through MapInternal, mark the pages they write
-// dirty: verification finds no escape, unless the mark is disabled.
+// MemoryFile's FD rather than through MapInternal from hostWriteThreshold on,
+// mark the pages they write dirty: verification finds no escape, unless the
+// mark is disabled.
 func TestDirtyTrackingDiskBackedWrite(t *testing.T) {
+	// Every write goes to the MemoryFile's FD, however small, as this test's
+	// do not reach hostWriteThreshold.
+	threshold := hostWriteThreshold
+	hostWriteThreshold = 1
+	t.Cleanup(func() { hostWriteThreshold = threshold })
 	for _, disabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("disabled=%v", disabled), func(t *testing.T) {
 			ctx := contexttest.Context(t)

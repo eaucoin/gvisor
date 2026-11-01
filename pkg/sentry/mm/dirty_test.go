@@ -40,7 +40,7 @@ type recordingPlatform struct {
 }
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace.
-func (recordingPlatform) NewAddressSpace() (platform.AddressSpace, error) {
+func (recordingPlatform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	return &recordingAddressSpace{}, nil
 }
 
