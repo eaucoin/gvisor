@@ -46,6 +46,10 @@ readonly DIR="${dir}"
 readonly RESULTS="${2:?usage: standby_test.sh DIR RESULTS [RUNSC_FLAG...]}"
 shift 2
 readonly RUNS="${STANDBY_RUNS:-20}"
+# With STANDBY_GROUPING=false, each container has a shim of its own, as
+# containerd runs the shim by default: the sandbox's shim serves the root
+# container's socket, and each other container's shim its own.
+readonly GROUPING="${STANDBY_GROUPING:-true}"
 
 readonly K3S="mirror.gcr.io/rancher/k3s:v1.37.1-k3s1@sha256:ca7f37d993d82ef0dcdcfecb2e0e2618ea541dbaffc620c8cedebe01a82acd0d"
 readonly IMAGE="mirror.gcr.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
@@ -109,12 +113,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+sed "s/^grouping = .*/grouping = ${GROUPING}/" "${CONF}/config.toml" >"${tmp}/config.toml"
+
 sudo docker run --detach --name "${NODE}" --hostname "${NODE}" --privileged \
   --memory 1536m --memory-swap 1536m --tmpfs /run --tmpfs /var/run \
   --volume "${SOCKETS}:/run/standby" \
   --volume "${CONF}/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" \
   --volume "${CONF}/config-v3.toml.tmpl:/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl:ro" \
-  --volume "${CONF}/config.toml:/etc/containerd/runsc/config.toml:ro" \
+  --volume "${tmp}/config.toml:/etc/containerd/runsc/config.toml:ro" \
   --volume "${tmp}/runsc.toml:/etc/containerd/runsc/runsc.toml:ro" \
   --volume "${DIR}:/opt/gvisor:ro" \
   --volume "${DIR}/containerd-shim-runsc-v1:/bin/containerd-shim-runsc-v1:ro" \
@@ -260,11 +266,18 @@ socket() {
   done
 }
 
-# restore_standby NAME BODY asks the shim of standby pod NAME to restore, as
-# BODY says: its answer.
+# restore_standby NAME BODY asks the shims of standby pod NAME to restore, as
+# BODY says: the sandbox's, then each container's of its own where shim
+# grouping is off. Its answer is a JSON array of theirs.
 restore_standby() {
-  sudo curl --silent --show-error --fail-with-body --max-time 120 --unix-socket "${SOCKETS}/$1.sock" \
-    --data "$2" http://standby/restore
+  local -a answers=()
+  local socket
+  for socket in "${SOCKETS}/$1.sock" $(sudo find "${SOCKETS}" -maxdepth 1 -name "$1.*.sock" | sort); do
+    answers+=("$(sudo curl --silent --show-error --fail-with-body --max-time 120 --unix-socket "${socket}" \
+      --data "$2" http://standby/restore)") || return 1
+  done
+  local IFS=,
+  echo "[${answers[*]}]"
 }
 
 # boot_lines NAME: the restore's lines of pod NAME's boot log.

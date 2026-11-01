@@ -131,6 +131,10 @@ type runscService struct {
 	// created as, which every one of them names; empty if none.
 	standbySocket string
 
+	// standbyNames are the names of the standby's containers, by id, which
+	// name their own sockets where each has a shim of its own.
+	standbyNames map[string]string
+
 	// versionCommand is the runsc executable configured for the sandbox.
 	// A nil pointer or empty command selects the default.
 	versionCommand atomic.Pointer[string]
@@ -240,6 +244,12 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 
 	log.L.Infof("Created container %q, a standby's: %t (sandbox standby socket %q)", rfs.Create.ID, restore.standby != "", s.standbySocket)
 	if restore.standby != "" {
+		if name := containerName(rfs.Create.Bundle); name != "" {
+			if s.standbyNames == nil {
+				s.standbyNames = make(map[string]string)
+			}
+			s.standbyNames[rfs.Create.ID] = name
+		}
 		if s.standbySocket != "" && s.standbySocket != restore.standby {
 			return nil, fmt.Errorf("standby socket %q differs from the sandbox's, %q: %w", restore.standby, s.standbySocket, errdefs.ErrInvalidArgument)
 		}
@@ -298,9 +308,21 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
-	if initProcess, ok := p.(*proc.Init); ok && len(r.ExecID) == 0 && initProcess.Sandbox && c.isStandby() {
-		if err := s.serveStandby(initProcess.Pid()); err != nil {
-			return nil, errgrpc.ToGRPC(err)
+	if initProcess, ok := p.(*proc.Init); ok && len(r.ExecID) == 0 && c.isStandby() {
+		s.mu.Lock()
+		served, socket, name := s.standby != nil, s.standbySocket, s.standbyNames[r.ID]
+		s.mu.Unlock()
+		switch {
+		case initProcess.Sandbox:
+			if err := s.serveStandby(initProcess.Pid(), socket); err != nil {
+				return nil, errgrpc.ToGRPC(err)
+			}
+		case !served && name != "":
+			// This shim holds no root container to restore this one with:
+			// shim grouping is off, and the sandbox's shim is another.
+			if err := s.serveStandby(initProcess.Pid(), containerStandbySocket(socket, name)); err != nil {
+				return nil, errgrpc.ToGRPC(err)
+			}
 		}
 	}
 	if len(r.ExecID) == 0 {
@@ -337,6 +359,7 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 		s.mu.Lock()
 		delete(s.containers, r.ID)
 		s.created = slices.DeleteFunc(s.created, func(id string) bool { return id == r.ID })
+		delete(s.standbyNames, r.ID)
 		hasCont := len(s.containers) > 0
 		standby := s.standby
 		s.mu.Unlock()
@@ -1088,4 +1111,14 @@ func setDebug(r *runsccmd.Runsc, d *pb.Debug) *runsccmd.Runsc {
 		cp.DebugLogFD = &fd
 	}
 	return &cp
+}
+
+// containerName is the name of the container whose bundle is bundle, as the
+// CRI annotates it; empty if it does not.
+func containerName(bundle string) string {
+	spec, err := utils.ReadSpec(bundle)
+	if err != nil {
+		return ""
+	}
+	return spec.Annotations["io.kubernetes.cri.container-name"]
 }

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,31 +89,42 @@ type standbyServer struct {
 	closed bool
 }
 
-// serveStandby starts the standby's server on its socket, for its sandbox,
-// whose process is pid.
-func (s *runscService) serveStandby(pid int) error {
+// containerStandbySocket is the socket of the standby's container named name,
+// served by the shim of that container alone, as each container has a shim of
+// its own where shim grouping is off: the sandbox's socket, socket, with the
+// container's name before its extension.
+func containerStandbySocket(socket, name string) string {
+	return strings.TrimSuffix(socket, ".sock") + "." + name + ".sock"
+}
+
+// serveStandby starts the standby's server on socket, for its sandbox, whose
+// process is pid: the sandbox's socket, served by the shim of its root
+// container, which restores every container of the sandbox this shim
+// created; or a container's socket (containerStandbySocket), served by the
+// shim of that container alone, where shim grouping is off.
+func (s *runscService) serveStandby(pid int, socket string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.standby != nil {
 		return fmt.Errorf("standby sandbox already served on %q", s.standby.socket)
 	}
-	if err := os.MkdirAll(filepath.Dir(s.standbySocket), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return fmt.Errorf("standby socket directory: %w", err)
 	}
-	if err := os.Remove(s.standbySocket); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("standby socket: %w", err)
 	}
-	listener, err := net.Listen("unix", s.standbySocket)
+	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		return fmt.Errorf("standby socket: %w", err)
 	}
-	if err := os.Chmod(s.standbySocket, 0600); err != nil {
+	if err := os.Chmod(socket, 0600); err != nil {
 		listener.Close()
 		return fmt.Errorf("standby socket: %w", err)
 	}
 	srv := &standbyServer{
 		s:         s,
-		socket:    s.standbySocket,
+		socket:    socket,
 		listener:  listener,
 		pid:       pid,
 		stopWatch: make(chan struct{}),
