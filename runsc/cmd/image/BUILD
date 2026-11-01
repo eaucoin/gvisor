@@ -20,7 +20,7 @@ go_library(
     visibility = ["//runsc:__subpackages__"],
     deps = [
         "//pkg/cpuid",
-        "//pkg/sentry/platform",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
