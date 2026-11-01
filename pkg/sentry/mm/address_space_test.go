@@ -82,20 +82,26 @@ func (*recordingAddressSpace) PreFork() {}
 // PostFork implements platform.AddressSpace.PostFork.
 func (*recordingAddressSpace) PostFork() {}
 
-// gatedReaderAt is an io.ReaderAt whose reads wait until open is closed.
-type gatedReaderAt struct {
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
+func (*recordingAddressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
+	return nil
+}
+
+// openGatedReaderAt is an io.ReaderAt whose reads wait until open is closed.
+type openGatedReaderAt struct {
 	r    io.ReaderAt
 	open chan struct{}
 }
 
 // ReadAt implements io.ReaderAt.ReadAt.
-func (g *gatedReaderAt) ReadAt(dst []byte, off int64) (int, error) {
+func (g *openGatedReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 	<-g.open
 	return g.r.ReadAt(dst, off)
 }
 
-// newTestMemoryFile returns a new MemoryFile backed by a memfd.
-func newTestMemoryFile(t *testing.T, expectHugepages bool) *pgalloc.MemoryFile {
+// newHugeTestMemoryFile returns a new MemoryFile backed by a memfd, which
+// expects huge pages if expectHugepages.
+func newHugeTestMemoryFile(t *testing.T, expectHugepages bool) *pgalloc.MemoryFile {
 	t.Helper()
 	fd, err := memutil.CreateMemFD("mm-test", 0)
 	if err != nil {
@@ -122,7 +128,7 @@ func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool) 
 	t.Helper()
 
 	// Save an image of one page.
-	src := newTestMemoryFile(t, false /* expectHugepages */)
+	src := newHugeTestMemoryFile(t, false /* expectHugepages */)
 	fr, err := src.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
@@ -161,12 +167,12 @@ func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool) 
 	var openOnce sync.Once
 	letLoad := func() { openOnce.Do(func() { close(open) }) }
 	t.Cleanup(letLoad)
-	ar := stateio.NewIOReader(&gatedReaderAt{bytes.NewReader(pages.Bytes()), open}, 256<<10, 64, 4)
-	apfl, err := pgalloc.StartAsyncPagesFileLoad(ar, func(error) {}, nil /* timeline */)
+	ar := stateio.NewIOReader(&openGatedReaderAt{bytes.NewReader(pages.Bytes()), open}, 256<<10, 64, 4)
+	apfl, err := pgalloc.StartAsyncPagesFileLoad(ar, func(error) {}, nil /* timeline */, pgalloc.AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
 	}
-	mf := newTestMemoryFile(t, expectHugepages)
+	mf := newHugeTestMemoryFile(t, expectHugepages)
 	loaded := make(chan error, 1)
 	opts := pgalloc.LoadOpts{
 		Image:        img.Proto,

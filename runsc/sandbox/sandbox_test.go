@@ -717,9 +717,9 @@ func TestIsGCSRestorePath(t *testing.T) {
 		{name: "local nested prefix", path: filepath.Join(localDir, "bundles", "fs"), wantPrefixed: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gotGCS, gotPrefixed := isGCSRestorePath(tc.path)
+			gotGCS, gotPrefixed := isCheckpointGoferRestorePath(tc.path)
 			if gotGCS != tc.wantGCS || gotPrefixed != tc.wantPrefixed {
-				t.Errorf("isGCSRestorePath(%q) = (%t, %t), want (%t, %t)", tc.path, gotGCS, gotPrefixed, tc.wantGCS, tc.wantPrefixed)
+				t.Errorf("isCheckpointGoferRestorePath(%q) = (%t, %t), want (%t, %t)", tc.path, gotGCS, gotPrefixed, tc.wantGCS, tc.wantPrefixed)
 			}
 		})
 	}
