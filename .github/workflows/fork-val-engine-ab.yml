@@ -1,0 +1,86 @@
+# Spike, not for main (named fork-* so that fork-integrate.yml leaves it
+# enabled): the kernel-standby validation's engine A/B (the endpoint package's
+# G-16), on every push of a spike/val-engine-ab branch. eaucoin.15, as
+# released, and the rebase spike's build with the wire and the graph engine
+# checkpoint and restore the same workloads on the same runner, interleaved
+# (tools/fork/engine_ab.sh). The workloads are split over three jobs, run one
+# after another, each pinned to the CPU and kernel that the package's
+# measurements use.
+name: Engine A/B spike
+
+"on":
+  push:
+    branches:
+      - spike/val-engine-ab*
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The rebase spike's run whose release artifact is measured, and the commit it built.
+  REBASED_RUN: "41313006795"
+  REBASED_SHA: "a60215c23e883e5fa31c047c1b53277f65b20e0b"
+  BASELINE_TAG: release-20260921.0-eaucoin.15
+  RUNS: "20"
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      # One job at a time, within the validation's share of the account's runners.
+      max-parallel: 1
+      matrix:
+        workloads: ["procs:1,procs:12", "procs:64,procs:256", "files:1000"]
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          release=$(uname -r)
+          echo "$model, $release"
+          [ "$model" = "AMD EPYC 7763 64-Core Processor" ] || { echo "::error::this runner's CPU is $model: re-run this job"; exit 3; }
+          [[ $release == 7.0.* ]] || { echo "::error::this runner's kernel is $release: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: tools/fork
+          persist-credentials: false
+      - name: The builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/e15" "${RUNNER_TEMP}/rebased"
+          gh release download "${BASELINE_TAG}" -R "${GITHUB_REPOSITORY}" -p gvisor-x86_64.tar.bz2 -D "${RUNNER_TEMP}"
+          tar -C "${RUNNER_TEMP}/e15" -xjf "${RUNNER_TEMP}/gvisor-x86_64.tar.bz2"
+          gh run download "${REBASED_RUN}" -R "${GITHUB_REPOSITORY}" -n "release-${REBASED_SHA}" -D "${RUNNER_TEMP}/rebased"
+          chmod -R a+rX "${RUNNER_TEMP}/e15" "${RUNNER_TEMP}/rebased"
+          find "${RUNNER_TEMP}/e15" "${RUNNER_TEMP}/rebased" -name runsc -type f -exec chmod a+x {} +
+          find "${RUNNER_TEMP}/e15" "${RUNNER_TEMP}/rebased" -path '*gvisor-bin/*' -type f -exec chmod a+x {} +
+          e15="$(find "${RUNNER_TEMP}/e15" -name runsc -type f | head -n 1)"
+          rebased="${RUNNER_TEMP}/rebased/runsc"
+          "${e15}" --version
+          "${rebased}" --version
+          echo "E15=${e15}" >>"${GITHUB_ENV}"
+          echo "REBASED=${rebased}" >>"${GITHUB_ENV}"
+      - name: Checkpoints and restores, interleaved
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: |
+          tools/fork/engine_ab.sh "${RUNS}" "${RUNNER_TEMP}/ab.jsonl" "${WORKLOADS}" \
+            "e15=${E15}" "wire=${REBASED},--state-engine=wire" "graph=${REBASED},--state-engine=graph"
+      - id: name
+        if: always()
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: echo "name=engine-ab-$(tr ':,' '-_' <<<"${WORKLOADS}")-${GITHUB_SHA}" >>"${GITHUB_OUTPUT}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ${{ runner.temp }}/ab.jsonl
+          retention-days: 14
