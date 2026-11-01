@@ -104,7 +104,8 @@ cycle() {
   t0="$(now_ms)"
   runsc checkpoint --image-path="${image}" w
   t1="$(now_ms)"
-  runsc delete w
+  # The checkpointed sandbox may take a moment to be seen stopped.
+  runsc delete --force w
   local -r size="$(sudo stat -c %s "${image}/checkpoint.img")"
   runsc restore --bundle="${bundle}" --image-path="${image}" --detach w
   t2="$(now_ms)"
