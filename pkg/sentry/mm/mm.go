@@ -178,6 +178,11 @@ type MemoryManager struct {
 	// TakeDirtied.
 	dirtiedSession atomicbitops.Uint64 `state:"nosave"`
 
+	// dirtyAttribution counts the bytes that writes disarmed in each vma since
+	// dirty tracking was last armed, while pgalloc.LoggingDirtyAttribution;
+	// see dirty.go. dirtyAttribution is protected by activeMu.
+	dirtyAttribution map[hostarch.Addr]*DirtyAttributionEntry `state:"nosave"`
+
 	// hasPinned is true if pages in this MemoryManager have ever been pinned
 	// by Pin. It is never cleared, even if all pinned pages are unpinned;
 	// compare Linux's MMF_HAS_PINNED.
