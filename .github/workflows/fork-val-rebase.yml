@@ -1,10 +1,10 @@
 # Spike, not for main (named fork-* so that fork-integrate.yml leaves it
 # enabled): the kernel-standby validation's rebase of the fork's series onto
 # upstream master (the endpoint package's M6 rebase spike), checked as tier 1
-# checks main, on every push of a spike/val-rebase branch. The Bazel job, then
-# the checks, run beside the go branch build, so that the spike holds two
-# runners at a time; the Bazel job is pinned to the CPU and kernel that the
-# package's measurements use.
+# checks main, on every push of a spike/val-rebase branch: the Bazel build
+# and the affected tests, pinned to the CPU and kernel that the package's
+# measurements use. The checks and the go branch build, which passed at
+# be15019ec0 (run 41310522894), run again at the end.
 name: Rebase spike
 
 "on":
@@ -106,28 +106,3 @@ jobs:
         with:
           path: /home/runner/.cache/bazel/disk
           key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
-
-  checks:
-    name: Lint, license headers and documentation links
-    needs: bazel
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          filter: blob:none
-          persist-credentials: false
-      - id: base
-        run: echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
-      - name: License headers
-        run: tools/check_license_headers.sh "${{ steps.base.outputs.base }}"
-      - name: Documentation links
-        run: tools/fork/check_links.sh "${{ steps.base.outputs.base }}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: false
-      - name: Lint
-        run: make lint
