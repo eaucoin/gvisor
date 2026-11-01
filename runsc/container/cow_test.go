@@ -16,6 +16,8 @@ package container
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -66,13 +68,14 @@ func (w *abwriter) gap() time.Duration {
 
 // TestCheckpointCoWAB takes copy-on-write checkpoints of the A-B writer while
 // it rewrites random pages of its 64 MiB at 1 to 200 MiB/s, to the local disk
-// and to a store that takes 16 MiB/s, a whole image and then a delta of it,
-// with dirty tracking and the captured pages verified: every page that a
-// checkpoint writes must be the page at its save point, and each image,
-// restored, must pass the writer's check of every page. The writer's longest
-// gap during each checkpoint, which is how long the checkpoint kept the
-// sandbox from running, is logged beside that of checkpoints that are not
-// copy-on-write, which write their pages in the pause.
+// and to a store that takes 16 MiB/s, a whole image (whose save point starts
+// dirty tracking) and then a delta of it, with dirty tracking and the
+// captured pages verified: every page that a checkpoint writes must be the
+// page at its save point, and each image, restored, must pass the writer's
+// check of every page. The writer's longest gap during each checkpoint, which
+// is how long the checkpoint kept the sandbox from running, and the pause
+// that the sandbox reports, are logged beside those of checkpoints that are
+// not copy-on-write, which write their pages in the pause.
 func TestCheckpointCoWAB(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		for _, store := range []struct {
@@ -85,12 +88,8 @@ func TestCheckpointCoWAB(t *testing.T) {
 			for _, rateMiB := range []int{1, 10, 50, 200} {
 				for _, cow := range []bool{false, true} {
 					t.Run(fmt.Sprintf("%s/%s/%dMiBps/cow=%v", name, store.name, rateMiB, cow), func(t *testing.T) {
+						start := time.Now()
 						w := startABWriter(t, cowConf(t, conf, store.rate, cow, config.DirtyTrackingBreakNone), "64", fmt.Sprint(rateMiB))
-						// The first checkpoint starts dirty tracking, which
-						// copy-on-write checkpoints need.
-						if _, err := w.checkpoint(sandbox.CheckpointOpts{}); err != nil {
-							t.Fatalf("error checkpointing: %v", err)
-						}
 						w.gap()
 						whole, err := w.checkpoint(sandbox.CheckpointOpts{})
 						if err != nil {
@@ -102,7 +101,7 @@ func TestCheckpointCoWAB(t *testing.T) {
 							t.Fatalf("error checkpointing incrementally: %v", err)
 						}
 						deltaGap := w.gap()
-						t.Logf("longest gap: whole %v, delta %v", wholeGap, deltaGap)
+						t.Logf("longest gap: whole %v, delta %v; the sandbox's pauses: %v", wholeGap, deltaGap, savePauses(t, start))
 
 						w.restore(whole, nil)
 						if got := w.check(); !strings.HasPrefix(got, "PASS ") {
@@ -119,15 +118,50 @@ func TestCheckpointCoWAB(t *testing.T) {
 	}
 }
 
+// savePauses returns the lines of the boot logs of the sandboxes started
+// since start in which they say how their checkpoints paused them and took
+// their save points.
+func savePauses(t *testing.T, start time.Time) []string {
+	t.Helper()
+	logs, err := filepath.Glob(filepath.Join(os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"), "*boot*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Log names hold the time their runsc started (specutils.DebugLogFile).
+	since := start.Format("20060102-150405.000000")
+	var said []string
+	for _, path := range logs {
+		name := filepath.Base(path)
+		if i := strings.Index(name, ".boot"); i < len(since) || name[i-len(since):i] < since {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			for _, what := range []string{"paused for", "Save point taken", "pre-armed", "Dirty tracking: armed", "Kernel save took", "copy-on-write save copied in", "pages written"} {
+				if strings.Contains(line, what) {
+					said = append(said, line[strings.Index(line, "]")+2:])
+					break
+				}
+			}
+		}
+	}
+	return said
+}
+
 // TestCheckpointCoWChurn takes copy-on-write checkpoints of the A-B writer
 // while it churns memory as well (it allocates, fills and frees regions,
 // discards pages with MADV_DONTNEED, and forks children that write their
-// copies of its pages), copying late so that its writes reach the pages
-// before the copier does: the checkpoints' captures must be the memory of
-// their save points, and their restore must pass the writer's check. As
-// negative controls, with the captures before first writes or before
-// decommits disabled, the checkpoint must find pages written without being
-// captured.
+// copies of its pages), so that pages are freed and reused while they are
+// still to be copied, copying late so that its writes reach the pages before
+// the copier does: a whole image and a delta of it, whose captures must be
+// the memory of their save points and whose dirty tracking must have missed
+// no write since the first, and whose restore must pass the writer's check.
+// As negative controls, with the captures before first writes or before
+// decommits disabled, the first checkpoint must find pages written without
+// being captured.
 func TestCheckpointCoWChurn(t *testing.T) {
 	const storeRate = 16 << 20
 	for name, conf := range configs(t, true /* noOverlay */) {
@@ -136,10 +170,7 @@ func TestCheckpointCoWChurn(t *testing.T) {
 				c := cowConf(t, conf, storeRate, true /* cow */, brk)
 				c.TestOnlyCoWCopyDelay = 500 * time.Millisecond
 				w := startABWriter(t, c, "-c", "64", "50")
-				if _, err := w.checkpoint(sandbox.CheckpointOpts{}); err != nil {
-					t.Fatalf("error checkpointing: %v", err)
-				}
-				image, err := w.checkpoint(sandbox.CheckpointOpts{})
+				whole, err := w.checkpoint(sandbox.CheckpointOpts{})
 				if brk != config.DirtyTrackingBreakNone {
 					if err == nil || !strings.Contains(err.Error(), pgalloc.ErrCoWEscapes.Error()) {
 						t.Errorf("checkpoint with %v captures disabled: got %v, want pages written without being captured", brk, err)
@@ -149,9 +180,17 @@ func TestCheckpointCoWChurn(t *testing.T) {
 				if err != nil {
 					t.Fatalf("error checkpointing: %v", err)
 				}
-				w.restore(image, nil)
+				delta, err := w.checkpoint(sandbox.CheckpointOpts{ParentImagePath: whole})
+				if err != nil {
+					t.Fatalf("error checkpointing incrementally: %v", err)
+				}
+				w.restore(whole, nil)
 				if got := w.check(); !strings.HasPrefix(got, "PASS ") {
-					t.Errorf("abwriter's check after restoring: %s", got)
+					t.Errorf("abwriter's check after restoring the whole image: %s", got)
+				}
+				w.restore(delta, []string{whole})
+				if got := w.check(); !strings.HasPrefix(got, "PASS ") {
+					t.Errorf("abwriter's check after restoring the delta: %s", got)
 				}
 			})
 		}

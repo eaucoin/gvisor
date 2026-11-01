@@ -196,10 +196,20 @@ func TestCoWSaveIsSavePoint(t *testing.T) {
 			want := contents(tf.f, tf.fr)
 
 			opts := freezeCoW(t, tf, parent, CoWOpts{StagingMax: math.MaxUint64, Verify: true})
+			var written []uint64
 			for _, w := range cowWriters {
-				w.write(t, tf.f, tf.fr)
+				written = append(written, w.write(t, tf.f, tf.fr)...)
 			}
 			ti := newTestPagesWriter(t).save(t, tf.f, parent, opts)
+			// The next epoch holds every page written after the save point,
+			// those freed, released and allocated again included, whether the
+			// copier or a writer captured them.
+			next := tf.f.SwapDirty(true /* paused */)
+			for _, off := range written {
+				if !next.Contains(off) {
+					t.Errorf("page %#x, written after the save point, is not dirty in the next epoch", off)
+				}
+			}
 
 			restored := loadTestImage(t, ti)
 			checkContents(t, restored, tf.fr, want)
