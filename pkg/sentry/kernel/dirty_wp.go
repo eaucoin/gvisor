@@ -15,11 +15,14 @@
 package kernel
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 // WriteProtectDirtySource is a DirtySource that write-protects application
@@ -61,6 +64,9 @@ func (s *WriteProtectDirtySource) Arm(ctx context.Context, paused bool) error {
 		defer s.k.Unpause()
 	}
 	mms := s.k.memoryManagersPaused()
+	if pgalloc.LoggingDirtyAttribution() {
+		s.k.logDirtyAttributionPaused(mms)
+	}
 	for _, m := range mms {
 		m.ArmDirtyTracking(s.unit)
 	}
@@ -101,4 +107,42 @@ func (k *Kernel) memoryManagersPaused() []*mm.MemoryManager {
 		}
 	}
 	return mms
+}
+
+// dirtyAttributionVMAs is the number of vmas, largest first, that
+// logDirtyAttributionPaused names for each MemoryManager.
+const dirtyAttributionVMAs = 16
+
+// logDirtyAttributionPaused logs, for each of mms, the thread groups that use
+// it and what writes disarmed in its vmas since dirty tracking was last armed
+// (a measurement build's, while pgalloc.LoggingDirtyAttribution).
+//
+// Preconditions: The kernel must be paused.
+func (k *Kernel) logDirtyAttributionPaused(mms []*mm.MemoryManager) {
+	users := make(map[*mm.MemoryManager][]string)
+	k.tasks.mu.RLock()
+	for tg, id := range k.tasks.Root.tgids {
+		leader := tg.leader
+		if leader == nil || leader.image.MemoryManager == nil {
+			continue
+		}
+		m := leader.image.MemoryManager
+		users[m] = append(users[m], fmt.Sprintf("%d %q", id, leader.Name()))
+	}
+	k.tasks.mu.RUnlock()
+	for _, m := range mms {
+		entries, total := m.TakeDirtyAttribution()
+		if total == 0 {
+			continue
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Dirty attribution: MemoryManager %p of thread groups [%s] disarmed %d bytes since the last arm, in %d vmas; largest:", m, strings.Join(users[m], ", "), total, len(entries))
+		for i, e := range entries {
+			if i == dirtyAttributionVMAs {
+				break
+			}
+			fmt.Fprintf(&b, " [%#x-%#x %s %q: %d]", e.Start, e.End, e.Perms, e.Name, e.Bytes)
+		}
+		log.Infof("%s", b.String())
+	}
 }

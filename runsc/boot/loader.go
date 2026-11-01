@@ -759,6 +759,7 @@ func New(args Args) (*Loader, error) {
 
 	pgalloc.SetLogAwaitedLoads(args.Conf.AsyncAwaitsTrace == config.AsyncAwaitsTraceLog)
 	mm.SetUncachedInternalMappingsWhileLoading(args.Conf.AsyncLoadInternalMappings == config.AsyncLoadInternalMappingsUncached)
+	pgalloc.SetLogDirtyAttribution(args.Conf.DirtyTrace == config.DirtyTraceLog)
 
 	// Create kernel and platform.
 	if err := l.setUpDirtyTracking(args.Conf); err != nil {

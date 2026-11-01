@@ -598,6 +598,9 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// This is the first write to the pma since it was armed
 					// for dirty tracking.
 					pseg = mm.disarmDirtyLocked(vseg, pseg, ar)
+					if pgalloc.LoggingDirtyAttribution() {
+						mm.recordDirtyAttributionLocked(ctx, vseg, uint64(pseg.Range().Length()))
+					}
 					pstart = pmaIterator{} // iterators invalidated
 					pseg, pgap = pseg.NextNonEmpty()
 				} else {

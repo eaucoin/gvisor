@@ -130,6 +130,30 @@ func (b *dirtyBitmap) mark(fr memmap.FileRange) {
 	}
 }
 
+// markCounting is mark, which also returns the number of pages whose bits it
+// set that were not set before.
+func (b *dirtyBitmap) markCounting(fr memmap.FileRange) uint64 {
+	chunks := b.load()
+	page := fr.Start / hostarch.PageSize
+	end := (fr.End + hostarch.PageSize - 1) / hostarch.PageSize
+	if end > uint64(len(chunks))*dirtyChunkWords*64 {
+		panic(fmt.Sprintf("dirty pages %v beyond the MemoryFile's %d chunks", fr, len(chunks)))
+	}
+	var n uint64
+	for page < end {
+		word := page / 64
+		bit := page % 64
+		mask := ^uint64(0) << bit
+		if rest := end - page; rest < 64-bit {
+			mask &= ^uint64(0) >> (64 - bit - rest)
+		}
+		old := chunks[word/dirtyChunkWords][word%dirtyChunkWords].Or(mask)
+		n += uint64(bits.OnesCount64(mask &^ old))
+		page += 64 - bit
+	}
+	return n
+}
+
 // DirtySet is a set of pages of a MemoryFile, returned by SwapDirty.
 type DirtySet struct {
 	// words has one bit per page: page i is in the set if bit i%64 of
@@ -212,6 +236,11 @@ type dirtyState struct {
 	// written marks pages dirtied since the last swap.
 	written dirtyBitmap
 
+	// marked counts, by the DirtyMarkPath that marked them (DirtyMarkNone for
+	// MarkDirty's callers), the bytes of the pages newly marked in written
+	// since the last swap, while LoggingDirtyAttribution.
+	marked [dirtyMarkPaths]atomic.Uint64
+
 	// internal marks pages dirtied by MapInternal(Write) since the last swap;
 	// see SwapDirty.
 	internal dirtyBitmap
@@ -282,7 +311,17 @@ func (f *MemoryFile) MarkDirty(fr memmap.FileRange) {
 	if !f.dirty.tracked.Load() {
 		return
 	}
-	f.dirty.written.mark(fr)
+	f.markWritten(DirtyMarkNone, fr)
+}
+
+// markWritten marks the pages overlapping fr in f's written set, counting the
+// newly marked ones against p while LoggingDirtyAttribution.
+func (f *MemoryFile) markWritten(p DirtyMarkPath, fr memmap.FileRange) {
+	if !logDirtyAttribution.Load() {
+		f.dirty.written.mark(fr)
+		return
+	}
+	f.dirty.marked[p].Add(f.dirty.written.markCounting(fr) * hostarch.PageSize)
 }
 
 // MarkDirtyBy is MarkDirty for a mark made by path p, which tests may disable
@@ -291,7 +330,7 @@ func (f *MemoryFile) MarkDirtyBy(p DirtyMarkPath, fr memmap.FileRange) {
 	if !f.dirty.tracked.Load() || !DirtyMarkPathEnabled(p) {
 		return
 	}
-	f.dirty.written.mark(fr)
+	f.markWritten(p, fr)
 }
 
 // markDirtyInternal records that the caller of MapInternal may write the
@@ -300,7 +339,7 @@ func (f *MemoryFile) markDirtyInternal(fr memmap.FileRange) {
 	if !f.dirty.tracked.Load() || !DirtyMarkPathEnabled(DirtyMarkMapInternal) {
 		return
 	}
-	f.dirty.written.mark(fr)
+	f.markWritten(DirtyMarkMapInternal, fr)
 	f.dirty.internal.mark(fr)
 }
 
@@ -350,6 +389,15 @@ func (f *MemoryFile) SwapDirty(paused bool) *DirtySet {
 	if !f.dirty.tracked.Load() {
 		panic(fmt.Sprintf("MemoryFile(%p).SwapDirty() called without dirty tracking", f))
 	}
+	s := f.swapDirty(paused)
+	if logDirtyAttribution.Load() {
+		f.logDirtyAttribution(s)
+	}
+	return s
+}
+
+// swapDirty implements SwapDirty.
+func (f *MemoryFile) swapDirty(paused bool) *DirtySet {
 	f.dirty.swapMu.Lock()
 	defer f.dirty.swapMu.Unlock()
 	written := f.dirty.written.load()
@@ -668,6 +716,9 @@ const (
 	// harvests a mapping that it is about to unmap or replace, which loses
 	// what write tracking recorded in it.
 	DirtyMarkUffdUnmap
+
+	// dirtyMarkPaths is the number of DirtyMarkPaths.
+	dirtyMarkPaths
 )
 
 // disabledDirtyMarkPath is the DirtyMarkPath disabled by

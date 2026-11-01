@@ -504,6 +504,11 @@ type Config struct {
 	// awaits only the pages it accesses.
 	AsyncLoadInternalMappings AsyncLoadInternalMappings `flag:"async-load-internal-mappings"`
 
+	// DirtyTrace is whether a measurement build attributes the pages that dirty
+	// tracking records: at each swap, by memory kind and marking path, and at
+	// each arm, by MemoryManager, thread group and vma.
+	DirtyTrace DirtyTrace `flag:"dirty-trace"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -2107,6 +2112,55 @@ func (t AsyncAwaitsTrace) String() string {
 		return "log"
 	default:
 		panic(fmt.Sprintf("invalid async awaits trace %d", t))
+	}
+}
+
+// DirtyTrace is whether a measurement build attributes dirty pages.
+type DirtyTrace int
+
+// DirtyTrace values.
+const (
+	// DirtyTraceOff logs nothing more.
+	DirtyTraceOff DirtyTrace = iota
+
+	// DirtyTraceLog logs each dirty set swapped by kind and marking path, and
+	// each MemoryManager's disarmed bytes by thread group and vma.
+	DirtyTraceLog
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (t *DirtyTrace) Set(v string) error {
+	switch v {
+	case "off":
+		*t = DirtyTraceOff
+	case "log":
+		*t = DirtyTraceLog
+	default:
+		return fmt.Errorf("invalid dirty trace %q: must be off or log", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `t`.
+// Useful in flag declaration line.
+func (t DirtyTrace) Ptr() *DirtyTrace {
+	return &t
+}
+
+// Get implements flag.Get.
+func (t *DirtyTrace) Get() any {
+	return *t
+}
+
+// String implements flag.String.
+func (t DirtyTrace) String() string {
+	switch t {
+	case DirtyTraceOff:
+		return "off"
+	case DirtyTraceLog:
+		return "log"
+	default:
+		panic(fmt.Sprintf("invalid dirty trace %d", t))
 	}
 }
 

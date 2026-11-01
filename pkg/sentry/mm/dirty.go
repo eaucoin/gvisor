@@ -16,9 +16,11 @@ package mm
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -159,6 +161,72 @@ func (mm *MemoryManager) disarmDirtyLocked(vseg vmaIterator, pseg pmaIterator, a
 	pma.file.(*pgalloc.MemoryFile).MarkDirtyBy(pgalloc.DirtyMarkWriteProtectFault, pseg.fileRange())
 	mm.dirtyThrottle.dirtied.Add(uint64(pseg.Range().Length()))
 	return pseg
+}
+
+// Dirty attribution (a measurement build's, while
+// pgalloc.LoggingDirtyAttribution).
+
+// DirtyAttributionEntry is what writes disarmed in one vma since dirty tracking
+// was last armed.
+type DirtyAttributionEntry struct {
+	// Start and End are the vma's bounds when it was first written.
+	Start, End hostarch.Addr
+
+	// Perms are the vma's permissions, as /proc/[pid]/maps shows them.
+	Perms string
+
+	// Name is the vma's name, its mapped file's path or "" for anonymous
+	// memory, as /proc/[pid]/maps shows it; "[stack]" for a stack.
+	Name string
+
+	// Bytes is the number of bytes disarmed.
+	Bytes uint64
+}
+
+// recordDirtyAttributionLocked counts n bytes disarmed in the vma vseg.
+//
+// Preconditions: mm.activeMu must be locked for writing; mm.mappingMu must be
+// locked.
+func (mm *MemoryManager) recordDirtyAttributionLocked(ctx context.Context, vseg vmaIterator, n uint64) {
+	if mm.dirtyAttribution == nil {
+		mm.dirtyAttribution = make(map[hostarch.Addr]*DirtyAttributionEntry)
+	}
+	e, ok := mm.dirtyAttribution[vseg.Start()]
+	if !ok {
+		vma := vseg.ValuePtr()
+		e = &DirtyAttributionEntry{Start: vseg.Start(), End: vseg.End(), Perms: vma.realPerms.String()}
+		switch {
+		case vma.name != "":
+			e.Name = vma.name
+		case vma.id != nil:
+			e.Name = vma.id.MappedName(ctx)
+		case vma.growsDown || vma.isStack:
+			e.Name = "[stack]"
+		}
+		if vma.private {
+			e.Perms += "p"
+		} else {
+			e.Perms += "s"
+		}
+		mm.dirtyAttribution[vseg.Start()] = e
+	}
+	e.Bytes += n
+}
+
+// TakeDirtyAttribution returns what writes disarmed in each vma of mm since
+// the last call, largest first, and their total, and starts counting anew.
+func (mm *MemoryManager) TakeDirtyAttribution() ([]DirtyAttributionEntry, uint64) {
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	var total uint64
+	entries := make([]DirtyAttributionEntry, 0, len(mm.dirtyAttribution))
+	for _, e := range mm.dirtyAttribution {
+		entries = append(entries, *e)
+		total += e.Bytes
+	}
+	mm.dirtyAttribution = nil
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Bytes > entries[j].Bytes })
+	return entries, total
 }
 
 // Dirty rate limiting.
