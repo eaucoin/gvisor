@@ -1460,6 +1460,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	if ws := opts.Image.GetWorkingSet(); opts.WorkingSet && ws != nil && opts.Prefetch != PrefetchOff {
 		loads.setPrefetch(ws, pb.Extents)
 	}
+	if logAwaitedLoads.Load() {
+		f.ws.setImage(pb.Extents)
+	}
 	// Let each layer's loader read the pages it holds in pages file order.
 	for _, amfl := range loads.amfls {
 		if amfl != nil {
