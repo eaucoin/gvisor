@@ -826,6 +826,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if err := k.invalidateUnsavableMappings(ctx); err != nil {
 		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
 	}
+	log.Infof("Unsavable mappings invalidated in [%s].", time.Since(saveStart))
 
 	// Capture all private memory files.
 	mfsToSave := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
