@@ -692,8 +692,8 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 			prefetch = pgalloc.PrefetchOff
 		}
 		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), kernel.AsyncMFLoaderOpts{
-			Trace:    cm.l.root.conf.AsyncLoadTrace,
-			Throttle: cm.l.root.conf.AsyncLoadThrottle && o.Background,
+			Trace:    cm.l.root.conf.AsyncLoadTrace == "all",
+			Throttle: cm.l.root.conf.AsyncLoadThrottle == "until-kernel-loaded" && o.Background,
 		}) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")

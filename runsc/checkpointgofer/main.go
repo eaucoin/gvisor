@@ -313,7 +313,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		PagesFileReadParallel:   opts.ReadParallel,
 		PagesFilePartBytes:      opts.WritePartBytes,
 		PagesFileWriteParallel:  opts.WriteParallel,
-		Trace:                   conf.AsyncLoadTrace,
+		Trace:                   conf.AsyncLoadTrace == "all",
 		HedgePercentile:         conf.CheckpointGoferHedgePercentile,
 		CacheDir:                conf.CheckpointGoferCacheDir,
 		PagesCompression:        conf.CheckpointGoferPagesCompression,

@@ -492,14 +492,14 @@ type Config struct {
 	// saved in the image before the rest of its memory.
 	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
 
-	// AsyncLoadTrace logs every read of a restore's async page loader as it
-	// completes, and every GET of the S3 checkpoint gofer.
-	AsyncLoadTrace bool `flag:"async-load-trace"`
+	// AsyncLoadTrace, if "all", logs every read of a restore's async page
+	// loader as it completes, and every GET of the S3 checkpoint gofer.
+	AsyncLoadTrace string `flag:"async-load-trace"`
 
-	// AsyncLoadThrottle keeps a restore's async page loader at one background
-	// read of each pages file in flight until the kernel is loaded, as
-	// upstream's background restores do.
-	AsyncLoadThrottle bool `flag:"async-load-throttle"`
+	// AsyncLoadThrottle, if "until-kernel-loaded", keeps a restore's async
+	// page loader at one background read of each pages file in flight until
+	// the kernel is loaded, as upstream's background restores do.
+	AsyncLoadThrottle string `flag:"async-load-throttle"`
 
 	// CheckpointGoferHedgePercentile, if not 0, has the S3 checkpoint gofer
 	// make a GET of a pages file again on another connection when the store
