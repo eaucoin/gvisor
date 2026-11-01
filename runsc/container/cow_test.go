@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -118,36 +119,43 @@ func TestCheckpointCoWAB(t *testing.T) {
 	}
 }
 
-// savePauses returns the lines of the boot logs of the sandboxes started
-// since start in which they say how their checkpoints paused them and took
-// their save points.
+// savePauses returns the lines that the sandboxes' boot logs wrote since
+// start in which they say how their checkpoints paused them and took their
+// save points.
 func savePauses(t *testing.T, start time.Time) []string {
+	return bootLogSince(t, start, "paused for", "Save point taken", "pre-armed", "Dirty tracking: armed", "Kernel save took", "copy-on-write save copied in", "pages written")
+}
+
+// bootLogSince returns the lines that the sandboxes' boot logs wrote since
+// start and that hold one of whats, without their prefix.
+func bootLogSince(t *testing.T, start time.Time, whats ...string) []string {
 	t.Helper()
 	logs, err := filepath.Glob(filepath.Join(os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"), "*boot*"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Log names hold the time their runsc started (specutils.DebugLogFile).
-	since := start.Format("20060102-150405.000000")
+	// Lines start as "I1101 11:30:34.109107": the month, day and time, of
+	// the local time zone.
+	since := start.Format("0102 15:04:05.000000")
 	var said []string
 	for _, path := range logs {
-		name := filepath.Base(path)
-		if i := strings.Index(name, ".boot"); i < len(since) || name[i-len(since):i] < since {
-			continue
-		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, line := range strings.Split(string(data), "\n") {
-			for _, what := range []string{"paused for", "Save point taken", "pre-armed", "Dirty tracking: armed", "Kernel save took", "copy-on-write save copied in", "pages written"} {
+			if len(line) < 1+len(since) || line[1:1+len(since)] < since {
+				continue
+			}
+			for _, what := range whats {
 				if strings.Contains(line, what) {
-					said = append(said, line[strings.Index(line, "]")+2:])
+					said = append(said, line[1:1+len(since)]+" "+line[strings.Index(line, "]")+2:])
 					break
 				}
 			}
 		}
 	}
+	slices.Sort(said)
 	return said
 }
 

@@ -141,31 +141,8 @@ func TestCheckpointPrecopyWriters(t *testing.T) {
 	}
 }
 
-// precopySaid returns the lines of the boot logs of the sandboxes started
-// since start that tell a pre-copy's rounds and its save's pause.
+// precopySaid returns the lines that the sandboxes' boot logs wrote since
+// start that tell a pre-copy's rounds and its save's pause.
 func precopySaid(t *testing.T, start time.Time) []string {
-	t.Helper()
-	logs, err := filepath.Glob(filepath.Join(os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"), "*boot*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var said []string
-	for _, path := range logs {
-		if st, err := os.Stat(path); err != nil || st.ModTime().Before(start) {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			for _, what := range []string{"Pre-copy round", "Pre-copy done", "Pre-copy: limiting", "Pre-copy: tasks were kept", "paused for", "Kernel save took", "Memory files save took"} {
-				if strings.Contains(line, what) {
-					said = append(said, line[strings.Index(line, "]")+2:])
-					break
-				}
-			}
-		}
-	}
-	return said
+	return bootLogSince(t, start, "Pre-copy round", "Pre-copy done", "Pre-copy: limiting", "Pre-copy: tasks were kept", "paused for", "Kernel save took", "Memory files save took")
 }
