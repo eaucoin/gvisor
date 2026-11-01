@@ -57,6 +57,7 @@ go_test(
         "metric_server_test.go",
         "multi_container_test.go",
         "precopy_test.go",
+        "precopy_writers_test.go",
         "shared_volume_test.go",
         "trace_test.go",
         "write_errors_test.go",
