@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -46,7 +47,7 @@ func (recordingPlatform) NewAddressSpace() (platform.AddressSpace, error) {
 
 // dirtyTestMM returns a MemoryManager whose AddressSpace records mappings,
 // over the MemoryFile of ctx, with dirty tracking enabled on it.
-func dirtyTestMM(t *testing.T, ctx context.Context) (*MemoryManager, *recordingAddressSpace) {
+func dirtyTestMM(t testing.TB, ctx context.Context) (*MemoryManager, *recordingAddressSpace) {
 	t.Helper()
 	p := recordingPlatform{platform.FromContext(ctx)}
 	mf := pgalloc.MemoryFileFromContext(ctx)
@@ -68,7 +69,7 @@ func dirtyTestMM(t *testing.T, ctx context.Context) (*MemoryManager, *recordingA
 }
 
 // mmap maps n anonymous pages in mm.
-func mmap(t *testing.T, ctx context.Context, mm *MemoryManager, n uint64, private bool) hostarch.AddrRange {
+func mmap(t testing.TB, ctx context.Context, mm *MemoryManager, n uint64, private bool) hostarch.AddrRange {
 	t.Helper()
 	addr, err := mm.MMap(ctx, memmap.MMapOpts{
 		Length:   n * hostarch.PageSize,
@@ -530,5 +531,74 @@ func TestDirtyThrottleDelay(t *testing.T) {
 	copyOut(t, ctx, mm, page(ar, 10), 6*hostarch.PageSize)
 	if d := mm.DirtyThrottleDelay(limit, 2, 125*ms); d != 0 {
 		t.Errorf("first delay of a new session: got %v, want 0", d)
+	}
+}
+
+// BenchmarkFirstWrite measures a first write to write-protected memory: the
+// fault that disarms its unit, alone and with the copy that a copy-on-write
+// save makes of the unit before the write (pgalloc's cow.go), at the default
+// unit and at a huge page's. Each operation is the fault of one unit; the
+// AddressSpace only records mappings, so the fault is the Sentry's part of it.
+func BenchmarkFirstWrite(b *testing.B) {
+	const size = 64 << 20
+	for _, unit := range []uint64{DefaultDirtyTrackingUnit, hostarch.HugePageSize} {
+		for _, cow := range []bool{false, true} {
+			b.Run(fmt.Sprintf("unit=%dK/cow=%v", unit>>10, cow), func(b *testing.B) {
+				ctx := contexttest.Context(b)
+				mm, _ := dirtyTestMM(b, ctx)
+				ar := mmap(b, ctx, mm, size/hostarch.PageSize, true /* private */)
+				if _, err := mm.CopyOut(ctx, ar.Start, bytes.Repeat([]byte{1}, size), usermem.IOOpts{}); err != nil {
+					b.Fatalf("CopyOut: %v", err)
+				}
+				// Units are aligned to their size, as disarming aligns them.
+				base := (ar.Start + hostarch.Addr(unit) - 1) &^ hostarch.Addr(unit-1)
+				units := uint64(ar.End-base) / unit
+				// arm starts an epoch, and a copy-on-write save whose save
+				// point is its start.
+				arm := func() {
+					mm.mf.CancelCoWSave()
+					mm.ArmDirtyTracking(unit)
+					mm.mf.SwapDirty(true /* paused */)
+					if cow {
+						if err := mm.mf.FreezeForCoWSave(&pgalloc.SaveOpts{PageHashes: true}, nil, pgalloc.CoWOpts{StagingMax: math.MaxUint64}); err != nil {
+							b.Fatalf("FreezeForCoWSave: %v", err)
+						}
+					}
+				}
+				b.Cleanup(mm.mf.CancelCoWSave)
+				b.SetBytes(int64(unit))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					u := uint64(i) % units
+					if u == 0 {
+						b.StopTimer()
+						arm()
+						b.StartTimer()
+					}
+					if err := mm.HandleUserFault(ctx, base+hostarch.Addr(u*unit), hostarch.Write, 0); err != nil {
+						b.Fatalf("HandleUserFault: %v", err)
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(unit/hostarch.PageSize), "ns/page")
+			})
+		}
+	}
+}
+
+// BenchmarkUnitCopy measures the copy of a unit of memory into a new buffer,
+// the part of a copy-on-write save's capture that its size decides.
+func BenchmarkUnitCopy(b *testing.B) {
+	for _, unit := range []int{DefaultDirtyTrackingUnit, hostarch.HugePageSize} {
+		b.Run(fmt.Sprintf("unit=%dK", unit>>10), func(b *testing.B) {
+			src := bytes.Repeat([]byte{1}, 64<<20)
+			units := len(src) / unit
+			b.SetBytes(int64(unit))
+			for i := 0; i < b.N; i++ {
+				u := i % units
+				dst := make([]byte, unit)
+				copy(dst, src[u*unit:])
+			}
+		})
 	}
 }
