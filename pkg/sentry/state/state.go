@@ -145,6 +145,12 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		log.Infof("Before save wall time: %s", wt.String())
 	}
 
+	if opts.Precopy != nil && k.CoWSaveApplies(opts.Resume, opts.PagesMetadata, opts.PagesFile, nil /* precopy */, opts.FSSaveOpts) {
+		// The pause of a copy-on-write save does not write memory: there is
+		// nothing for a pre-copy to take out of it.
+		log.Infof("Copy-on-write save: no pre-copy.")
+		opts.Precopy = nil
+	}
 	var precopy *kernel.Precopy
 	if opts.Precopy != nil {
 		if opts.PagesFile == nil {
