@@ -59,12 +59,18 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/release"
           make copy BAZEL_OPTIONS=--keep_going TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
           "${RUNNER_TEMP}/release/runsc" --version
+      # Kept whatever the tests after say, for the engine A/B.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+          retention-days: 7
       - name: Smoke test, graph engine (upstream's default)
         run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
       - name: Smoke test, wire engine
         run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --state-engine=wire
       - name: Build runsc/container's tests
-        run: make build TARGETS=//runsc/container:container_test
+        run: make build BAZEL_OPTIONS=--keep_going TARGETS=//runsc/container:container_test
       - name: Affected tests
         run: |
           tools/fork/affected_tests.sh "${{ steps.base.outputs.base }}" >/tmp/affected.query
@@ -97,11 +103,6 @@ jobs:
         with:
           path: /home/runner/.cache/bazel/disk
           key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-${{ github.sha }}
-          path: ${{ runner.temp }}/release
-          retention-days: 7
 
   checks:
     name: Lint, license headers and documentation links
