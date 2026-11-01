@@ -531,6 +531,12 @@ type Config struct {
 	// debugging.
 	AsyncLoadTrace AsyncLoadTrace `flag:"async-load-trace"`
 
+	// AsyncAwaitsTrace is whether a measurement build logs each await of pages
+	// that async page loading has not loaded yet, the Sentry's internal
+	// mappings of whole pmas of 1 MiB or more, which task each goroutine runs,
+	// and the first touches of a working set being recorded.
+	AsyncAwaitsTrace AsyncAwaitsTrace `flag:"async-awaits-trace"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -2383,6 +2389,56 @@ func (t AsyncLoadTrace) String() string {
 		return "all"
 	default:
 		panic(fmt.Sprintf("invalid async load trace %d", t))
+	}
+}
+
+// AsyncAwaitsTrace is whether a measurement build traces what a restored
+// sandbox awaits of async page loading.
+type AsyncAwaitsTrace int
+
+// AsyncAwaitsTrace values.
+const (
+	// AsyncAwaitsTraceOff logs nothing more.
+	AsyncAwaitsTraceOff AsyncAwaitsTrace = iota
+
+	// AsyncAwaitsTraceLog logs awaits, whole internal mappings, tasks'
+	// goroutines and working sets' first touches.
+	AsyncAwaitsTraceLog
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (t *AsyncAwaitsTrace) Set(v string) error {
+	switch v {
+	case "off":
+		*t = AsyncAwaitsTraceOff
+	case "log":
+		*t = AsyncAwaitsTraceLog
+	default:
+		return fmt.Errorf("invalid async awaits trace %q: must be off or log", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `t`.
+// Useful in flag declaration line.
+func (t AsyncAwaitsTrace) Ptr() *AsyncAwaitsTrace {
+	return &t
+}
+
+// Get implements flag.Get.
+func (t *AsyncAwaitsTrace) Get() any {
+	return *t
+}
+
+// String implements flag.String.
+func (t AsyncAwaitsTrace) String() string {
+	switch t {
+	case AsyncAwaitsTraceOff:
+		return "off"
+	case AsyncAwaitsTraceLog:
+		return "log"
+	default:
+		panic(fmt.Sprintf("invalid async awaits trace %d", t))
 	}
 }
 

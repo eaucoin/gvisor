@@ -14,6 +14,21 @@
 
 package pgalloc
 
-// If logAwaitedLoads is true, events relevant to awaited async page loads will
-// be logged at level Info.
-const logAwaitedLoads = false
+import "gvisor.dev/gvisor/pkg/atomicbitops"
+
+// If logAwaitedLoads is true, events relevant to awaited async page loads, and
+// the first touches of a working set being recorded, are logged at level Info.
+// runsc sets it from --async-awaits-trace=log, before any MemoryFile loads.
+var logAwaitedLoads atomicbitops.Bool
+
+// SetLogAwaitedLoads sets whether events relevant to awaited async page loads,
+// and the first touches of a working set being recorded, are logged.
+func SetLogAwaitedLoads(enabled bool) {
+	logAwaitedLoads.Store(enabled)
+}
+
+// LoggingAwaitedLoads returns true if events relevant to awaited async page
+// loads are logged, so that their users can log what they await.
+func LoggingAwaitedLoads() bool {
+	return logAwaitedLoads.Load()
+}

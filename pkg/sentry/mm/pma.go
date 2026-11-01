@@ -1065,7 +1065,8 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 
 // getInternalMappingsLocked returns internal mappings for addresses in ar.
 // Unless pseg.internalMappingsUncached(), it caches internal mappings for the
-// whole pma in pseg.ValuePtr().internalMappings. The generated iterator
+// whole pma in pseg.ValuePtr().internalMappings. It records ar, not the whole
+// pma, as touched in a working set being recorded. The generated iterator
 // identifies a set node and index, not its MemoryManager, so checklocks cannot
 // name the owning mutex.
 //
@@ -1076,7 +1077,8 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
 	if pma.internalMappings.IsEmpty() && !pseg.internalMappingsUncached() {
-		ims, err := pseg.internalMappingsOfLocked(pseg.Range())
+		logWholeInternalMapping(pseg, ar)
+		ims, err := pseg.mapInternalLocked(pseg.Range())
 		if err != nil {
 			return safemem.BlockSeq{}, err
 		}
@@ -1087,7 +1089,8 @@ func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safeme
 
 // internalMappingsOfLocked returns internal mappings for addresses in ar,
 // from pseg.ValuePtr().internalMappings if it is non-empty and from
-// memmap.File.MapInternal otherwise.
+// memmap.File.MapInternal otherwise, and records ar as touched in a working
+// set being recorded.
 //
 // Preconditions:
 //   - The owning MemoryManager's activeMu is locked.
@@ -1095,9 +1098,30 @@ func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safeme
 //   - ar.Length() != 0.
 func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
-	if !pma.internalMappings.IsEmpty() {
-		return pma.internalMappings.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length())), nil
+	ims := pma.internalMappings
+	if ims.IsEmpty() {
+		var err error
+		if ims, err = pseg.mapInternalLocked(ar); err != nil {
+			return safemem.BlockSeq{}, err
+		}
+	} else {
+		ims = ims.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length()))
 	}
+	if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
+		mf.RecordTouch(pseg.fileRangeOf(ar))
+	}
+	return ims, nil
+}
+
+// mapInternalLocked returns internal mappings for addresses in ar, from
+// memmap.File.MapInternal, recording nothing as touched.
+//
+// Preconditions:
+//   - The owning MemoryManager's activeMu is locked.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
+func (pseg pmaIterator) mapInternalLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
+	pma := pseg.ValuePtr()
 	// This must use maxPerms (instead of perms) because some permission
 	// constraints are only visible to vmas; for example, mappings of read-only
 	// files have vma.maxPerms.Write unset, but this may not be visible to the
@@ -1107,7 +1131,8 @@ func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem
 	perms.Execute = false
 	if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
 		// Writes through pmas are tracked by arming them (dirty.go), not by
-		// marking the pages whose internal mappings are obtained.
+		// marking the pages whose internal mappings are obtained, and
+		// touches by the accesses through them (internalMappingsOfLocked).
 		return mf.MapInternalUntracked(pseg.fileRangeOf(ar), perms)
 	}
 	return pma.file.MapInternal(pseg.fileRangeOf(ar), perms)

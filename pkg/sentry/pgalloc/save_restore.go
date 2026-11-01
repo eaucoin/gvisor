@@ -2925,7 +2925,7 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 				default:
 				}
 			}
-			if logAwaitedLoads {
+			if logAwaitedLoads.Load() {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
 			}
 		}
@@ -2947,6 +2947,9 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 	}
 	apfl.numWaiters++
 	apfl.totalWaiters++
+	if logAwaitedLoads.Load() {
+		log.Infof("MemoryFile(%p): awaitLoad goid %d awaits %v (%d bytes, %d of them unloaded)", amfl.f, goid.Get(), fr, fr.Length(), w.pending)
+	}
 	return w, nil
 }
 
@@ -2956,11 +2959,8 @@ func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, er
 // be loaded and returns linuxerr.EINTR. Either way, w is no longer reachable
 // by the loader when finishAwait returns.
 func (amfl *asyncMemoryFileLoad) finishAwait(w *aplWaiter) error {
-	if logAwaitedLoads {
-		log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), w.fr, w.fr.Length())
-	}
 	w.wakeup.WaitAndAckAll()
-	if logAwaitedLoads {
+	if logAwaitedLoads.Load() {
 		waitNS := aplNanotime() - w.timeStart
 		log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), w.fr, w.fr.Length())
 	}
@@ -3106,7 +3106,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
 	}
-	if logAwaitedLoads && !op.background {
+	if logAwaitedLoads.Load() && !op.background {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}
 }
@@ -3702,7 +3702,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					}
 				}
 			}
-			if logAwaitedLoads && haveWaiters {
+			if logAwaitedLoads.Load() && haveWaiters {
 				log.Infof("MemoryFile(%p): awaited opid %d complete, read %d bytes: %v", op.amfl.f, c.ID, op.total, op.frs)
 			}
 			// Keep amfl.minUnloaded up to date. We can only determine this

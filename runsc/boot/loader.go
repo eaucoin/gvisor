@@ -837,6 +837,8 @@ func New(args Args) (*Loader, error) {
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
 	}
 
+	pgalloc.SetLogAwaitedLoads(args.Conf.AsyncAwaitsTrace == config.AsyncAwaitsTraceLog)
+
 	// Create kernel and platform.
 	if err := l.setUpDirtyTracking(args.Conf); err != nil {
 		return nil, err

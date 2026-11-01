@@ -16,9 +16,11 @@ package pgalloc
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -90,6 +92,11 @@ type workingSet struct {
 	// adjacent.
 	extents []memmap.FileRange
 
+	// touches are, while logAwaitedLoads, the bytes of units first touched by
+	// each goroutine in each millisecond since start, in order, which
+	// stopLocked logs.
+	touches []workingSetTouch
+
 	// set is the latest working set: recorded after the last restore, or, if
 	// none was, carried by the image restored.
 	set *pgallocpb.WorkingSetProto
@@ -132,6 +139,7 @@ func (f *MemoryFile) StartWorkingSetRecording(unit uint64, window time.Duration)
 	ws.start = time.Now()
 	ws.seen = nil
 	ws.extents = nil
+	ws.touches = nil
 	ws.gen++
 	gen := ws.gen
 	ws.recording.Store(true)
@@ -182,6 +190,12 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 	if !ws.recording.Load() {
 		return
 	}
+	added := uint64(0)
+	defer func() {
+		if added != 0 && logAwaitedLoads.Load() {
+			ws.traceLocked(added)
+		}
+	}()
 	for u := fr.Start / ws.unit; u < (fr.End+ws.unit-1)/ws.unit; u++ {
 		word, bit := u/64, uint64(1)<<(u%64)
 		if word >= uint64(len(ws.seen)) {
@@ -191,6 +205,7 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 			continue
 		}
 		ws.seen[word] |= bit
+		added += ws.unit
 		start := u * ws.unit
 		if n := len(ws.extents); n != 0 && ws.extents[n-1].End == start {
 			ws.extents[n-1].End += ws.unit
@@ -199,9 +214,46 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 		if len(ws.extents) == maxWorkingSetExtents {
 			log.Infof("MemoryFile(%p): the working set reached %d extents after %v", f, maxWorkingSetExtents, time.Since(ws.start))
 			ws.stopLocked()
+			added = 0
 			return
 		}
 		ws.extents = append(ws.extents, memmap.FileRange{Start: start, End: start + ws.unit})
+	}
+}
+
+// workingSetTouch is the bytes of units that a goroutine touched first in a
+// millisecond of a working set's recording.
+type workingSetTouch struct {
+	ms    int64
+	goid  int64
+	bytes uint64
+}
+
+// traceLocked adds bytes, of units that the calling goroutine touched first
+// now, to ws.touches.
+//
+// Preconditions: ws.mu must be locked.
+func (ws *workingSet) traceLocked(bytes uint64) {
+	t := workingSetTouch{ms: time.Since(ws.start).Milliseconds(), goid: goid.Get(), bytes: bytes}
+	if n := len(ws.touches); n != 0 && ws.touches[n-1].ms == t.ms && ws.touches[n-1].goid == t.goid {
+		ws.touches[n-1].bytes += bytes
+		return
+	}
+	ws.touches = append(ws.touches, t)
+}
+
+// logTouchesLocked logs ws.touches, as ms:goid:bytes, in lines of at most
+// touchesPerLine.
+//
+// Preconditions: ws.mu must be locked.
+func (ws *workingSet) logTouchesLocked() {
+	const touchesPerLine = 256
+	for i := 0; i < len(ws.touches); i += touchesPerLine {
+		var b strings.Builder
+		for _, t := range ws.touches[i:min(i+touchesPerLine, len(ws.touches))] {
+			fmt.Fprintf(&b, " %d:%d:%d", t.ms, t.goid, t.bytes)
+		}
+		log.Infof("Working set first touches %d-%d of %d since %s (ms:goid:bytes):%s", i, min(i+touchesPerLine, len(ws.touches))-1, len(ws.touches), ws.start.UTC().Format(time.RFC3339Nano), b.String())
 	}
 }
 
@@ -243,9 +295,11 @@ func (ws *workingSet) stopLocked() {
 		}
 		ws.set = set
 	}
+	ws.logTouchesLocked()
 	ws.restored = nil
 	ws.seen = nil
 	ws.extents = nil
+	ws.touches = nil
 }
 
 // coverageLocked returns the number of bytes touched, of those that the

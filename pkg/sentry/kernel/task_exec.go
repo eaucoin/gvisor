@@ -392,6 +392,7 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	oldImage := t.image
 	t.image = *r.image
 	t.mu.Unlock()
+	t.logGoroutine("execs")
 
 	// Don't hold t.mu while calling t.image.release(), that may
 	// attempt to acquire TaskImage.MemoryManager.mappingMu, a lock order
