@@ -99,7 +99,8 @@ cleanup() {
     on_node kubectl -n "${NS}" get pods -o wide >&2 || true
     on_node kubectl -n "${NS}" get events --sort-by=.lastTimestamp >&2 || true
     on_node sh -c 'find /var/log/runsc -name "*.boot.txt" -exec tail -n 30 {} +' >&2 || true
-    on_node sh -c 'tail -n 60 /var/log/runsc/shim/*.log' >&2 || true
+    on_node sh -c 'grep -h -i -E "standby|Start, id|Kill, id|exit" /var/log/runsc/shim/*.log | tr -d "\\000" | sort | tail -n 80' >&2 || true
+    sudo dmesg | tail -n 30 >&2 || true
     on_node tail -n 80 /var/lib/rancher/k3s/agent/containerd/containerd.log >&2 || true
     sudo docker logs --tail 50 "${NODE}" >&2 || true
   fi

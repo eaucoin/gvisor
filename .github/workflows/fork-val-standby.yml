@@ -1,4 +1,4 @@
-# Spike, not for main: the kernel-standby validation's restores into standby
+# Spike, not for main (named fork-* so that fork-integrate.yml leaves it enabled): the kernel-standby validation's restores into standby
 # sandboxes (the endpoint package's E15), on every push of a spike/val-standby
 # branch: runsc and its shim built as tier 1 builds them, the shim's tests, and
 # tools/fork/standby_test.sh, whose times are kept as an artifact.

@@ -15,6 +15,7 @@
 package runsc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -252,7 +253,15 @@ func (srv *standbyServer) watch() {
 		if n == 0 {
 			continue
 		}
-		log.L.Infof("Standby sandbox (PID %d) exited before a restore into it (poll events %#x)", srv.pid, fds[0].Revents)
+		state, alive := processState(srv.pid)
+		if alive {
+			// Seen while the sandbox execs itself early in its boot, from a
+			// thread other than its leader: keep watching.
+			log.L.Warningf("Standby sandbox (PID %d) polled exited (events %#x) but is alive (%s)", srv.pid, fds[0].Revents, state)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		log.L.Infof("Standby sandbox (PID %d) exited before a restore into it (events %#x, %s)", srv.pid, fds[0].Revents, state)
 		srv.close()
 		for _, c := range srv.s.createdContainers() {
 			if c.takeStandby() != nil {
@@ -261,6 +270,22 @@ func (srv *standbyServer) watch() {
 		}
 		return
 	}
+}
+
+// processState returns the state of the process pid, as /proc/pid/stat says
+// it, and whether it is alive: neither a zombie nor gone.
+func processState(pid int) (string, bool) {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return err.Error(), false
+	}
+	// The state follows the command, which is in parentheses.
+	i := bytes.LastIndexByte(stat, ')')
+	if i < 0 || i+2 >= len(stat) {
+		return string(stat), false
+	}
+	state := stat[i+2]
+	return fmt.Sprintf("state %c", state), state != 'Z' && state != 'X'
 }
 
 // killStandby kills the container c of a standby, which runs nothing: the
