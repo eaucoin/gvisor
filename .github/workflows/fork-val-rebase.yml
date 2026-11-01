@@ -57,7 +57,7 @@ jobs:
       - name: Build the release binaries
         run: |
           mkdir -p "${RUNNER_TEMP}/release"
-          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          make copy BAZEL_OPTIONS=--keep_going TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
           "${RUNNER_TEMP}/release/runsc" --version
       - name: Smoke test, graph engine (upstream's default)
         run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"

@@ -21,7 +21,7 @@ import (
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/pkg/cpuid"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
@@ -105,7 +105,7 @@ func checkHost(state map[string]string) error {
 		return fmt.Errorf("saved by runsc %q, this is runsc %q", got, want)
 	}
 	if p := state[boot.PlatformKey]; p != "" {
-		c, err := platform.Lookup(p)
+		c, err := platformdesc.Lookup(p)
 		if err != nil {
 			return fmt.Errorf("platform %q: %w", p, err)
 		}
