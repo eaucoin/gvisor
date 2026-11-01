@@ -492,6 +492,18 @@ type Config struct {
 	// saved in the image before the rest of its memory.
 	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
 
+	// AsyncAwaitsTrace is whether a measurement build logs each await of pages
+	// that async page loading has not loaded yet, the Sentry's internal
+	// mappings of whole pmas of 1 MiB or more, which task each goroutine runs,
+	// and the first touches of a working set being recorded.
+	AsyncAwaitsTrace AsyncAwaitsTrace `flag:"async-awaits-trace"`
+
+	// AsyncLoadInternalMappings is whether the internal mappings of pmas
+	// larger than 32 MiB are cached while async page loading is in progress,
+	// which awaits the whole pma, or not, so that each Sentry access to them
+	// awaits only the pages it accesses.
+	AsyncLoadInternalMappings AsyncLoadInternalMappings `flag:"async-load-internal-mappings"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -2045,6 +2057,107 @@ func (p WorkingSetPrefetch) String() string {
 		return "off"
 	default:
 		panic(fmt.Sprintf("invalid working set prefetch policy %d", p))
+	}
+}
+
+// AsyncAwaitsTrace is whether a measurement build traces what a restored
+// sandbox awaits of async page loading.
+type AsyncAwaitsTrace int
+
+// AsyncAwaitsTrace values.
+const (
+	// AsyncAwaitsTraceOff logs nothing more.
+	AsyncAwaitsTraceOff AsyncAwaitsTrace = iota
+
+	// AsyncAwaitsTraceLog logs awaits, whole internal mappings, tasks'
+	// goroutines and working sets' first touches.
+	AsyncAwaitsTraceLog
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (t *AsyncAwaitsTrace) Set(v string) error {
+	switch v {
+	case "off":
+		*t = AsyncAwaitsTraceOff
+	case "log":
+		*t = AsyncAwaitsTraceLog
+	default:
+		return fmt.Errorf("invalid async awaits trace %q: must be off or log", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `t`.
+// Useful in flag declaration line.
+func (t AsyncAwaitsTrace) Ptr() *AsyncAwaitsTrace {
+	return &t
+}
+
+// Get implements flag.Get.
+func (t *AsyncAwaitsTrace) Get() any {
+	return *t
+}
+
+// String implements flag.String.
+func (t AsyncAwaitsTrace) String() string {
+	switch t {
+	case AsyncAwaitsTraceOff:
+		return "off"
+	case AsyncAwaitsTraceLog:
+		return "log"
+	default:
+		panic(fmt.Sprintf("invalid async awaits trace %d", t))
+	}
+}
+
+// AsyncLoadInternalMappings is how the Sentry maps large pmas internally while
+// their pages load asynchronously.
+type AsyncLoadInternalMappings int
+
+// AsyncLoadInternalMappings values.
+const (
+	// AsyncLoadInternalMappingsCached maps and caches the whole pma, which
+	// awaits all of its pages.
+	AsyncLoadInternalMappingsCached AsyncLoadInternalMappings = iota
+
+	// AsyncLoadInternalMappingsUncached maps the range accessed alone, which
+	// awaits its pages only, without caching it.
+	AsyncLoadInternalMappingsUncached
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (m *AsyncLoadInternalMappings) Set(v string) error {
+	switch v {
+	case "cached":
+		*m = AsyncLoadInternalMappingsCached
+	case "uncached":
+		*m = AsyncLoadInternalMappingsUncached
+	default:
+		return fmt.Errorf("invalid async load internal mappings %q: must be cached or uncached", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `m`.
+// Useful in flag declaration line.
+func (m AsyncLoadInternalMappings) Ptr() *AsyncLoadInternalMappings {
+	return &m
+}
+
+// Get implements flag.Get.
+func (m *AsyncLoadInternalMappings) Get() any {
+	return *m
+}
+
+// String implements flag.String.
+func (m AsyncLoadInternalMappings) String() string {
+	switch m {
+	case AsyncLoadInternalMappingsCached:
+		return "cached"
+	case AsyncLoadInternalMappingsUncached:
+		return "uncached"
+	default:
+		panic(fmt.Sprintf("invalid async load internal mappings %d", m))
 	}
 }
 

@@ -101,6 +101,7 @@ go_library(
         "//pkg/sentry/kernel/version",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader",
+        "//pkg/sentry/mm",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/platform",

@@ -17,6 +17,7 @@ package mm
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -580,5 +581,40 @@ func TestMRemapMappableOffsetOverflow(t *testing.T) {
 	// We remap with oldSize = PageSize, newSize = 3*PageSize.
 	if _, err := mm.MRemap(ctx, addr, hostarch.PageSize, 3*hostarch.PageSize, MRemapOpts{}); !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Errorf("MRemap grow got err %v want EINVAL", err)
+	}
+}
+
+// TestInternalAccessRecordsAccessedRange checks that an access through the
+// internal mappings of a pma records, in the working set of its MemoryFile,
+// the units that it accesses rather than the whole pma that it maps.
+func TestInternalAccessRecordsAccessedRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	const length = 64 << 20
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   length,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+
+	const unit = 64 << 10
+	mm.mf.StartWorkingSetRecording(unit, time.Hour)
+	// The access allocates a pma of a hugepage or more and maps all of it.
+	if _, err := mm.CopyOut(ctx, addr+length/2, bytes.Repeat([]byte{'A'}, hostarch.PageSize), usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyOut got err %v want nil", err)
+	}
+	mm.mf.StopWorkingSetRecording()
+	var touched uint64
+	for _, extent := range mm.mf.WorkingSet().GetExtents() {
+		touched += extent.GetEnd() - extent.GetStart()
+	}
+	if touched != unit {
+		t.Errorf("working set holds %d bytes after a %d-byte access, want %d", touched, hostarch.PageSize, unit)
 	}
 }

@@ -467,12 +467,13 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						copyAR = pseg.Range().Intersect(hugeMaskAR)
 					}
 					// Get internal mappings from the pma to copy from.
-					if err := pseg.getInternalMappingsLocked(); err != nil {
+					ims, err := pseg.getInternalMappingsLocked(copyAR)
+					if err != nil {
 						return pstart, pseg.PrevGap(), err
 					}
 					// Copy contents.
 					huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
-					reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, copyAR)}
+					reader := safemem.BlockSeqReader{Blocks: ims}
 					fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
 						Kind:       usage.Anonymous,
 						MemCgID:    memCgID,
@@ -915,6 +916,7 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 	if ar.End <= pseg.End() {
 		// Since only one pma is involved, we can use pma.internalMappings
 		// directly, avoiding a slice allocation.
+		pseg.recordInternalTouch(ar)
 		offset := uint64(ar.Start - pseg.Start())
 		return pseg.ValuePtr().internalMappings.DropFirst64(offset).TakeFirst64(uint64(ar.Length()))
 	}
@@ -922,6 +924,7 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 	var ims []safemem.Block
 	for {
 		pr := pseg.Range().Intersect(ar)
+		pseg.recordInternalTouch(pr)
 		for pims := pseg.ValuePtr().internalMappings.DropFirst64(uint64(pr.Start - pseg.Start())).TakeFirst64(uint64(pr.Length())); !pims.IsEmpty(); pims = pims.Tail() {
 			ims = append(ims, pims.Head())
 		}
@@ -1045,38 +1048,77 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 	return mm.pmas.UpperBoundSegment(addr)
 }
 
-// getInternalMappingsLocked ensures that pseg.ValuePtr().internalMappings is
-// non-empty.
+// getInternalMappingsLocked returns internal mappings for addresses in ar,
+// and records ar as touched in the working set of pseg's MemoryFile, if it
+// records one. Unless pseg.internalMappingsUncached(), it caches internal
+// mappings for the whole pma in pseg.ValuePtr().internalMappings.
 //
-// Preconditions: mm.activeMu must be locked for writing.
-func (pseg pmaIterator) getInternalMappingsLocked() error {
+// Preconditions:
+//   - mm.activeMu must be locked for writing.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
+func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
+	// This must use maxPerms (instead of perms) because some permission
+	// constraints are only visible to vmas; for example, mappings of read-only
+	// files have vma.maxPerms.Write unset, but this may not be visible to the
+	// memmap.Mappable.
+	perms := pma.maxPerms
+	// We will never execute application code through an internal mapping.
+	perms.Execute = false
+	// Writes through pmas of a MemoryFile are tracked by arming them
+	// (dirty.go), not by marking whole pmas whenever their internal mappings
+	// are obtained, and touches are recorded for the range accessed, not the
+	// range mapped.
+	mf, isMF := pma.file.(*pgalloc.MemoryFile)
 	if pma.internalMappings.IsEmpty() {
-		// This must use maxPerms (instead of perms) because some permission
-		// constraints are only visible to vmas; for example, mappings of
-		// read-only files have vma.maxPerms.Write unset, but this may not be
-		// visible to the memmap.Mappable.
-		perms := pma.maxPerms
-		// We will never execute application code through an internal mapping.
-		perms.Execute = false
+		if pseg.internalMappingsUncached() {
+			ims, err := mf.MapInternalUntracked(pseg.fileRangeOf(ar), perms)
+			if err == nil {
+				mf.RecordTouch(pseg.fileRangeOf(ar))
+			}
+			return ims, err
+		}
+		logWholeInternalMapping(pseg, ar)
 		var (
 			ims safemem.BlockSeq
 			err error
 		)
-		if mf, ok := pma.file.(*pgalloc.MemoryFile); ok {
-			// Writes through pmas are tracked by arming them (dirty.go),
-			// not by marking whole pmas whenever their internal mappings
-			// are obtained.
+		if isMF {
 			ims, err = mf.MapInternalUntracked(pseg.fileRange(), perms)
 		} else {
 			ims, err = pma.file.MapInternal(pseg.fileRange(), perms)
 		}
 		if err != nil {
-			return err
+			return safemem.BlockSeq{}, err
 		}
 		pma.internalMappings = ims
 	}
-	return nil
+	if isMF {
+		mf.RecordTouch(pseg.fileRangeOf(ar))
+	}
+	return pma.internalMappings.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length())), nil
+}
+
+// recordInternalTouch records ar, accessed through pseg's cached internal
+// mappings, as touched in the working set of pseg's MemoryFile, if it records
+// one.
+//
+// Preconditions: pseg.Range().IsSupersetOf(ar).
+func (pseg pmaIterator) recordInternalTouch(ar hostarch.AddrRange) {
+	if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok {
+		mf.RecordTouch(pseg.fileRangeOf(ar))
+	}
+}
+
+// internalMappingsUncached returns true if internal mappings for pseg are not
+// cached, so that each access waits only for the async page loading of the
+// pages it accesses rather than of the whole pma: if
+// SetUncachedInternalMappingsWhileLoading(true), for pmas larger than
+// maxCachedAsyncLoadingPMA of a MemoryFile still loading.
+func (pseg pmaIterator) internalMappingsUncached() bool {
+	mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+	return ok && uncachedInternalMappings.Load() && mf.IsAsyncLoading() && pseg.Range().Length() > maxCachedAsyncLoadingPMA
 }
 
 func (pseg pmaIterator) fileRange() memmap.FileRange {

@@ -190,9 +190,10 @@ func (t *Task) Name() string {
 // SetName changes t's name.
 func (t *Task) SetName(name string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.image.Name = name
+	t.mu.Unlock()
 	t.Debugf("Set thread name to %q", name)
+	t.logGoroutine("is named")
 }
 
 // Limits implements context.Context.Limits.

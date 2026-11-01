@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -58,6 +59,7 @@ type taskRunState interface {
 // searching for Task.run()'s argument value.
 func (t *Task) run(threadID uintptr) {
 	t.goid.Store(goid.Get())
+	t.logGoroutine("starts")
 	// Killed before its goroutine was known to killLocked, t's waits for
 	// pages being loaded are cut short here (see Task.killLocked).
 	if t.killed() {
@@ -415,4 +417,13 @@ func (t *Task) Yield() {
 	t.yieldCount.Add(1)
 	t.tg.yieldCount.Add(1)
 	runtime.Gosched()
+}
+
+// logGoroutine logs, while pgalloc.LoggingAwaitedLoads(), which task t's
+// goroutine runs, so that the pages each goroutine awaits can be told by task:
+// when it starts, execs, and is named.
+func (t *Task) logGoroutine(event string) {
+	if pgalloc.LoggingAwaitedLoads() {
+		log.Infof("Task goroutine %d %s: thread %d of thread group %d, %q", t.goid.Load(), event, t.ThreadID(), t.tg.ID(), t.Name())
+	}
 }

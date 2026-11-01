@@ -58,6 +58,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
@@ -755,6 +756,9 @@ func New(args Args) (*Loader, error) {
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
 	}
+
+	pgalloc.SetLogAwaitedLoads(args.Conf.AsyncAwaitsTrace == config.AsyncAwaitsTraceLog)
+	mm.SetUncachedInternalMappingsWhileLoading(args.Conf.AsyncLoadInternalMappings == config.AsyncLoadInternalMappingsUncached)
 
 	// Create kernel and platform.
 	if err := l.setUpDirtyTracking(args.Conf); err != nil {

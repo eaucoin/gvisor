@@ -1500,8 +1500,10 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 }
 
 // MapInternalUntracked is MapInternal, except that it does not mark pages
-// dirty if at.Write is true. It is used by callers that track their writes
-// through the returned mappings themselves.
+// dirty if at.Write is true, nor record them as touched in a working set being
+// recorded. It is used by callers that track their writes through the returned
+// mappings themselves, and record what they touch through them (mm records
+// the range that each access touches, not the whole range that it maps).
 func (f *MemoryFile) MapInternalUntracked(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	return f.mapInternal(fr, at, false /* track */)
 }
@@ -1522,7 +1524,9 @@ func (f *MemoryFile) mapInternal(fr memmap.FileRange, at hostarch.AccessType, tr
 			return safemem.BlockSeq{}, err
 		}
 	}
-	f.RecordTouch(fr)
+	if track {
+		f.RecordTouch(fr)
+	}
 
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
 	if chunks == 1 {
