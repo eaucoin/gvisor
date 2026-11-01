@@ -86,6 +86,7 @@ def _syscall_test(
         dirty_tracking_unit = 0,
         dirty_tracking = "wp",
         save_incremental = False,
+        cow = False,
         nftables = False,
         kvm_use_cpu_nums = True,
         in_sandbox_cgroup = "v1",
@@ -121,6 +122,8 @@ def _syscall_test(
         name += "_" + dirty_tracking
     if save_incremental:
         name += "_incremental"
+    if cow:
+        name += "_cow"
     if nftables:
         name += "_nftables"
 
@@ -144,6 +147,8 @@ def _syscall_test(
                 tags.append("save_restore")
             if save_resume:
                 tags.append("save_resume")
+            if cow:
+                tags.append("save_cow")
 
     # Hash this target into one of 15 buckets. This can be used to
     # randomly split targets between different workflows.
@@ -204,6 +209,7 @@ def _syscall_test(
         "--dirty-tracking-unit=" + str(dirty_tracking_unit),
         "--save-incremental=" + str(save_incremental),
         "--dirty-tracking=" + dirty_tracking,
+        "--cow=" + str(cow),
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
@@ -732,6 +738,38 @@ def syscall_test(
                     in_sandbox_cgroup = in_sandbox_cgroup,
                     **kwargs
                 )
+
+        # Add a save-resume variant on systrap and kvm in which saves are
+        # copy-on-write: the test goes on while each save writes its memory,
+        # and every save checks that the memory it writes is the memory at
+        # its save point, and that dirty tracking missed no write.
+        for platform, platform_tags in all_platforms():
+            if platform not in ["systrap", "kvm"]:
+                continue
+            _syscall_test(
+                test = test,
+                platform = platform,
+                use_tmpfs = use_tmpfs,
+                add_host_uds = add_host_uds,
+                add_host_connector = add_host_connector,
+                add_host_fifo = add_host_fifo,
+                add_host_tty = add_host_tty,
+                tags = platform_tags + tags,
+                iouring = iouring,
+                debug = debug,
+                container = container,
+                one_sandbox = one_sandbox,
+                leak_check = leak_check,
+                save_resume = True,
+                dirty_tracking_verify = True,
+                cow = True,
+                size = "large",
+                timeout = "long",
+                nftables = nftables,
+                kvm_use_cpu_nums = kvm_use_cpu_nums,
+                in_sandbox_cgroup = in_sandbox_cgroup,
+                **kwargs
+            )
 
         # Add save resume variant to all other variants generated above.
         syscall_test_variants(

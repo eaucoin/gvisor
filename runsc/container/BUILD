@@ -52,6 +52,7 @@ go_test(
     srcs = [
         "console_test.go",
         "container_test.go",
+        "cow_test.go",
         "incremental_test.go",
         "metric_server_test.go",
         "multi_container_test.go",
@@ -96,6 +97,7 @@ go_test(
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/limits",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",

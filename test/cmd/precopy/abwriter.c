@@ -32,7 +32,10 @@
 // generation that the table records and the filler derived from both, or be
 // zero if the table records it discarded. It appends "PASS <pages> <pages
 // written>", or "FAIL <bad index> <bad filler> <bad generation>: page <i>
-// ..." about the first bad page.
+// ..." about the first bad page. On SIGUSR2, it appends "GAP <us>": the longest
+// time, in microseconds, between two ticks of a child process that ticks
+// every millisecond, since the last SIGUSR2 (how long a checkpoint kept the
+// sandbox from running).
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <signal.h>
@@ -41,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,6 +61,9 @@ static uint64_t* gen;
 static uint64_t npages;
 static uint64_t written;
 static uint64_t rng = 0x2545f4914f6cdd1dULL;
+// The longest gap between the ticker's ticks since the last report, in
+// microseconds, in memory shared with the ticker.
+static uint64_t* longest_gap_us;
 
 static void die(const char* m) {
   perror(m);
@@ -210,6 +217,32 @@ static double now_ms(void) {
   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
+// start_ticker forks the ticker, which wakes every millisecond and records
+// the longest time between two of its wakeups.
+static void start_ticker(void) {
+  longest_gap_us = mmap(NULL, PS, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (longest_gap_us == MAP_FAILED) die("mmap gap");
+  pid_t parent = getpid();
+  pid_t pid = fork();
+  if (pid < 0) die("fork ticker");
+  if (pid != 0) return;
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(0);
+  const struct timespec ms = {0, 1000000};
+  double last = now_ms();
+  for (;;) {
+    nanosleep(&ms, NULL);
+    double t = now_ms();
+    uint64_t gap = (uint64_t)((t - last) * 1e3);
+    uint64_t cur = __atomic_load_n(longest_gap_us, __ATOMIC_RELAXED);
+    while (gap > cur &&
+           !__atomic_compare_exchange_n(longest_gap_us, &cur, gap, 1,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    last = t;
+  }
+}
+
 int main(int argc, char** argv) {
   int churning = 0;
   const char* file = NULL;
@@ -251,7 +284,9 @@ int main(int argc, char** argv) {
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGUSR1);
+  sigaddset(&set, SIGUSR2);
   if (sigprocmask(SIG_BLOCK, &set, NULL)) die("sigprocmask");
+  start_ticker();
   report("READY\n");
 
   // Pages to write per tick, with the fraction carried over.
@@ -262,7 +297,15 @@ int main(int argc, char** argv) {
   for (;;) {
     for (due += per_tick; due >= 1; due--) rewrite(next_random() % npages);
     if (churning) churn();
-    if (sigtimedwait(&set, NULL, &no_wait) == SIGUSR1) check();
+    switch (sigtimedwait(&set, NULL, &no_wait)) {
+      case SIGUSR1:
+        check();
+        break;
+      case SIGUSR2:
+        report("GAP %llu\n", (unsigned long long)__atomic_exchange_n(
+                                  longest_gap_us, 0, __ATOMIC_RELAXED));
+        break;
+    }
     next += TICK_MS;
     double wait = next - now_ms();
     if (wait > 0) {

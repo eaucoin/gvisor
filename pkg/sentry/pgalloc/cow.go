@@ -333,7 +333,7 @@ func (f *MemoryFile) cowBeforeWrite(p DirtyMarkPath, fr memmap.FileRange) {
 // +checklocks:c.mu
 func (c *cowSave) captureLocked(fr memmap.FileRange, mark bool) {
 	fr.Start = hostarch.PageRoundDown(fr.Start)
-	fr.End = min(hostarch.PageRoundUp(fr.End), c.size)
+	fr.End = min(hostarch.MustPageRoundUp(fr.End), c.size)
 	for c.err == nil && c.pendingBytes != 0 && fr.Start < fr.End {
 		var run memmap.FileRange
 		c.forEachPendingLocked(fr, func(r memmap.FileRange) {

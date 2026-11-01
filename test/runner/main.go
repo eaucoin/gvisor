@@ -81,6 +81,7 @@ var (
 	dirtyVerify      = flag.Bool("dirty-tracking-verify", false, "enables dirty tracking, verified at every save: saves fail if a page changed without being tracked")
 	dirtyUnit        = flag.Uint64("dirty-tracking-unit", 0, "with --dirty-tracking-verify, the size in bytes of the units in which dirty tracking records first writes; 0 for runsc's default")
 	dirtyTracking    = flag.String("dirty-tracking", "wp", "dirty source of -dirty-tracking-verify and -save-incremental")
+	cow              = flag.Bool("cow", false, "with -save-resume and -dirty-tracking-verify, makes saves copy-on-write, writing their memory while the test goes on, and checks that the memory each writes is the memory at its save point")
 	saveIncremental  = flag.Bool("save-incremental", false, "with -save, makes saves incremental, of the image the sandbox was restored from, in chains of at most incrementalChainLength images that each start with a full save, and restores from the chain of images")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
@@ -475,6 +476,11 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		if *dirtyUnit != 0 {
 			args = append(args, fmt.Sprintf("-dirty-tracking-unit=%d", *dirtyUnit))
 		}
+	}
+	if *cow {
+		// The copier starts late, so that the test's writes after a save
+		// point reach most pages before it does.
+		args = append(args, "-cow=on", "-TESTONLY-cow-verify=hash", "-TESTONLY-cow-copy-delay=20ms")
 	}
 
 	testLogDir := ""

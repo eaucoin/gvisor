@@ -1247,10 +1247,10 @@ func configureDirtyTracking(k *kernel.Kernel, conf *config.Config, uffd bool, tr
 		Sources: []kernel.DirtySource{source},
 		Verify:  conf.DirtyTrackingVerify == config.DirtyTrackingVerifyHash,
 	}
-	if conf.CoW {
+	if conf.CoW == config.CoWOn {
 		opts.CoW = &pgalloc.CoWOpts{
 			StagingMax: conf.CoWStagingMax,
-			Verify:     conf.TestOnlyCoWVerify,
+			Verify:     conf.TestOnlyCoWVerify == config.DirtyTrackingVerifyHash,
 			CopyDelay:  conf.TestOnlyCoWCopyDelay,
 		}
 		log.Infof("Copy-on-write checkpoints: staging up to %d bytes, verification %v", conf.CoWStagingMax, conf.TestOnlyCoWVerify)

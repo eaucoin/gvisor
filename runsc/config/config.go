@@ -383,16 +383,16 @@ type Config struct {
 	// CoW makes the checkpoints that leave the sandbox running and write a
 	// pages file copy-on-write: they pause the sandbox only to take their
 	// save point, and write its memory while it runs.
-	CoW bool `flag:"cow"`
+	CoW CoWMode `flag:"cow"`
 
 	// CoWStagingMax is the most bytes of memory that a copy-on-write
 	// checkpoint holds copied before writes and not yet written.
 	CoWStagingMax uint64 `flag:"cow-staging-max"`
 
-	// TestOnlyCoWVerify should only be used in tests. It makes every
-	// copy-on-write checkpoint check that the memory it writes is the
-	// memory at its save point, and fail if it is not.
-	TestOnlyCoWVerify bool `flag:"TESTONLY-cow-verify"`
+	// TestOnlyCoWVerify should only be used in tests. With hash, every
+	// copy-on-write checkpoint checks that the memory it writes is the
+	// memory at its save point, and fails if it is not.
+	TestOnlyCoWVerify DirtyTrackingVerifyMode `flag:"TESTONLY-cow-verify"`
 
 	// TestOnlyCoWBreak should only be used in tests. It disables the copies
 	// that copy-on-write checkpoints make before the writes of one dirty
@@ -627,10 +627,10 @@ func (c *Config) Validate() error {
 	} else if u := c.DirtyTrackingUnit; u < 4096 || u&(u-1) != 0 {
 		return fmt.Errorf("dirty-tracking-unit must be a power of 2 of at least 4096, got: %d", u)
 	}
-	if c.CoW && c.DirtyTracking != DirtyTrackingWriteProtect {
+	if c.CoW == CoWOn && c.DirtyTracking != DirtyTrackingWriteProtect {
 		return fmt.Errorf("cow requires --dirty-tracking=wp")
 	}
-	if !c.CoW && (c.TestOnlyCoWVerify || c.TestOnlyCoWBreak != DirtyTrackingBreakNone || c.TestOnlyCoWCopyDelay != 0) {
+	if c.CoW == CoWOff && (c.TestOnlyCoWVerify != DirtyTrackingVerifyOff || c.TestOnlyCoWBreak != DirtyTrackingBreakNone || c.TestOnlyCoWCopyDelay != 0) {
 		return fmt.Errorf("TESTONLY-cow-verify, TESTONLY-cow-break and TESTONLY-cow-copy-delay require --cow")
 	}
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
@@ -988,6 +988,52 @@ func (d DirtyTrackingVerifyMode) String() string {
 		return "hash"
 	}
 	panic(fmt.Sprintf("Invalid dirty tracking verification mode %d", d))
+}
+
+// CoWMode tells whether checkpoints are copy-on-write.
+type CoWMode int
+
+const (
+	// CoWOff writes a checkpoint's memory while the sandbox is paused, or
+	// pre-copies it.
+	CoWOff CoWMode = iota
+
+	// CoWOn makes the checkpoints that leave the sandbox running and write
+	// a pages file copy-on-write.
+	CoWOn
+)
+
+func cowModePtr(v CoWMode) *CoWMode {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (m *CoWMode) Set(v string) error {
+	switch v {
+	case "off":
+		*m = CoWOff
+	case "on":
+		*m = CoWOn
+	default:
+		return fmt.Errorf("invalid copy-on-write mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (m *CoWMode) Get() any {
+	return *m
+}
+
+// String implements flag.Value.
+func (m CoWMode) String() string {
+	switch m {
+	case CoWOff:
+		return "off"
+	case CoWOn:
+		return "on"
+	}
+	panic(fmt.Sprintf("Invalid copy-on-write mode %d", m))
 }
 
 // DirtyTrackingBreak names a path by which dirty tracking marks pages written,

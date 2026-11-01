@@ -43,7 +43,7 @@ func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
 			Resume:      true,
 			Destination: io.Discard,
 		}
-		if l.root.conf.CoW {
+		if l.root.conf.CoW == config.CoWOn {
 			// Copy-on-write saves write a pages file, which they write
 			// while the test runs.
 			saveOpts.PagesMetadata = discardWriteCloser{}
