@@ -151,6 +151,30 @@ func (f *MemoryFile) StartWorkingSetRecording(unit uint64, window time.Duration)
 		}
 	})
 	log.Infof("MemoryFile(%p): recording the working set in units of %d bytes for %v", f, unit, window)
+	if logAwaitedLoads.Load() {
+		go ws.logTouchesEvery(touchesLogInterval, gen)
+	}
+}
+
+// touchesLogInterval is how often the first touches of a working set being
+// recorded are logged while logAwaitedLoads, so that those of a sandbox that
+// ends before its recording does are logged too.
+const touchesLogInterval = 250 * time.Millisecond
+
+// logTouchesEvery logs, every interval, the first touches recorded since it
+// last did, as long as the recording gen goes on.
+func (ws *workingSet) logTouchesEvery(interval time.Duration, gen uint64) {
+	for {
+		time.Sleep(interval)
+		ws.mu.Lock()
+		if !ws.recording.Load() || ws.gen != gen {
+			ws.mu.Unlock()
+			return
+		}
+		ws.logTouchesLocked()
+		ws.touches = nil
+		ws.mu.Unlock()
+	}
 }
 
 // StopWorkingSetRecording stops recording f's working set, if it is being
