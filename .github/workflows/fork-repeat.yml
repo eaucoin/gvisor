@@ -51,6 +51,11 @@ name: Fork repeat
         required: false
         default: false
         type: boolean
+      cpu:
+        description: The runner CPU model the job must have, others failing at once to be re-run (any if empty)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -71,6 +76,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: The runner's CPU and kernel
+        env:
+          PINNED: ${{ inputs.cpu }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU: ${model}; kernel: $(uname -r); $(nproc) CPUs" | tee -a "${GITHUB_STEP_SUMMARY}"
+          [[ -z "${PINNED}" || "${model}" == "${PINNED}" ]] || { echo "::error::this runner's CPU is ${model}, not ${PINNED}: re-run this job"; exit 3; }
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Give access to /dev/kvm
@@ -160,7 +172,7 @@ jobs:
           fi
           exit "${status}"
       - name: Test logs
-        if: failure()
+        if: always()
         run: |
           # The logs and outputs (runsc's own logs among them) of the runs that
           # failed, kept as an artifact.
@@ -172,7 +184,7 @@ jobs:
             echo "${label}"
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
+        if: always()
         with:
           name: testlogs
           path: ${{ runner.temp }}/testlogs
