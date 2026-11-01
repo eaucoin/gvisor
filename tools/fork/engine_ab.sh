@@ -133,8 +133,10 @@ for (( round = 1; round <= RUNS; round++ )); do
   for build in "${BUILDS[@]}"; do
     for workload in "${workloads[@]}"; do cells+=("${build}|${workload}"); done
   done
-  while IFS= read -r cell; do
-    cycle "${cell%%|*}" "${cell##*|}" "${round}"
-  done < <(printf '%s\n' "${cells[@]}" | shuf)
+  # The cells read from a descriptor of their own: runsc and sudo read the
+  # standard input.
+  while IFS= read -r -u 3 cell; do
+    cycle "${cell%%|*}" "${cell##*|}" "${round}" </dev/null
+  done 3< <(printf '%s\n' "${cells[@]}" | shuf)
   echo "round ${round} of ${RUNS} done"
 done
