@@ -340,7 +340,7 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) (bool, e
 	// Counted in, a container that the checkpoint does not hold would start
 	// the restore before one that it does.
 	if _, ok := r.checkpointedSpecs[info.containerName]; !ok {
-		return fmt.Errorf("container %q is not in the checkpoint", info.containerName)
+		return false, fmt.Errorf("container %q is not in the checkpoint", info.containerName)
 	}
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {

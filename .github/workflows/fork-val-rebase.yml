@@ -1,9 +1,10 @@
 # Spike, not for main (named fork-* so that fork-integrate.yml leaves it
 # enabled): the kernel-standby validation's rebase of the fork's series onto
 # upstream master (the endpoint package's M6 rebase spike), checked as tier 1
-# checks main, on every push of a spike/val-rebase branch. Its jobs run one
-# after another, so that the spike holds one runner at a time; every one of
-# them is pinned to the CPU and kernel that the package's measurements use.
+# checks main, on every push of a spike/val-rebase branch. The Bazel job, then
+# the checks, run beside the go branch build, so that the spike holds two
+# runners at a time; the Bazel job is pinned to the CPU and kernel that the
+# package's measurements use.
 name: Rebase spike
 
 "on":
@@ -129,8 +130,6 @@ jobs:
 
   go:
     name: Go branch build
-    needs: checks
-    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
