@@ -68,11 +68,18 @@ func (s *WriteProtectDirtySource) Arm(ctx context.Context, paused bool) error {
 	return nil
 }
 
+// preArmStep is the most memory that preArm arms at once in a MemoryManager,
+// holding its locks: at the 37-96 ms per GiB that arming costs on systrap, a
+// task of the MemoryManager that faults meanwhile waits at most a few
+// milliseconds.
+const preArmStep = 64 << 20
+
 // preArm arms, while tasks run, every MemoryManager that it reaches, each
-// under its own locks and without pausing the kernel, and returns how many
-// it armed. MemoryManagers that it does not reach, such as those of tasks in
-// the middle of execve, are armed by the next Arm.
-func (s *WriteProtectDirtySource) preArm(ctx context.Context) int {
+// under its own locks, preArmStep bytes at a time, and without pausing the
+// kernel. MemoryManagers that it does not reach, such as those of tasks in the
+// middle of execve, are armed by the next Arm. It returns how many it armed,
+// in how many steps, and the longest step.
+func (s *WriteProtectDirtySource) preArm(ctx context.Context) (n, steps int, longest time.Duration) {
 	seen := make(map[*mm.MemoryManager]struct{})
 	var mms []*mm.MemoryManager
 	s.k.tasks.mu.RLock()
@@ -91,10 +98,12 @@ func (s *WriteProtectDirtySource) preArm(ctx context.Context) int {
 	}
 	s.k.tasks.mu.RUnlock()
 	for _, m := range mms {
-		m.ArmDirtyTracking(s.unit)
+		mSteps, mLongest := m.ArmDirtyTrackingInSteps(s.unit, preArmStep)
+		steps += mSteps
+		longest = max(longest, mLongest)
 		m.DecUsers(ctx)
 	}
-	return len(mms)
+	return len(mms), steps, longest
 }
 
 // Harvest implements DirtySource.Harvest. First writes are recorded when they

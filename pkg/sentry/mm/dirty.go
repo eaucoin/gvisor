@@ -53,16 +53,65 @@ const DefaultDirtyTrackingUnit = 64 << 10
 //
 // Preconditions: unit is a power of 2 and at least hostarch.PageSize.
 func (mm *MemoryManager) ArmDirtyTracking(unit uint64) {
-	if unit < hostarch.PageSize || unit&(unit-1) != 0 {
-		panic(fmt.Sprintf("invalid dirty tracking unit %d", unit))
-	}
+	checkDirtyTrackingUnit(unit)
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	mm.activeMu.Lock()
 	defer mm.activeMu.Unlock()
+	mm.armDirtyTrackingLocked(unit, 0, ^uint64(0))
+}
+
+// ArmDirtyTrackingInSteps arms mm as ArmDirtyTracking does, but while its
+// tasks run: in steps, each of which holds mm's locks while it arms at most
+// step bytes of pmas, so that a task of mm that faults waits for one step
+// rather than for the whole arm. It returns the number of steps and the
+// longest.
+//
+// Units that tasks write between steps are disarmed by their faults, as after
+// any arm, and pmas that tasks create behind a step are armed as they are
+// created if they map a dirty-tracked pgalloc.MemoryFile; completeness rests
+// on the ArmDirtyTracking that follows with tasks paused, not on this one.
+//
+// Preconditions: unit is a power of 2 and at least hostarch.PageSize; step >
+// 0.
+func (mm *MemoryManager) ArmDirtyTrackingInSteps(unit, step uint64) (steps int, longest time.Duration) {
+	checkDirtyTrackingUnit(unit)
+	var addr hostarch.Addr
+	for {
+		start := time.Now()
+		mm.mappingMu.RLock()
+		mm.activeMu.Lock()
+		next, more := mm.armDirtyTrackingLocked(unit, addr, step)
+		mm.activeMu.Unlock()
+		mm.mappingMu.RUnlock()
+		steps++
+		longest = max(longest, time.Since(start))
+		if !more {
+			return steps, longest
+		}
+		addr = next
+	}
+}
+
+// checkDirtyTrackingUnit panics if unit is not a valid dirty tracking unit.
+func checkDirtyTrackingUnit(unit uint64) {
+	if unit < hostarch.PageSize || unit&(unit-1) != 0 {
+		panic(fmt.Sprintf("invalid dirty tracking unit %d", unit))
+	}
+}
+
+// armDirtyTrackingLocked arms the pmas of mm from addr on, until it has armed
+// at least limit bytes of them. If pmas are left beyond, it returns the
+// address of the first and true.
+//
+// Preconditions:
+//   - mm.mappingMu must be locked for reading.
+//   - mm.activeMu must be locked for writing.
+//   - unit is a power of 2 and at least hostarch.PageSize.
+func (mm *MemoryManager) armDirtyTrackingLocked(unit uint64, addr hostarch.Addr, limit uint64) (hostarch.Addr, bool) {
 	mm.dirtyUnit = hostarch.Addr(unit)
 	if !pgalloc.DirtyMarkPathEnabled(pgalloc.DirtyMarkWriteProtectArm) {
-		return
+		return 0, false
 	}
 
 	// Unmap the pmas that were writable, with one call per vma (spanning the
@@ -71,15 +120,18 @@ func (mm *MemoryManager) ArmDirtyTracking(unit uint64) {
 	// syscall on systrap and a TLB invalidation on KVM.
 	var (
 		unmapAR hostarch.AddrRange
-		vseg    = mm.vmas.FirstSegment()
+		vseg    = mm.vmas.LowerBoundSegment(addr)
+		pseg    = mm.pmas.LowerBoundSegment(addr)
+		armed   uint64
 	)
-	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+	for ; pseg.Ok() && armed < limit; pseg = pseg.NextSegment() {
 		pma := pseg.ValuePtr()
 		if pma.dirtyArmed || !pma.dirtyTracked() {
 			continue
 		}
 		wasWritable := pma.effectivePerms.Write
 		pma.armDirty()
+		armed += uint64(pseg.Range().Length())
 		if !wasWritable {
 			continue
 		}
@@ -92,8 +144,13 @@ func (mm *MemoryManager) ArmDirtyTracking(unit uint64) {
 	}
 	mm.unmapASLocked(unmapAR)
 	// Merge the units disarmed during the previous epoch back into their
-	// neighbors.
-	mm.pmas.MergeAll()
+	// neighbors, up to the pmas left.
+	end := ^hostarch.Addr(0)
+	if pseg.Ok() {
+		end = pseg.Start()
+	}
+	mm.pmas.MergeInsideRange(hostarch.AddrRange{addr, end})
+	return end, pseg.Ok()
 }
 
 // dirtyTracked returns true if pma maps a dirty-tracked pgalloc.MemoryFile.

@@ -329,8 +329,8 @@ func (k *Kernel) PreArmCoWSave(ctx context.Context) {
 	}
 	for _, s := range k.dirty.Sources {
 		if wp, ok := s.(*WriteProtectDirtySource); ok {
-			n := wp.preArm(ctx)
-			log.Infof("Copy-on-write save: pre-armed %d MemoryManagers in %v", n, time.Since(start))
+			n, steps, longest := wp.preArm(ctx)
+			log.Infof("Copy-on-write save: pre-armed %d MemoryManagers in %v, in %d steps, the longest %v", n, time.Since(start), steps, longest)
 		}
 	}
 }

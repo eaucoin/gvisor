@@ -218,6 +218,65 @@ func TestDirtyTrackingSentryWrites(t *testing.T) {
 	}
 }
 
+func TestDirtyTrackingArmInSteps(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm, as := dirtyTestMM(t, ctx)
+	// Three vmas, each written and armed, then written again in every other
+	// page: 96 pages in about 50 pmas.
+	var ars []hostarch.AddrRange
+	for v := 0; v < 3; v++ {
+		ar := mmap(t, ctx, mm, 32, true /* private */)
+		for i := uint64(0); i < 32; i++ {
+			fault(t, ctx, mm, page(ar, i), hostarch.Write)
+		}
+		ars = append(ars, ar)
+	}
+	mm.ArmDirtyTracking(hostarch.PageSize)
+	for _, ar := range ars {
+		for i := uint64(0); i < 32; i += 2 {
+			fault(t, ctx, mm, page(ar, i), hostarch.Write)
+		}
+	}
+	mm.mf.SwapDirty(true)
+
+	// Steps of 8 pages arm the 48 written pages in 6 steps or more, and the
+	// result is that of one arm.
+	steps, _ := mm.ArmDirtyTrackingInSteps(hostarch.PageSize, 8*hostarch.PageSize)
+	if steps < 6 {
+		t.Errorf("armed in %d steps, want at least 6", steps)
+	}
+	mm.activeMu.RLock()
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		if !pseg.ValuePtr().dirtyArmed {
+			t.Errorf("pma %v not armed", pseg.Range())
+		}
+	}
+	mm.activeMu.RUnlock()
+	for addr, at := range as.pages {
+		if at.Write {
+			t.Errorf("page %#x still mapped writable", addr)
+		}
+	}
+	// Each write is recorded once more.
+	for _, ar := range ars {
+		fault(t, ctx, mm, page(ar, 9), hostarch.Write)
+		if got, want := dirtyPages(t, mm, ar), []uint64{9}; !slices.Equal(got, want) {
+			t.Errorf("dirty pages after one write: got %v, want %v", got, want)
+		}
+	}
+	// A full arm merges what the steps left apart: one pma per vma.
+	mm.ArmDirtyTracking(hostarch.PageSize)
+	mm.activeMu.RLock()
+	npmas := 0
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		npmas++
+	}
+	mm.activeMu.RUnlock()
+	if npmas > len(ars) {
+		t.Errorf("%d pmas after a full arm, want at most %d", npmas, len(ars))
+	}
+}
+
 func TestDirtyTrackingRearm(t *testing.T) {
 	ctx := contexttest.Context(t)
 	mm, as := dirtyTestMM(t, ctx)
