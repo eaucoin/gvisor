@@ -10,7 +10,7 @@
 #
 # Lines: "base TAG", then "BRANCH [on BRANCH...]"; "#" starts a comment.
 
-base release-20260921.0
+base aa767e4c43d011121271551fe24da501a56f729d
 
 series/fork-infra
 # Fixes to the base: upstream's own bugs, in systrap and in its tests.
