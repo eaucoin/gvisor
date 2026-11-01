@@ -256,7 +256,7 @@ func TestCheckpointCoWRelease(t *testing.T) {
 // releaseLines returns the lines that the sandboxes' boot logs wrote since
 // start on their saves' pauses and releases.
 func releaseLines(t *testing.T, start time.Time) []string {
-	return bootLogSince(t, start, "paused for", "Save point taken", "pre-armed", "Kernel save took", "copy-on-write save copied in", "release", "Release")
+	return bootLogSince(t, start, "paused for", "Save point taken", "pre-armed", "Dirty tracking: armed", "Kernel save took", "copy-on-write save copied in", "Copy-on-write release", "Release asked")
 }
 
 // TestCheckpointCoWChurn takes copy-on-write checkpoints of the A-B writer
