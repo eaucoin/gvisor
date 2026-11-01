@@ -4,7 +4,9 @@
 # branch: spike/val-tier2-graph with upstream's default engine, and
 # spike/val-tier2-wire, whose one commit more makes wire the default. Its jobs
 # run one after another, the matrices two at a time, so that it holds at
-# most two runners, the validation's third left to its other runs. It posts no commit status. Like fork-nightly.yml, and
+# most two runners, the validation's third left to its other runs; on
+# spike/val-tier2-wire one at a time, as it runs beside the graph run. It posts
+# no commit status. Like fork-nightly.yml, and
 # unlike the measurements, its runners are not pinned to a CPU: it says what
 # passes, not how fast.
 name: Tier 2 spike
@@ -118,7 +120,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         variant: [save_restore, save_resume, save_verify, save_incremental]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
@@ -304,7 +306,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         include:
           - platform: systrap
