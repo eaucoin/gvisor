@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -117,6 +118,18 @@ type runscService struct {
 
 	// containers maps container id to a container.
 	containers map[string]*Container
+
+	// created holds the ids of containers in the order they were created,
+	// which a restore into a standby restores them in (standby.go).
+	created []string
+
+	// standby is the standby sandbox's restore server, once its root
+	// container has started; nil if the sandbox is not a standby.
+	standby *standbyServer
+
+	// standbySocket is the socket of the standby that the containers were
+	// created as, which every one of them names; empty if none.
+	standbySocket string
 
 	// versionCommand is the runsc executable configured for the sandbox.
 	// A nil pointer or empty command selects the default.
@@ -219,12 +232,20 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		RestoreDirect:      restore.direct,
 		RestoreBackground:  restore.background,
 		RestorePaused:      restore.paused,
+		Standby:            restore.standby != "",
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	if restore.standby != "" {
+		if s.standbySocket != "" && s.standbySocket != restore.standby {
+			return nil, fmt.Errorf("standby socket %q differs from the sandbox's, %q: %w", restore.standby, s.standbySocket, errdefs.ErrInvalidArgument)
+		}
+		s.standbySocket = restore.standby
+	}
 	s.containers[rfs.Create.ID] = c
+	s.created = append(s.created, rfs.Create.ID)
 
 	p, err := c.Process("")
 	if err != nil {
@@ -276,6 +297,11 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	if initProcess, ok := p.(*proc.Init); ok && len(r.ExecID) == 0 && initProcess.Sandbox && c.isStandby() {
+		if err := s.serveStandby(initProcess.Pid()); err != nil {
+			return nil, errgrpc.ToGRPC(err)
+		}
+	}
 	if len(r.ExecID) == 0 {
 		s.send(&events.TaskStart{
 			ContainerID: r.ID,
@@ -309,8 +335,13 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 	if len(r.ExecID) == 0 {
 		s.mu.Lock()
 		delete(s.containers, r.ID)
+		s.created = slices.DeleteFunc(s.created, func(id string) bool { return id == r.ID })
 		hasCont := len(s.containers) > 0
+		standby := s.standby
 		s.mu.Unlock()
+		if !hasCont && standby != nil {
+			standby.close()
+		}
 
 		if !hasCont && s.platform != nil {
 			s.platform.Close()
@@ -372,6 +403,11 @@ func (s *runscService) State(ctx context.Context, r *task.StateRequest) (*task.S
 	if err != nil {
 		log.L.Debugf("State failed: %v", err)
 		return nil, err
+	}
+	// A standby's container is started, as Start reported, though runsc keeps
+	// it created.
+	if len(r.ExecID) == 0 && c.isStandby() {
+		st = "running"
 	}
 	status := tasktypes.Status_UNKNOWN
 	switch st {
@@ -436,6 +472,10 @@ func (s *runscService) Kill(ctx context.Context, r *task.KillRequest) (*types.Em
 	c, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
+	}
+	if len(r.ExecID) == 0 && c.isStandby() {
+		s.killStandby(c, r.Signal)
+		return empty, nil
 	}
 	if err := c.Kill(ctx, r); err != nil {
 		return nil, errgrpc.ToGRPC(err)

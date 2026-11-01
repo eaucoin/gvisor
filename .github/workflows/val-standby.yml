@@ -1,0 +1,69 @@
+# Spike, not for main: the kernel-standby validation's restores into standby
+# sandboxes (the endpoint package's E15), on every push of a spike/val-standby
+# branch: runsc and its shim built as tier 1 builds them, the shim's tests, and
+# tools/fork/standby_test.sh, whose times are kept as an artifact.
+name: Standby spike
+
+"on":
+  push:
+    branches:
+      - spike/val-standby*
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+  TEST_OPTIONS: --modify_execution_info=TestRunner=+no-cache
+
+jobs:
+  standby:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Every time is of one CPU model and kernel: a job elsewhere ends at once, to be re-run.
+      - name: The runner's CPU and kernel, as pinned
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          release=$(uname -r)
+          echo "$model, $release"
+          [ "$model" = "AMD EPYC 7763 64-Core Processor" ] || { echo "::error::this runner's CPU is $model: re-run this job"; exit 3; }
+          [[ $release == 7.0.* ]] || { echo "::error::this runner's kernel is $release: re-run this job"; exit 3; }
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: base
+        run: echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
+          restore-keys: bazel-${{ steps.base.outputs.base }}-
+      - name: Build the release binaries
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          "${RUNNER_TEMP}/release/runsc" --version
+      - name: The shim's tests
+        run: make test OPTIONS="${TEST_OPTIONS}" TARGETS=//pkg/shim/v1/runsc:runsc_test
+      - name: Restores into standby sandboxes
+        run: tools/fork/standby_test.sh "${RUNNER_TEMP}/release" "${RUNNER_TEMP}/standby.jsonl"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: standby-${{ github.sha }}
+          path: ${{ runner.temp }}/standby.jsonl
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+          retention-days: 7

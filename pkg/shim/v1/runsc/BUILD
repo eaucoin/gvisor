@@ -19,6 +19,7 @@ go_library(
         "sandbox.go",
         "service.go",
         "service_linux.go",
+        "standby.go",
         "state.go",
     ],
     visibility = ["//pkg/shim:__subpackages__"],

@@ -82,6 +82,14 @@ type Container struct {
 	//
 	// +checklocks:mu
 	restoreConf *extension.RestoreConfig
+
+	// standby is non-nil while the container is a standby's that no restore
+	// has been made into yet (standby.go): Start reports it started, but runsc
+	// keeps it created. It holds the restore options of the container's
+	// runsc options, which a restore into it takes.
+	//
+	// +checklocks:mu
+	standby *extension.RestoreConfig
 }
 
 // ContainerConfig contains configuration for creating a container.
@@ -125,6 +133,12 @@ type ContainerConfig struct {
 	// restored, until resumed. Set it on every container of the sandbox
 	// being restored, as RestoreImagePath.
 	RestorePaused bool
+
+	// Standby makes the container a standby's: created, and reported started,
+	// but running nothing until a checkpoint is restored into its sandbox
+	// (standby.go). Set it on every container of the sandbox, without
+	// RestoreImagePath.
+	Standby bool
 }
 
 // NewContainer returns a new runsc container
@@ -300,6 +314,13 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 			Paused:     conf.RestorePaused,
 		}
 	}
+	var standby *extension.RestoreConfig
+	if conf.Standby {
+		standby = &extension.RestoreConfig{
+			Direct:     opts.RestoreDirect,
+			Background: opts.RestoreBackground,
+		}
+	}
 	c := Container{
 		ID:          conf.ID,
 		Bundle:      conf.Bundle,
@@ -307,6 +328,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		cgroup:      cgroupMode,
 		processes:   make(map[string]extension.Process),
 		restoreConf: restoreConf,
+		standby:     standby,
 	}
 	return &c, nil
 }
@@ -396,6 +418,10 @@ func (c *Container) ProcessRemove(id string) {
 
 // Start a container process.
 func (c *Container) Start(ctx context.Context, r *task.StartRequest) (extension.Process, error) {
+	// A standby's container runs nothing until a restore is made into it.
+	if r.ExecID == "" && c.isStandby() {
+		return c.init(), nil
+	}
 	// An exec starts normally even in a restored container.
 	if restoreConf := c.restoreConfig(); restoreConf != nil && r.ExecID == "" {
 		p, err := c.Restore(ctx, &extension.RestoreRequest{Start: r, Conf: *restoreConf})
@@ -423,6 +449,25 @@ func (c *Container) restoreConfig() *extension.RestoreConfig {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.restoreConf
+}
+
+// isStandby returns true if the container is a standby's that no restore has
+// been made into yet.
+func (c *Container) isStandby() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.standby != nil
+}
+
+// takeStandby returns the restore options of a standby's container, and makes
+// it a standby's no more, so that at most one restore is made into it; nil if
+// it is not a standby's, or no more.
+func (c *Container) takeStandby() *extension.RestoreConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	conf := c.standby
+	c.standby = nil
+	return conf
 }
 
 // clearRestoreConfig drops the config, so that a restore happens at most once.
