@@ -65,8 +65,17 @@ docker rm "${container}" >/dev/null
 # Detached, with no console to attach a terminal to.
 sed -i 's/"terminal": true/"terminal": false/' "${bundle}/config.json"
 
+# The counter's value. A checkpoint may catch the shell between its
+# redirection's truncation of the file and its write, which a read right after
+# the restore then finds empty: read again until there is a value.
 count() {
-  runsc exec counter cat /tmp/count
+  local value=""
+  for (( tries = 0; tries < 100; tries++ )); do
+    value="$(runsc exec counter cat /tmp/count)"
+    [[ -n "${value}" ]] && break
+    sleep 0.05
+  done
+  echo "${value}"
 }
 
 runsc run --bundle="${bundle}" --detach counter
