@@ -599,6 +599,9 @@ func (r *restorer) restore(l *Loader) error {
 				return err
 			}
 			r.timer.Reached("MF metadata loaded")
+			// The kernel is loaded: the pages load at full speed, if they
+			// were throttled until now (--async-load-throttle).
+			r.asyncMFLoader.Unthrottle()
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err

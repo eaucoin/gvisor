@@ -38,6 +38,7 @@ import (
 type inspect struct {
 	layerPaths stringSlice
 	json       bool
+	extents    bool
 }
 
 // Name implements subcommands.Command.
@@ -63,6 +64,7 @@ An image directory may also hold only the options file of a checkpoint gofer (gc
 func (i *inspect) SetFlags(f *flag.FlagSet) {
 	f.Var(&i.layerPaths, "layer-path", "directory in which to look for the image's layers besides IMAGE/layers, as for runsc restore; can be repeated, or given comma-separated")
 	f.BoolVar(&i.json, "json", false, "print a JSON object")
+	f.BoolVar(&i.extents, "extents", false, "with --json, list each memory file's extents ([start, end, layer, offset]) and the working set's ([start, end])")
 }
 
 // Execute implements subcommands.Command.
@@ -77,7 +79,7 @@ func (i *inspect) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		return exitStatus(err)
 	}
 	defer closeImage()
-	info, err := describe(d)
+	info, err := describe(d, i.extents)
 	if err != nil {
 		return exitStatus(err)
 	}
@@ -145,6 +147,8 @@ type memoryFileInfo struct {
 	CommittedBytes uint64   `json:"committed_bytes"`
 	Extents        int      `json:"extents"`
 	LayerBytes     []uint64 `json:"layer_bytes"`
+	// ExtentList is set with --extents.
+	ExtentList [][4]uint64 `json:"extent_list,omitempty"`
 }
 
 type workingSetInfo struct {
@@ -152,9 +156,11 @@ type workingSetInfo struct {
 	Window  time.Duration `json:"window_ns"`
 	Extents int           `json:"extents"`
 	Bytes   uint64        `json:"bytes"`
+	// ExtentList is set with --extents.
+	ExtentList [][2]uint64 `json:"extent_list,omitempty"`
 }
 
-func describe(d *imageDir) (*imageInfo, error) {
+func describe(d *imageDir, extents bool) (*imageInfo, error) {
 	containers, err := specutils.GetSpecsFromString(d.state[boot.ContainerSpecsKey])
 	if err != nil {
 		return nil, fmt.Errorf("%s of %s: %w: %v", boot.ContainerSpecsKey, d.path, checkpointimage.ErrFormat, err)
@@ -199,6 +205,9 @@ func describe(d *imageDir) (*imageInfo, error) {
 		}
 		for _, e := range mf.GetExtents() {
 			mi.LayerBytes[e.GetLayer()] += e.GetEnd() - e.GetStart()
+			if extents {
+				mi.ExtentList = append(mi.ExtentList, [4]uint64{e.GetStart(), e.GetEnd(), uint64(e.GetLayer()), e.GetOffset()})
+			}
 		}
 		info.MemoryFiles = append(info.MemoryFiles, mi)
 	}
@@ -210,6 +219,9 @@ func describe(d *imageDir) (*imageInfo, error) {
 		}
 		for _, fr := range ws.GetExtents() {
 			wi.Bytes += fr.GetEnd() - fr.GetStart()
+			if extents {
+				wi.ExtentList = append(wi.ExtentList, [2]uint64{fr.GetStart(), fr.GetEnd()})
+			}
 		}
 		info.WorkingSet = wi
 	}

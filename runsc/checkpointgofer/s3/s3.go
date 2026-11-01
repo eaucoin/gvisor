@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -95,6 +96,9 @@ type FileServer struct {
 	client *s3.Client
 	opts   FileServerOptions
 	retry  retryPolicy
+
+	// hedge is nil unless opts.HedgePercentile is not 0.
+	hedge *hedger
 }
 
 // FileServerOptions provides options to NewFileServer.
@@ -188,6 +192,25 @@ type FileServerOptions struct {
 	// once. If they are 0, they are 32 MiB and 4.
 	PagesFilePartBytes     int
 	PagesFileWriteParallel int
+
+	// If Trace is true, each GET of a pages file is logged as it ends, as a
+	// line beginning "S3 read trace:", and each pages file's reader logs what
+	// it read, and the process's CPU time, as it closes.
+	Trace bool
+
+	// HedgePercentile, if not 0, has a GET of a pages file made again on
+	// another connection if the store has not begun to answer it within that
+	// percentile of the times the store took to begin answering GETs of
+	// pages files before (at least twice the shortest), for at most
+	// hedgeMaxFraction of them: the answer that begins first is read, the
+	// other's request canceled.
+	HedgePercentile int
+
+	// CacheDir, if not empty, is a directory into which the bytes of each
+	// pages file read are written at their offsets, in a file named after its
+	// object, with O_DIRECT, from a buffer of the FileServer's own that they
+	// are read into before they are copied to the client's memory.
+	CacheDir string
 }
 
 // ParsePagesRetry returns the FileServerOptions.PagesRetryWhileRunning that
@@ -290,6 +313,8 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 		return nil, fmt.Errorf("pages file read size %d is not a multiple of the page size %d", o.PagesFileReadBytes, pageSize)
 	case o.PagesFilePartBytes < minPartBytes || o.PagesFilePartBytes > maxPartBytes:
 		return nil, fmt.Errorf("pages file part size %d is not between %d and %d", o.PagesFilePartBytes, minPartBytes, maxPartBytes)
+	case o.HedgePercentile < 0 || o.HedgePercentile >= 100:
+		return nil, fmt.Errorf("hedge percentile %d is not between 0 and 99", o.HedgePercentile)
 	}
 
 	if o.Socket != "" {
@@ -355,7 +380,7 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 	})
 
 	ctx, cancel := context.WithCancelCause(ctx)
-	return &FileServer{
+	s := &FileServer{
 		ctx:    ctx,
 		cancel: cancel,
 		client: client,
@@ -365,7 +390,11 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 			timeout:     o.RequestTimeout,
 			bandwidth:   o.MinRequestBandwidth,
 		},
-	}, nil
+	}
+	if o.HedgePercentile != 0 {
+		s.hedge = newHedger(o.HedgePercentile)
+	}
+	return s, nil
 }
 
 // CheckFileMode returns an error unless the file described by fi, named name,
@@ -450,7 +479,20 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	}
 	obj := s.object(path)
 	log.Infof("Opening %s for reading", obj)
-	return newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel), nil
+	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
+	if name == checkpointfiles.PagesFileName {
+		r.trace = s.opts.Trace
+		r.hedge = s.hedge
+		if s.opts.CacheDir != "" {
+			cache, err := newCacheWriter(filepath.Join(s.opts.CacheDir, strings.ReplaceAll(obj.key, "/", "_")), maxParallel)
+			if err != nil {
+				r.Close()
+				return nil, err
+			}
+			r.cache = cache
+		}
+	}
+	return r, nil
 }
 
 // OpenWrite implements stateipc.AsyncFileServerImpl.OpenWrite.

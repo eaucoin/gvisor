@@ -22,6 +22,7 @@ go_binary(
         "//runsc/checkpointgofer/s3",
         "//runsc/cli",
         "//runsc/cmd/util",
+        "//runsc/config",
         "//runsc/flag",
         "//runsc/gvisorbinaries",
         "@com_github_aws_aws_sdk_go_v2_credentials//:go_default_library",

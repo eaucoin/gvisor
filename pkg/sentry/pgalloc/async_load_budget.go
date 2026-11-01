@@ -171,6 +171,19 @@ const (
 	aplReadFullBackground
 )
 
+// String implements fmt.Stringer.String.
+func (k aplReadKind) String() string {
+	switch k {
+	case aplReadAwaited:
+		return "awaited"
+	case aplReadBackground:
+		return "background"
+	case aplReadFullBackground:
+		return "full-background"
+	}
+	return fmt.Sprintf("aplReadKind(%d)", int(k))
+}
+
 // aplBackgroundBudget is the bound on the bytes of background reads that the
 // async page loader keeps in flight.
 //

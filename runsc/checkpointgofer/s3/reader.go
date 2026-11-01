@@ -73,6 +73,18 @@ type Reader struct {
 	// since, as they wait to be made again (see read).
 	retrying atomic.Int32
 
+	// If trace is true, each GET is logged as it ends (FileServerOptions.Trace),
+	// and gets and bytes count them.
+	trace bool
+	gets  atomic.Uint64
+	bytes atomic.Uint64
+
+	// hedge, if not nil, hedges GETs (FileServerOptions.HedgePercentile).
+	hedge *hedger
+
+	// cache, if not nil, is written the bytes read (FileServerOptions.CacheDir).
+	cache *cacheWriter
+
 	// size is the object's size, once the store has said it in the
 	// Content-Range of an answer to a GET, or -1 before: a read that would
 	// begin at or past it then ends there, without a GET the store would
@@ -106,8 +118,8 @@ func newReader(ctx context.Context, client *s3.Client, obj object, policy retryP
 	}
 	r.size.Store(-1)
 	r.workers.Add(maxParallel)
-	for range maxParallel {
-		go r.workerMain(ctx)
+	for i := range maxParallel {
+		go r.workerMain(ctx, i)
 	}
 	return r
 }
@@ -223,6 +235,18 @@ func (r *Reader) Retrying() bool {
 func (r *Reader) Close() error {
 	r.cancel(fmt.Errorf("context canceled by Reader.Close"))
 	r.workers.Wait()
+	if r.cache != nil {
+		r.cache.close()
+	}
+	if r.trace {
+		var gets, hedges uint64
+		if r.hedge != nil {
+			gets, hedges = r.hedge.counts()
+		}
+		var ru unix.Rusage
+		unix.Getrusage(unix.RUSAGE_SELF, &ru)
+		log.Infof("S3 read trace: closed %s after %d GETs of %d bytes; hedged %d of the file server's %d GETs; process CPU user %v system %v", r.obj, r.gets.Load(), r.bytes.Load(), hedges, gets, time.Duration(ru.Utime.Nano()), time.Duration(ru.Stime.Nano()))
+	}
 	return nil
 }
 
@@ -277,14 +301,14 @@ func (r *Reader) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]statei
 	return stateio.CompletionChanWaitOr(r.cmps, cs, wake)
 }
 
-func (r *Reader) workerMain(ctx context.Context) {
+func (r *Reader) workerMain(ctx context.Context, worker int) {
 	defer r.workers.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case sub := <-r.subs:
-			n, err := r.read(ctx, &sub)
+			n, err := r.read(ctx, &sub, worker)
 			r.cmps <- stateio.Completion{
 				ID:  sub.id,
 				N:   n,
@@ -304,7 +328,7 @@ func (r *Reader) workerMain(ctx context.Context) {
 // it) or that delivers nothing is made again after a backoff (backoffBefore),
 // for as long as ctx lasts, rather than failing the read: a store that is away
 // for a while delays the read, rather than failing it for good.
-func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) {
+func (r *Reader) read(ctx context.Context, sub *readSubmission, worker int) (uint64, error) {
 	var done uint64
 	dst := sub.dst
 	s := &readState{r: r}
@@ -316,7 +340,7 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) 
 		if size := r.size.Load(); size >= 0 && sub.off+int64(done) >= size {
 			return done, io.EOF
 		}
-		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s)
+		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s, worker)
 		done += n
 		if r.whileRunning && transient(err) {
 			if n != 0 {
@@ -401,10 +425,10 @@ func transient(err error) bool {
 	return retry.IsErrorRetryables(retry.DefaultRetryables).IsErrorRetryable(err) == aws.TrueTernary
 }
 
-// readOnce reads up to total bytes at off into dst with one GET. It returns
-// io.EOF if the object ends before them. Its errors are the client's, which
-// read maps.
-func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges, s *readState) (uint64, error) {
+// readOnce reads up to total bytes at off into dst with one GET, made by the
+// given worker. It returns io.EOF if the object ends before them. Its errors
+// are the client's, which read maps.
+func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges, s *readState, worker int) (n uint64, err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.retry.deadline(total))
 	defer cancel()
 	var optFns []func(*s3.Options)
@@ -416,11 +440,34 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 		s.watch(pagesRetryWatchdogTimeout)
 		defer s.unwatch()
 	}
-	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+	in := &s3.GetObjectInput{
 		Bucket: aws.String(r.obj.bucket),
 		Key:    aws.String(r.obj.key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(total)-1)),
-	}, optFns...)
+	}
+	begun := time.Now()
+	var (
+		out              *s3.GetObjectOutput
+		hedged, hedgeWon bool
+		answered         time.Time
+	)
+	if r.trace {
+		defer func() {
+			r.gets.Add(1)
+			r.bytes.Add(n)
+			log.Infof("S3 read trace: %s off %d bytes %d got %d worker %d begun %d answered %d ended %d hedged %t hedge-won %t err %v", r.obj, off, total, n, worker, begun.UnixNano(), answered.UnixNano(), time.Now().UnixNano(), hedged, hedgeWon, err)
+		}()
+	}
+	if r.hedge != nil && !r.Retrying() {
+		var getCancel context.CancelFunc
+		out, getCancel, hedged, hedgeWon, err = r.hedge.get(ctx, r.client, in, optFns...)
+		if getCancel != nil {
+			defer getCancel()
+		}
+	} else {
+		out, err = r.client.GetObject(ctx, in, optFns...)
+	}
+	answered = time.Now()
 	if err != nil {
 		var respErr *awshttp.ResponseError
 		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
@@ -453,7 +500,7 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 			break
 		}
 		m = m[:min(uint64(len(m)), want-done)]
-		n, err := io.ReadFull(body, m)
+		n, err := r.readBody(body, m, off+int64(done))
 		done += uint64(n)
 		if err != nil {
 			bodyErr = err
@@ -468,4 +515,37 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	default:
 		return done, fmt.Errorf("%w after %d of %d bytes: %v", errShortBody, done, want, bodyErr)
 	}
+}
+
+// readBody reads len(m) bytes of body, those of the pages file at off, into
+// m, as io.ReadFull does; through buffers of r.cache, which writes them to the
+// cache, if r.cache is not nil.
+func (r *Reader) readBody(body io.Reader, m []byte, off int64) (int, error) {
+	if r.cache == nil {
+		return io.ReadFull(body, m)
+	}
+	done := 0
+	for done < len(m) {
+		k := min(len(m)-done, cacheChunkBytes)
+		buf := r.cache.buffer()
+		if buf == nil {
+			n, err := io.ReadFull(body, m[done:done+k])
+			r.cache.dropped.Add(uint64(n))
+			done += n
+			if err != nil {
+				return done, err
+			}
+			continue
+		}
+		n, err := io.ReadFull(body, buf[:k])
+		begun := time.Now()
+		copy(m[done:], buf[:n])
+		r.cache.copying.Add(int64(time.Since(begun)))
+		r.cache.write(off+int64(done), buf[:n])
+		done += n
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
 }

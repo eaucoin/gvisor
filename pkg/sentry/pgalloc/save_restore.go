@@ -1513,6 +1513,14 @@ type AsyncPagesFileLoad struct {
 	// loader goroutine.
 	lfStatus syncevent.Waiter
 
+	// If trace is true, the async page loader goroutine logs each read as it
+	// completes (see Trace).
+	trace atomicbitops.Bool
+
+	// If throttled is true, at most one background read is in flight (see
+	// Throttle).
+	throttled atomicbitops.Bool
+
 	// Padding before state used mostly by the async page loader goroutine:
 	_ [hostarch.CacheLineSize]byte
 
@@ -2144,6 +2152,35 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	return apfl, nil
 }
 
+// Trace has the async page loader log each read as it completes: its kind,
+// offset, bytes and gap bytes, when it was issued and completed (Unix
+// nanoseconds), the background bytes in flight at its issue, and the budget, as
+// a line beginning "Async page loading trace:". layer names the pages file in
+// the lines. Trace must be called before MemoryFile.LoadFrom loads from apfl.
+func (apfl *AsyncPagesFileLoad) Trace(layer int) {
+	apfl.trace.Store(true)
+	log.Infof("Async page loading trace: loader %p reads layer %d", apfl, layer)
+}
+
+// Throttle keeps apfl at one background read in flight until Unthrottle, as
+// upstream's background restores do until the kernel is loaded. It must be
+// called before MemoryFile.LoadFrom loads from apfl.
+func (apfl *AsyncPagesFileLoad) Throttle() {
+	apfl.throttled.Store(true)
+}
+
+// Unthrottle lets apfl keep as many background reads in flight as its budget
+// allows.
+func (apfl *AsyncPagesFileLoad) Unthrottle() {
+	if apfl.throttled.Swap(false) {
+		log.Infof("Async page loading: loader %p unthrottled", apfl)
+		select {
+		case apfl.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // activeLoads holds the asynchronous loads of pages files in progress, from
 // StartAsyncPagesFileLoad until their async page loader goroutines end, for
 // CurrentAsyncPageLoadProgress.
@@ -2531,6 +2568,9 @@ func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
 // - apfl.canEnqueue() == true.
 // - apfl.curOp == nil.
 func (apfl *AsyncPagesFileLoad) mayStartBackgroundRead() bool {
+	if apfl.throttled.Load() && apfl.bgInflight != 0 {
+		return false
+	}
 	withinBudget := apfl.bgInflight == 0 || apfl.bgInflight+apfl.maxReadBytes <= apfl.bgBudget.bytes
 	return withinBudget && (apfl.qavail > 1 || len(apfl.ops) == 1)
 }
@@ -2806,6 +2846,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
 	timeStart := aplNanotime()
+	// trace is true if each completion is logged, with its times as Unix
+	// nanoseconds, aplNanotime() plus wallOffset.
+	trace := apfl.trace.Load()
+	wallOffset := time.Now().UnixNano() - timeStart
 	// Background reads may use every slot but one, which is kept for awaited
 	// reads (see mayStartBackgroundRead).
 	apfl.bgBudget.init(timeStart, apfl.maxReadBytes, uint64(max(maxParallel-1, 1))*apfl.maxReadBytes, apfl.parallelReads)
@@ -3026,6 +3070,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				}
 			}
 			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight)
+			if trace {
+				log.Infof("Async page loading trace: loader %p op %d %s off %d bytes %d gap %d issued %d completed %d bg-inflight %d budget %d floor %d drops %d", apfl, c.ID, kind, op.off(), op.total, op.gap, op.issued+wallOffset, now+wallOffset, op.bgInflight, apfl.bgBudget.bytes, apfl.bgBudget.floor, apfl.bgBudget.drops)
+			}
 			if op.firstRound {
 				apfl.firstRoundClosed = true
 				apfl.firstRoundDone++

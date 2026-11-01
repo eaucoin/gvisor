@@ -9,6 +9,8 @@ go_library(
     name = "s3",
     srcs = [
         "errors.go",
+        "cache.go",
+        "hedge.go",
         "reader.go",
         "s3.go",
         "writer.go",

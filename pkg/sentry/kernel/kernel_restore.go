@@ -326,6 +326,23 @@ type AsyncMFLoader struct {
 	loadWg  sync.WaitGroup
 	loadMu  sync.Mutex
 	loadErr error
+
+	// throttled is the loads of the pages files that Unthrottle lets keep
+	// as many background reads in flight as their budgets allow, once they
+	// have started (throttledWg).
+	throttledWg sync.WaitGroup
+	throttled   []*pgalloc.AsyncPagesFileLoad
+}
+
+// AsyncMFLoaderOpts are options of an AsyncMFLoader.
+type AsyncMFLoaderOpts struct {
+	// If Trace is true, the loader of each pages file logs each of its reads
+	// (pgalloc.AsyncPagesFileLoad.Trace).
+	Trace bool
+
+	// If Throttle is true, the loader of each pages file keeps one background
+	// read in flight until Unthrottle (pgalloc.AsyncPagesFileLoad.Throttle).
+	Throttle bool
 }
 
 type privateMFsInfo struct {
@@ -341,7 +358,7 @@ type privateMFsInfo struct {
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline) *AsyncMFLoader {
+func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline, opts AsyncMFLoaderOpts) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
 		image:          image,
 		privateMFsChan: make(chan privateMFsInfo, 1),
@@ -349,11 +366,24 @@ func NewAsyncMFLoader(image *checkpointimage.Image, pagesFiles []stateio.AsyncRe
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(image, pagesFiles, mainMF, prefetch, timeline)
+	if opts.Throttle {
+		mfl.throttledWg.Add(1)
+	}
+	go mfl.backgroundGoroutine(image, pagesFiles, mainMF, prefetch, timeline, opts)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline) {
+// Unthrottle lets the loader of each pages file keep as many background reads
+// in flight as its budget allows, if they were throttled
+// (AsyncMFLoaderOpts.Throttle).
+func (mfl *AsyncMFLoader) Unthrottle() {
+	mfl.throttledWg.Wait()
+	for _, apfl := range mfl.throttled {
+		apfl.Unthrottle()
+	}
+}
+
+func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, pagesFiles []stateio.AsyncReader, mainMF *pgalloc.MemoryFile, prefetch pgalloc.PrefetchPolicy, timeline *timing.Timeline, mflOpts AsyncMFLoaderOpts) {
 	defer timeline.End()
 	cu := cleanup.Make(func() {
 		mfl.metadataWg.Done()
@@ -385,10 +415,23 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, page
 			mfl.mainMetadataErr = err
 			mfl.metadataErr = err
 			mfl.mainMFStartWg.Done()
+			if mflOpts.Throttle {
+				mfl.throttledWg.Done()
+			}
 			return
 		}
 		cu.Add(apfl.MemoryFilesDone)
+		if mflOpts.Trace {
+			apfl.Trace(i)
+		}
+		if mflOpts.Throttle {
+			apfl.Throttle()
+		}
 		opts.PagesFiles[i] = apfl
+	}
+	if mflOpts.Throttle {
+		mfl.throttled = opts.PagesFiles
+		mfl.throttledWg.Done()
 	}
 
 	timeline.Reached("loading mainMF")

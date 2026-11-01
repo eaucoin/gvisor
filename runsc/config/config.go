@@ -492,6 +492,26 @@ type Config struct {
 	// saved in the image before the rest of its memory.
 	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
 
+	// AsyncLoadTrace logs every read of a restore's async page loader as it
+	// completes, and every GET of the S3 checkpoint gofer.
+	AsyncLoadTrace bool `flag:"async-load-trace"`
+
+	// AsyncLoadThrottle keeps a restore's async page loader at one background
+	// read of each pages file in flight until the kernel is loaded, as
+	// upstream's background restores do.
+	AsyncLoadThrottle bool `flag:"async-load-throttle"`
+
+	// CheckpointGoferHedgePercentile, if not 0, has the S3 checkpoint gofer
+	// make a GET of a pages file again on another connection when the store
+	// has not begun to answer it within that percentile of the time it took
+	// to begin answering GETs before, for at most 5% of its GETs.
+	CheckpointGoferHedgePercentile int `flag:"checkpoint-gofer-hedge-percentile"`
+
+	// CheckpointGoferCacheDir, if not empty, is a directory into which the S3
+	// checkpoint gofer writes the bytes of pages files that it reads, with
+	// O_DIRECT, from a buffer of its own, at their offsets.
+	CheckpointGoferCacheDir string `flag:"checkpoint-gofer-cache-dir"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
