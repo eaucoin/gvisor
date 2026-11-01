@@ -17,7 +17,9 @@ package kernel
 import (
 	"errors"
 	"fmt"
+	"io"
 	"slices"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -25,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
 // Dirty tracking.
@@ -300,6 +303,31 @@ func (k *Kernel) beginCoWSave(ctx context.Context, e *DirtyEpochResult, saved []
 		}
 	}
 	return nil
+}
+
+// CoWSaveApplies returns true if a save with these arguments, as SaveTo takes
+// them, is copy-on-write.
+func (k *Kernel) CoWSaveApplies(resume bool, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, precopy *Precopy, fsOpts *FSSaveOpts) bool {
+	return k.dirty.CoW != nil && resume && pagesMetadata != nil && pagesFile != nil && !pagesFile.NeedRegisterSourceFD() && precopy == nil && fsOpts == nil
+}
+
+// PreArmCoWSave prepares a copy-on-write save, with tasks running, just
+// before it pauses them for its save point: it makes the MemoryFiles that the
+// save saves tracked, and arms write-protection in every MemoryManager it
+// reaches, so that the arm at the save point covers only the memory first
+// written since. Completeness rests on that arm, not on this one.
+func (k *Kernel) PreArmCoWSave(ctx context.Context) {
+	start := time.Now()
+	k.mf.EnableDirtyTracking()
+	for _, mf := range k.privateMemoryFiles(ctx) {
+		mf.EnableDirtyTracking()
+	}
+	for _, s := range k.dirty.Sources {
+		if wp, ok := s.(*WriteProtectDirtySource); ok {
+			n := wp.preArm(ctx)
+			log.Infof("Copy-on-write save: pre-armed %d MemoryManagers in %v", n, time.Since(start))
+		}
+	}
 }
 
 // endCoWSave ends a copy-on-write save that began with beginCoWSave, as

@@ -68,6 +68,35 @@ func (s *WriteProtectDirtySource) Arm(ctx context.Context, paused bool) error {
 	return nil
 }
 
+// preArm arms, while tasks run, every MemoryManager that it reaches, each
+// under its own locks and without pausing the kernel, and returns how many
+// it armed. MemoryManagers that it does not reach, such as those of tasks in
+// the middle of execve, are armed by the next Arm.
+func (s *WriteProtectDirtySource) preArm(ctx context.Context) int {
+	seen := make(map[*mm.MemoryManager]struct{})
+	var mms []*mm.MemoryManager
+	s.k.tasks.mu.RLock()
+	for t := range s.k.tasks.Root.tids {
+		t.WithMuLocked(func(t *Task) {
+			m := t.image.MemoryManager
+			if m == nil {
+				return
+			}
+			if _, ok := seen[m]; ok || !m.IncUsers() {
+				return
+			}
+			seen[m] = struct{}{}
+			mms = append(mms, m)
+		})
+	}
+	s.k.tasks.mu.RUnlock()
+	for _, m := range mms {
+		m.ArmDirtyTracking(s.unit)
+		m.DecUsers(ctx)
+	}
+	return len(mms)
+}
+
 // Harvest implements DirtySource.Harvest. First writes are recorded when they
 // fault, so there is nothing to harvest.
 func (*WriteProtectDirtySource) Harvest(context.Context) error {

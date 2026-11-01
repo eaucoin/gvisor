@@ -174,15 +174,17 @@ jobs:
       - name: Test logs
         if: always()
         run: |
-          # The logs and outputs (runsc's own logs among them) of the runs that
-          # failed, kept as an artifact.
+          # The logs and outputs (runsc's own logs among them) of every run,
+          # kept as an artifact.
           mkdir -p "${RUNNER_TEMP}/testlogs"
-          make testlogs | while read -r label log; do
-            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
-            mkdir -p "${dir}"
-            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
-            echo "${label}"
-          done
+          jq -r 'select(.testResult?) | .id.testResult as $id | .testResult.testActionOutput[]? | select(.name == "test.log") | "\($id.label) \($id.shard // 0)-\($id.run // 0) \(.uri)"' .build_events.json | sed -e 's|file://||' |
+            while read -r label run log; do
+              dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")/${run}"
+              mkdir -p "${dir}"
+              cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+              echo "${label} ${run}"
+            done
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

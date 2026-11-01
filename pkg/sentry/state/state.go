@@ -158,6 +158,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		}
 	}
 
+	if k.CoWSaveApplies(opts.Resume, opts.PagesMetadata, opts.PagesFile, precopy, opts.FSSaveOpts) {
+		k.PreArmCoWSave(ctx)
+	}
 	log.Infof("Sandbox save started, pausing all tasks.")
 	pauseStart := time.Now()
 	k.Pause()

@@ -862,7 +862,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	// A copy-on-write save ends its pause at its save point, and writes its
 	// pages while tasks run: it must resume them, and write a pages file
 	// from its own copies of the pages.
-	cow := k.dirty.CoW != nil && resume && pagesMetadata != nil && pagesFile != nil && !pagesFile.NeedRegisterSourceFD() && precopy == nil && fsOpts == nil
+	cow := k.CoWSaveApplies(resume, pagesMetadata, pagesFile, precopy, fsOpts)
 	var (
 		mfSaveWg  sync.WaitGroup
 		mfSaveErr error
