@@ -1229,11 +1229,14 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 			return fmt.Errorf("network configuration cannot be nil during restore")
 		}
 		log.Infof("Reconfiguring network for restore")
+		netStart := time.Now()
 		s.ResetConfig()
 		if err := networkArgs.ConfigureNetwork(s); err != nil {
 			return fmt.Errorf("configuring network: %w", err)
 		}
+		configured := time.Since(netStart)
 		s.Restore()
+		log.Infof("Network stack restore: configured in [%s], restored in [%s]", configured, time.Since(netStart)-configured)
 		timeline.Reached("Network stack restored")
 	}
 

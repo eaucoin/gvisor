@@ -16,6 +16,7 @@ package gofer
 
 import (
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -597,12 +598,23 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 //   - !d.isSynthetic().
 //   - d.parent != nil and has been restored.
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
+	stats := &d.inode.fs.restoreStats
+	switch {
+	case d.isDir():
+		stats.dirs++
+	case d.inode.isRegularFile():
+		stats.regular++
+	default:
+		stats.others++
+	}
+	start := time.Now()
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
 		// With inode sharing, we may have multiple references to the same inode.
 		// There is a possibility we try to restore the same inode multiple times.
 		// If we already have a controlFD, we don't need to do anything.
 		if it.controlFD.Ok() {
+			stats.shared++
 			return nil
 		}
 		controlFD := d.parent.Load().inode.impl.(*lisafsInode).controlFD
@@ -619,13 +631,18 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 				return fmt.Errorf("failed to create mountpoint directory at %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 		}
-		return it.restoreInode(ctx, &inode, opts, d)
+		stats.walk += time.Since(start)
+		start = time.Now()
+		err = it.restoreInode(ctx, &inode, opts, d)
+		stats.inode += time.Since(start)
+		return err
 
 	case *directfsInode:
 		// With inode sharing, we may have multiple references to the same inode.
 		// There is a possibility we try to restore the same inode multiple times.
 		// If we already have a controlFD, we don't need to do anything.
 		if it.controlFD >= 0 {
+			stats.shared++
 			return nil
 		}
 		controlFD := d.parent.Load().inode.impl.(*directfsInode).controlFD
@@ -652,7 +669,11 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 				return fmt.Errorf("failed to open %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 		}
-		return it.restoreFile(ctx, childFD, opts, d)
+		stats.walk += time.Since(start)
+		start = time.Now()
+		err = it.restoreFile(ctx, childFD, opts, d)
+		stats.inode += time.Since(start)
+		return err
 
 	default:
 		panic("unknown inode implementation")

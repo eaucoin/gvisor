@@ -267,6 +267,11 @@ type filesystem struct {
 	// save/restore. These are still accessible via open application FDs.
 	savedDeletedOpenDentries map[*dentry]struct{}
 
+	// saveStats and restoreStats count and time the last PrepareSave and
+	// CompleteRestore, for a measurement build.
+	saveStats    saveStats    `state:"nosave"`
+	restoreStats restoreStats `state:"nosave"`
+
 	// released is nonzero once filesystem.Release has been called.
 	released atomicbitops.Int32
 }

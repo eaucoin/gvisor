@@ -20,6 +20,7 @@ import (
 	"math"
 	"path"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -897,7 +898,10 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 	// Check metadata stability before updating metadata.
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
+	stats := &i.fs.restoreStats
+	start := time.Now()
 	if i.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(i.fs.iopts.UniqueID, genericDebugPathname(i.fs, d)) {
+		stats.validated++
 		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
 		if opts.ValidateFileSizes {
 			if savedSize != uint64(stat.Size) {
@@ -910,12 +914,17 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 			}
 		}
 	}
+	stats.validate += time.Since(start)
 	if !i.cachedMetadataAuthoritative() {
 		i.updateMetadataFromStatxLocked(&stat)
 	}
 
 	if rw, ok := i.fs.savedDentryRW[d]; ok {
-		if err := d.ensureSharedHandle(ctx, rw.read, rw.write, false /* trunc */); err != nil {
+		start := time.Now()
+		err := d.ensureSharedHandle(ctx, rw.read, rw.write, false /* trunc */)
+		stats.handles++
+		stats.handle += time.Since(start)
+		if err != nil {
 			return fmt.Errorf("failed to restore file handles (read=%t, write=%t) for %q in mount %q: %w", rw.read, rw.write, genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, err)
 		}
 	}
