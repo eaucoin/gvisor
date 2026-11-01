@@ -16,6 +16,7 @@ package pgalloc
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -96,6 +97,11 @@ type workingSet struct {
 	// each goroutine in each millisecond since start, in order, which
 	// stopLocked logs.
 	touches []workingSetTouch
+
+	// image holds, while logAwaitedLoads, the ranges of the MemoryFile that
+	// it was restored from an image with, in order: a touch's bytes in them
+	// were the image's, the others new.
+	image []memmap.FileRange
 
 	// set is the latest working set: recorded after the last restore, or, if
 	// none was, carried by the image restored.
@@ -214,10 +220,10 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 	if !ws.recording.Load() {
 		return
 	}
-	added := uint64(0)
+	var added, addedImage uint64
 	defer func() {
 		if added != 0 && logAwaitedLoads.Load() {
-			ws.traceLocked(added)
+			ws.traceLocked(added, addedImage)
 		}
 	}()
 	for u := fr.Start / ws.unit; u < (fr.End+ws.unit-1)/ws.unit; u++ {
@@ -230,6 +236,7 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 		}
 		ws.seen[word] |= bit
 		added += ws.unit
+		addedImage += ws.imageBytesLocked(memmap.FileRange{Start: u * ws.unit, End: (u + 1) * ws.unit})
 		start := u * ws.unit
 		if n := len(ws.extents); n != 0 && ws.extents[n-1].End == start {
 			ws.extents[n-1].End += ws.unit
@@ -246,28 +253,56 @@ func (f *MemoryFile) RecordTouch(fr memmap.FileRange) {
 }
 
 // workingSetTouch is the bytes of units that a goroutine touched first in a
-// millisecond of a working set's recording.
+// millisecond of a working set's recording, and of those the bytes that the
+// image the MemoryFile was restored from held.
 type workingSetTouch struct {
-	ms    int64
-	goid  int64
-	bytes uint64
+	ms         int64
+	goid       int64
+	bytes      uint64
+	imageBytes uint64
+}
+
+// setImage sets the ranges that f was restored with from its image to those
+// of extents.
+func (ws *workingSet) setImage(extents []*pgallocpb.ExtentProto) {
+	ranges := make([]memmap.FileRange, 0, len(extents))
+	for _, e := range extents {
+		ranges = append(ranges, memmap.FileRange{Start: e.Start, End: e.End})
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.image = ranges
+}
+
+// imageBytesLocked returns the bytes of fr that ws.image holds.
+//
+// Preconditions: ws.mu must be locked.
+func (ws *workingSet) imageBytesLocked(fr memmap.FileRange) uint64 {
+	i := sort.Search(len(ws.image), func(i int) bool { return ws.image[i].End > fr.Start })
+	var bytes uint64
+	for ; i < len(ws.image) && ws.image[i].Start < fr.End; i++ {
+		bytes += ws.image[i].Intersect(fr).Length()
+	}
+	return bytes
 }
 
 // traceLocked adds bytes, of units that the calling goroutine touched first
-// now, to ws.touches.
+// now, imageBytes of them the image's, to ws.touches.
 //
 // Preconditions: ws.mu must be locked.
-func (ws *workingSet) traceLocked(bytes uint64) {
-	t := workingSetTouch{ms: time.Since(ws.start).Milliseconds(), goid: goid.Get(), bytes: bytes}
+func (ws *workingSet) traceLocked(bytes, imageBytes uint64) {
+	t := workingSetTouch{ms: time.Since(ws.start).Milliseconds(), goid: goid.Get(), bytes: bytes, imageBytes: imageBytes}
 	if n := len(ws.touches); n != 0 && ws.touches[n-1].ms == t.ms && ws.touches[n-1].goid == t.goid {
 		ws.touches[n-1].bytes += bytes
+		ws.touches[n-1].imageBytes += imageBytes
 		return
 	}
 	ws.touches = append(ws.touches, t)
 }
 
-// logTouchesLocked logs ws.touches, as ms:goid:bytes, in lines of at most
-// touchesPerLine.
+// logTouchesLocked logs ws.touches, as ms:goid:bytes:imagebytes, in lines of
+// at most touchesPerLine.
 //
 // Preconditions: ws.mu must be locked.
 func (ws *workingSet) logTouchesLocked() {
@@ -275,9 +310,9 @@ func (ws *workingSet) logTouchesLocked() {
 	for i := 0; i < len(ws.touches); i += touchesPerLine {
 		var b strings.Builder
 		for _, t := range ws.touches[i:min(i+touchesPerLine, len(ws.touches))] {
-			fmt.Fprintf(&b, " %d:%d:%d", t.ms, t.goid, t.bytes)
+			fmt.Fprintf(&b, " %d:%d:%d:%d", t.ms, t.goid, t.bytes, t.imageBytes)
 		}
-		log.Infof("Working set first touches %d-%d of %d since %s (ms:goid:bytes):%s", i, min(i+touchesPerLine, len(ws.touches))-1, len(ws.touches), ws.start.UTC().Format(time.RFC3339Nano), b.String())
+		log.Infof("Working set first touches %d-%d of %d since %s (ms:goid:bytes:imagebytes):%s", i, min(i+touchesPerLine, len(ws.touches))-1, len(ws.touches), ws.start.UTC().Format(time.RFC3339Nano), b.String())
 	}
 }
 
