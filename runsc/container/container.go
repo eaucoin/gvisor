@@ -410,7 +410,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		var err error
 
 		cpuLimits = newCPULimits(conf, args.Spec.Linux.Resources, willRestoreSandbox(args))
-		if parentPath, inPod := args.Spec.Annotations[cgroupParentAnnotation]; inPod && cpuLimits != nil {
+		if parentPath, inPod := args.Spec.Annotations[specutils.CgroupParentAnnotation]; inPod && cpuLimits != nil {
 			logCPUPoliciesNotApplied(conf, fmt.Sprintf("the orchestrator owns the pod cgroup %q. Note that this means gVisor sandbox lifecycle operations are being capped by the pod CPU limit, and could go faster otherwise", parentPath))
 			cpuLimits = nil
 		}
@@ -775,7 +775,7 @@ func (c *Container) Update(conf *config.Config, res *specs.LinuxResources) error
 				return fmt.Errorf("cgroup cannot be nil")
 			}
 			oldCPULimits := c.Sandbox.CPULimits
-			if _, inPod := c.Spec.Annotations[cgroupParentAnnotation]; !inPod && cgroup.OwnsCPULimit(cg) {
+			if _, inPod := c.Spec.Annotations[specutils.CgroupParentAnnotation]; !inPod && cgroup.OwnsCPULimit(cg) {
 				c.Sandbox.CPULimits = newCPULimits(conf, res, oldCPULimits != nil && oldCPULimits.WillRestore)
 			}
 			if err := cg.Update(c.cgroupResources(res)); err != nil {
