@@ -716,6 +716,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 }
 
 func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
+	start := time.Now()
 	// Do not allow other Kernel methods to affect it while it's being saved.
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
@@ -731,6 +732,7 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	// Evict all evictable MemoryFile allocations.
 	k.mf.StartEvictions()
 	k.mf.WaitForEvictions()
+	log.Infof("Quiesced in [%s].", time.Since(start))
 
 	return f()
 }
@@ -834,6 +836,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if err := k.vfs.PrepareSave(vfsCtx); err != nil {
 		return err
 	}
+	log.Infof("Unsavable mappings invalidated and filesystems prepared in [%s].", time.Since(saveStart))
 	// Mark all to-be-saved MemoryFiles as savable to inform kernel save below.
 	k.mf.MarkSavable()
 	for _, mf := range mfsToSave {
@@ -910,6 +913,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		if err != nil {
 			return err
 		}
+		log.Infof("Dirty tracking epoch ended (copy-on-write: %t) at [%s].", cow, time.Since(saveStart))
 	}
 
 	parallelMFSave := pagesMetadata != nil

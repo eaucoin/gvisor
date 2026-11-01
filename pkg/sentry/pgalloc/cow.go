@@ -230,6 +230,7 @@ func (f *MemoryFile) FreezeForCoWSave(opts *SaveOpts, dirty *DirtySet, cowOpts C
 	if !f.dirty.tracked.Load() {
 		return fmt.Errorf("a copy-on-write save requires dirty tracking")
 	}
+	start := gohacks.Nanotime()
 	if opts.Clean == nil {
 		if err := f.AwaitLoadAll(); err != nil {
 			return fmt.Errorf("previous async page loading failed: %w", err)
@@ -311,7 +312,7 @@ func (f *MemoryFile) FreezeForCoWSave(opts *SaveOpts, dirty *DirtySet, cowOpts C
 	if c.pendingBytes != 0 {
 		f.cow.Store(c)
 	}
-	log.Infof("MemoryFile(%p): copy-on-write save point: %d bytes pending of %d bytes", f, c.pendingBytes, size)
+	log.Infof("MemoryFile(%p): copy-on-write save point: %d bytes pending of %d bytes, frozen in %s", f, c.pendingBytes, size, time.Duration(gohacks.Nanotime()-start))
 	return nil
 }
 
