@@ -18,8 +18,10 @@ import (
 	goContext "context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -74,9 +76,11 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 	}()
 	for _, fs := range fss {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
+			start := time.Now()
 			if err := ext.PrepareSave(ctx); err != nil {
 				return err
 			}
+			log.Infof("VFS PrepareSave of %q filesystem took [%s]", fs.fsType.Name(), time.Since(start))
 		}
 	}
 	return nil
@@ -104,9 +108,11 @@ func (vfs *VirtualFilesystem) CompleteRestore(ctx context.Context, opts *Complet
 	}()
 	for _, fs := range fss {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
+			start := time.Now()
 			if err := ext.CompleteRestore(ctx, *opts); err != nil {
 				return PrependErrMsg(fmt.Sprintf("failed to complete restore for filesystem type %q", fs.fsType.Name()), err)
 			}
+			log.Infof("VFS CompleteRestore of %q filesystem took [%s]", fs.fsType.Name(), time.Since(start))
 		}
 	}
 	return nil

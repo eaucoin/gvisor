@@ -2182,13 +2182,16 @@ func (s *Stack) Restore() {
 	eps := s.restoredEndpoints
 	s.restoredEndpoints = nil
 	s.mu.Unlock()
+	start := time.Now()
 	for _, e := range eps {
 		e.Restore(s)
 	}
+	restored := time.Since(start)
 
 	// Make sure all the endpoints are loaded correctly before resuming the
 	// protocol level background workers.
 	tcpip.AsyncLoading.Wait()
+	log.Infof("netstack: %d endpoints restored in [%s], async loading waited [%s]", len(eps), restored, time.Since(start)-restored)
 
 	// Now restore any protocol level background workers.
 	for _, p := range s.transportProtocols {
