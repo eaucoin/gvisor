@@ -85,7 +85,7 @@ const cowSweepBytes = 256 << 10
 
 // cowSweepInFlightMax is the most bytes that the copier keeps captured by its
 // sweep and not yet written.
-const cowSweepInFlightMax = 64 << 20
+const cowSweepInFlightMax = 16 << 20
 
 // cowPage values: the result of a captured page, from which SaveTo builds the
 // image's extents. Other values are 1 + the offset in the pages file at which
@@ -170,14 +170,37 @@ type cowSave struct {
 	// +checklocks:mu
 	stagedPeak uint64
 
+	// free holds the buffers that captured pages are all written from,
+	// for captures to reuse: the save allocates no more buffers than it
+	// holds captured pages at once.
+	//
+	// +checklocks:mu
+	free []*cowBuf
+
 	// wake is notified when a run is captured or a write completes.
 	wake chan struct{}
 }
 
-// cowRun is a run of pages captured together.
+// cowBufSize is the size of the buffers that pages are captured to: runs
+// are captured in pieces of at most this many bytes, each in a buffer of its
+// own, which is reused once every byte of it is written.
+const cowBufSize = 64 << 10
+
+// cowBuf is a buffer that pages are captured to.
+type cowBuf struct {
+	data [cowBufSize]byte
+
+	// left is the number of bytes captured to the buffer that are not yet
+	// written to the pages file nor found not to need writing. left is
+	// protected by the cowSave's mu.
+	left uint64
+}
+
+// cowRun is a run of pages captured together, to one buffer.
 type cowRun struct {
 	fr   memmap.FileRange
 	data []byte
+	buf  *cowBuf
 	// mark is true if a mark captured the run, and false if the copier did.
 	mark bool
 }
@@ -360,16 +383,27 @@ func (c *cowSave) captureLocked(fr memmap.FileRange, mark bool) {
 //
 // +checklocks:c.mu
 func (c *cowSave) captureRunLocked(run memmap.FileRange, mark bool) {
-	data := make([]byte, run.Length())
-	n := 0
-	c.f.forEachMappingSlice(run, func(bs []byte) {
-		n += copy(data[n:], bs)
-	})
+	for start := run.Start; start < run.End; start += cowBufSize {
+		piece := memmap.FileRange{start, min(start+cowBufSize, run.End)}
+		var buf *cowBuf
+		if n := len(c.free); n != 0 {
+			buf = c.free[n-1]
+			c.free = c.free[:n-1]
+		} else {
+			buf = new(cowBuf)
+		}
+		buf.left = piece.Length()
+		data := buf.data[:piece.Length()]
+		n := 0
+		c.f.forEachMappingSlice(piece, func(bs []byte) {
+			n += copy(data[n:], bs)
+		})
+		c.captured = append(c.captured, cowRun{fr: piece, data: data, buf: buf, mark: mark})
+	}
 	for page := run.Start / hostarch.PageSize; page < run.End/hostarch.PageSize; page++ {
 		c.pending[page/64] &^= 1 << (page % 64)
 	}
 	c.pendingBytes -= run.Length()
-	c.captured = append(c.captured, cowRun{fr: run, data: data, mark: mark})
 	if mark {
 		c.markCaptures++
 		c.markBytes += run.Length()
@@ -392,11 +426,14 @@ func (c *cowSave) notify() {
 	}
 }
 
-// written releases n bytes of a run once they are written or found not to
-// need writing.
-func (c *cowSave) written(mark bool, n uint64) {
+// written releases n bytes of r once they are written or found not to need
+// writing; its buffer is reused once all of them are.
+func (c *cowSave) written(r cowRun, n uint64) {
 	c.mu.Lock()
-	if mark {
+	if r.buf.left -= n; r.buf.left == 0 {
+		c.free = append(c.free, r.buf)
+	}
+	if r.mark {
 		c.staged -= n
 		c.stagedCond.Broadcast()
 	} else {
@@ -464,7 +501,7 @@ func (f *MemoryFile) cowSaveTo(ctx context.Context, w io.Writer, c *cowSave, opt
 	)
 	// process writes the pages of r that hold data that is not in base.
 	process := func(r cowRun) {
-		release := func(n uint64) { c.written(r.mark, n) }
+		release := func(n uint64) { c.written(r, n) }
 		var runStart uint64
 		var runData []byte
 		flush := func() {
@@ -523,7 +560,7 @@ func (f *MemoryFile) cowSaveTo(ctx context.Context, w io.Writer, c *cowSave, opt
 		}
 		flush()
 		if unwritten != 0 {
-			c.written(r.mark, unwritten)
+			c.written(r, unwritten)
 		}
 	}
 
