@@ -26,22 +26,15 @@ env:
   SERIES_REF: ${{ github.sha }}
 
 jobs:
-  bazel:
-    name: Bazel build and affected tests
+  # The Bazel job passed at d9edc28bb7 (run 41317539294: the release build, both
+  # engines' smoke test, runsc/container's tests built, 179 of 179 affected
+  # tests); only this workflow changes since, so tier 1's checks and the go
+  # branch build finish it.
+  checks:
+    name: Lint, license headers and documentation links
     runs-on: ubuntu-latest
-    timeout-minutes: 330
-    outputs:
-      base: ${{ steps.base.outputs.base }}
+    timeout-minutes: 30
     steps:
-      - name: The runner's CPU and kernel, as pinned
-        run: |
-          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
-          release=$(uname -r)
-          echo "$model, $release"
-          [ "$model" = "AMD EPYC 7763 64-Core Processor" ] || { echo "::error::this runner's CPU is $model: re-run this job"; exit 3; }
-          [[ $release == 7.0.* ]] || { echo "::error::this runner's kernel is $release: re-run this job"; exit 3; }
-      - name: Allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -49,60 +42,36 @@ jobs:
           persist-credentials: false
       - id: base
         run: echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: License headers
+        run: tools/check_license_headers.sh "${{ steps.base.outputs.base }}"
+      - name: Documentation links
+        run: tools/fork/check_links.sh "${{ steps.base.outputs.base }}"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          path: /home/runner/.cache/bazel/disk
-          key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
-          restore-keys: bazel-${{ steps.base.outputs.base }}-
-      - name: Build the release binaries
+          go-version-file: go.mod
+          cache: false
+      - name: Lint
+        run: make lint
+
+  go:
+    name: Go branch build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Generate the go branch
         run: |
-          mkdir -p "${RUNNER_TEMP}/release"
-          make copy BAZEL_OPTIONS=--keep_going TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
-          "${RUNNER_TEMP}/release/runsc" --version
-      # Kept whatever the tests after say, for the engine A/B.
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-${{ github.sha }}
-          path: ${{ runner.temp }}/release
-          retention-days: 7
-      - name: Smoke test, graph engine (upstream's default)
-        run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
-      - name: Smoke test, wire engine
-        run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --state-engine=wire
-      - name: Build runsc/container's tests
-        run: make build BAZEL_OPTIONS=--keep_going TARGETS=//runsc/container:container_test
-      - name: Affected tests
-        # Run whatever the build of runsc/container's tests said, so that one
-        # push shows every package that does not compile.
-        if: success() || failure()
-        run: |
-          tools/fork/affected_tests.sh "${{ steps.base.outputs.base }}" >/tmp/affected.query
-          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
-          "${bazel[@]}" query --query_file=/tmp/affected.query | sort >"${RUNNER_TEMP}/tests"
-          {
-            echo "### $(wc -l <"${RUNNER_TEMP}/tests") affected tests"
-            sed 's/^/- /' "${RUNNER_TEMP}/tests"
-          } >>"${GITHUB_STEP_SUMMARY}"
-          make test OPTIONS="${TEST_OPTIONS} --keep_going --test_tag_filters=-requires-kvm,-manual --build_tag_filters=-network_plugins --test_env=CGROUPV2=true --test_env=GVISOR_REQUIRE_UFFD_WP=1" \
-            TARGETS="$(tr '\n' ' ' <"${RUNNER_TEMP}/tests")"
-      - name: Test logs
-        if: failure()
-        run: |
-          mkdir -p "${RUNNER_TEMP}/testlogs"
-          make testlogs | while read -r label log; do
-            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
-            mkdir -p "${dir}"
-            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
-            echo "${label}"
-          done
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
-        with:
-          name: testlogs-${{ github.sha }}
-          path: ${{ runner.temp }}/testlogs
-          retention-days: 14
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: always()
-        with:
-          path: /home/runner/.cache/bazel/disk
-          key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
+          git config --global user.name "gVisor bot"
+          git config --global user.email "gvisor-bot@google.com"
+          tools/go_branch.sh
+          git checkout go
+          git clean -xffd
+      - name: go build ./...
+        run: go build ./...
