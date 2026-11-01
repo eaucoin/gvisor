@@ -247,6 +247,19 @@ restored() {
   fi
 }
 
+# socket NAME waits for the socket of standby pod NAME, which its shim makes as
+# it starts it.
+socket() {
+  local -r start="$(now_ms)"
+  until sudo test -S "${SOCKETS}/$1.sock"; do
+    if (( $(now_ms) - start > 60000 )); then
+      echo "standby $1 has no socket after a minute" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
 # restore_standby NAME BODY asks the shim of standby pod NAME to restore, as
 # BODY says: its answer.
 restore_standby() {
@@ -293,7 +306,7 @@ for (( run = 1; run <= RUNS; run++ )); do
   made="$(now_ms)"
   pod "standby-${run}" "dev.gvisor.internal.restore.standby=/run/standby/standby-${run}.sock"
   running "standby-${run}"
-  until sudo test -S "${SOCKETS}/standby-${run}.sock"; do sleep 0.05; done
+  socket "standby-${run}"
   start="$(now_ms)"
   answer="$(restore_standby "standby-${run}" '{"imagePath": "/checkpoints/exit"}')"
   answered="$(now_ms)"
@@ -312,9 +325,9 @@ for (( run = 1; run <= RUNS; run++ )); do
 done
 
 # Restored paused: it counts nothing until resumed.
-pod paused
+pod paused "dev.gvisor.internal.restore.standby=/run/standby/paused.sock"
 running paused
-until sudo test -S "${SOCKETS}/paused.sock"; do sleep 0.05; done
+socket paused
 restore_standby paused '{"imagePath": "/checkpoints/exit", "paused": true}' >/dev/null
 sleep 2
 # An exec into a paused sandbox runs nothing until it is resumed.
@@ -332,8 +345,9 @@ echo "A standby restored paused counts once resumed."
 gone paused
 
 # A standby deleted before any restore goes, its containers' exits reported.
-pod unused
+pod unused "dev.gvisor.internal.restore.standby=/run/standby/unused.sock"
 running unused
+socket unused
 start="$(now_ms)"
 gone unused
 echo "An unused standby deleted in $(( $(now_ms) - start )) ms."

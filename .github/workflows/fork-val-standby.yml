@@ -55,6 +55,7 @@ jobs:
       - name: The shim's tests
         run: make test OPTIONS="${TEST_OPTIONS}" TARGETS=//pkg/shim/v1/runsc:runsc_test
       - name: Restores into standby sandboxes
+        timeout-minutes: 30
         run: tools/fork/standby_test.sh "${RUNNER_TEMP}/release" "${RUNNER_TEMP}/standby.jsonl"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
