@@ -75,6 +75,8 @@ done
 {
   echo 'binary_name = "/opt/gvisor/runsc"'
   echo 'restore_background = true'
+  echo 'log_path = "/var/log/runsc/shim/%ID%.log"'
+  echo 'log_level = "debug"'
   echo '[runsc_config]'
   echo '  debug-log = "/var/log/runsc/%ID%/"'
   echo '  debug-command = "boot"'
@@ -97,6 +99,8 @@ cleanup() {
     on_node kubectl -n "${NS}" get pods -o wide >&2 || true
     on_node kubectl -n "${NS}" get events --sort-by=.lastTimestamp >&2 || true
     on_node sh -c 'find /var/log/runsc -name "*.boot.txt" -exec tail -n 30 {} +' >&2 || true
+    on_node sh -c 'tail -n 60 /var/log/runsc/shim/*.log' >&2 || true
+    on_node tail -n 80 /var/lib/rancher/k3s/agent/containerd/containerd.log >&2 || true
     sudo docker logs --tail 50 "${NODE}" >&2 || true
   fi
   sudo docker rm -f "${NODE}" >/dev/null 2>&1 || true

@@ -252,7 +252,7 @@ func (srv *standbyServer) watch() {
 		if n == 0 {
 			continue
 		}
-		log.L.Infof("Standby sandbox (PID %d) exited before a restore into it", srv.pid)
+		log.L.Infof("Standby sandbox (PID %d) exited before a restore into it (poll events %#x)", srv.pid, fds[0].Revents)
 		srv.close()
 		for _, c := range srv.s.createdContainers() {
 			if c.takeStandby() != nil {
