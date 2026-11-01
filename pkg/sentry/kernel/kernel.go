@@ -180,12 +180,14 @@ type Kernel struct {
 	// estimates the cost of the next save's page writes.
 	pagesWriteCost time.Duration `state:"nosave"`
 
-	// dirtyLimit is the rate in bytes per second at which each
-	// MemoryManager's tasks may dirty memory, or 0 if there is no limit;
-	// dirtyLimitSession identifies the period during which it applies. See
+	// dirtyLimit is the rate in bytes per second at which tasks may dirty
+	// memory, all MemoryManagers together, or 0 if there is no limit;
+	// dirtyLimitSession identifies the period during which it applies, and
+	// dirtyLimiter charges what tasks dirty against it. See
 	// PrecopyOpts.Throttle.
 	dirtyLimit        atomicbitops.Uint64 `state:"nosave"`
 	dirtyLimitSession atomicbitops.Uint64 `state:"nosave"`
+	dirtyLimiter      mm.DirtyLimiter     `state:"nosave"`
 
 	// dirtyLimitLongestDelay is the longest that the limit delayed a task
 	// since it was set, in nanoseconds.

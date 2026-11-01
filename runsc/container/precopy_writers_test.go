@@ -35,10 +35,10 @@ import (
 // write-protection in 64 KiB units, small pages), five times each, and logs
 // what the sandbox says of each pre-copy's rounds and pause: 1 GiB to the
 // local disk, and 256 MiB to a store that takes 32 MiB/s, below the writers'
-// dirtying rate. Throttling limits each MemoryManager's dirtying to a quarter
-// of the measured write speed, so that writers in several processes dirty
-// memory together at several times that: this measures whether the pause then
-// grows with their number. Each image, restored, must pass every writer's
+// dirtying rate. Throttling limited each MemoryManager's dirtying to a quarter
+// of the measured write speed, so that writers in several processes dirtied
+// memory together at several times that; it limits all of them together now:
+// this measures whether the pause grows with their number. Each image, restored, must pass every writer's
 // check.
 func TestCheckpointPrecopyWriters(t *testing.T) {
 	const runs = 5
