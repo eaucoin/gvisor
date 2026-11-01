@@ -8,6 +8,7 @@ package(
 go_library(
     name = "state",
     srcs = [
+        "release.go",
         "state.go",
         "state_metadata.go",
         "state_unsafe.go",
@@ -24,6 +25,7 @@ go_library(
         "//pkg/sentry/time",
         "//pkg/sentry/watchdog",
         "//pkg/state/statefile",
+        "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

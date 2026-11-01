@@ -38,6 +38,7 @@ type Checkpoint struct {
 	containerLoader
 	imagePath                 string
 	leaveRunning              bool
+	abortRelease              bool
 	compression               CheckpointCompression
 	excludeCommittedZeroPages bool
 	cudaCheckpointPath        string
@@ -78,6 +79,7 @@ func (*Checkpoint) Usage() string {
 func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved container image")
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
+	f.BoolVar(&c.abortRelease, "abort-release", false, "checkpoint nothing, but abort the container's checkpoint under way without --leave-running, if it is copy-on-write (--cow=on) and its pages are not written yet: its processes resume once its memory is saved, and the container runs on, as after a checkpoint with --leave-running")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
@@ -118,6 +120,13 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
+	}
+
+	if c.abortRelease {
+		if err := cont.Sandbox.AbortRelease(); err != nil {
+			util.Fatalf("aborting the release: %v", err)
+		}
+		return subcommands.ExitSuccess
 	}
 
 	if c.imagePath == "" {

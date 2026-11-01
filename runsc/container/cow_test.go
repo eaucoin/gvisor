@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/sandbox"
 )
@@ -157,6 +158,105 @@ func bootLogSince(t *testing.T, start time.Time, whats ...string) []string {
 	}
 	slices.Sort(said)
 	return said
+}
+
+// release checkpoints the container without leaving it running, to a new
+// image directory, and returns the directory. If abortAfter is not negative,
+// it asks the release to abort abortAfter after it starts, and returns
+// whether the abort was taken: the release may have written its pages
+// already.
+func (w *abwriter) release(abortAfter time.Duration) (string, bool, error) {
+	w.t.Helper()
+	w.images++
+	image := filepath.Join(w.dir, fmt.Sprint("image-", w.images))
+	if err := os.Mkdir(image, 0755); err != nil {
+		w.t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- w.cont.Checkpoint(w.conf, image, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone})
+	}()
+	if abortAfter < 0 {
+		return image, false, <-done
+	}
+	time.Sleep(abortAfter)
+	// The release can be aborted once the sandbox begins it.
+	for {
+		err := w.cont.Sandbox.AbortRelease()
+		if err == nil {
+			return image, true, <-done
+		}
+		select {
+		case err := <-done:
+			return image, false, err
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// TestCheckpointCoWRelease releases the A-B writer, rewriting random pages of
+// its 256 MiB at 50 MiB/s, with checkpoints that do not leave it running, to
+// the local disk and to a store that takes 16 MiB/s, with dirty tracking and
+// the captured pages verified. A copy-on-write release keeps the writer
+// paused until its pages are written, then kills it; its image must pass the
+// writer's check of every page once restored. A release asked to abort, at
+// once (before its save point) or 300 ms in (while its pages are written),
+// must resume the writer, which must pass its check running, and write an
+// image that passes it restored. The writer's longest gap and the sandbox's
+// lines on the release are logged beside those of a release that is not
+// copy-on-write.
+func TestCheckpointCoWRelease(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, store := range []struct {
+			name string
+			rate uint64
+		}{
+			{"local", 0},
+			{"16MiBps", 16 << 20},
+		} {
+			for _, test := range []struct {
+				name       string
+				cow        bool
+				abortAfter time.Duration
+			}{
+				{"release/cow=false", false, -1},
+				{"release/cow=true", true, -1},
+				{"abort-at-once", true, 0},
+				{"abort-300ms", true, 300 * time.Millisecond},
+			} {
+				t.Run(fmt.Sprintf("%s/%s/%s", name, store.name, test.name), func(t *testing.T) {
+					start := time.Now()
+					w := startABWriter(t, cowConf(t, conf, store.rate, test.cow, config.DirtyTrackingBreakNone), "256", "50")
+					w.gap()
+					image, aborted, err := w.release(test.abortAfter)
+					if err != nil {
+						t.Fatalf("error releasing: %v", err)
+					}
+					if aborted {
+						t.Logf("aborted; longest gap %v; the sandbox's lines: %v", w.gap(), releaseLines(t, start))
+						if got := w.check(); !strings.HasPrefix(got, "PASS ") {
+							t.Errorf("abwriter's check running after the aborted release: %s", got)
+						}
+					} else {
+						if test.abortAfter >= 0 {
+							t.Logf("not aborted: the release had written its pages")
+						}
+						t.Logf("released; the sandbox's lines: %v", releaseLines(t, start))
+					}
+					w.restore(image, nil)
+					if got := w.check(); !strings.HasPrefix(got, "PASS ") {
+						t.Errorf("abwriter's check after restoring the release's image: %s", got)
+					}
+				})
+			}
+		}
+	}
+}
+
+// releaseLines returns the lines that the sandboxes' boot logs wrote since
+// start on their saves' pauses and releases.
+func releaseLines(t *testing.T, start time.Time) []string {
+	return bootLogSince(t, start, "paused for", "Save point taken", "pre-armed", "Kernel save took", "copy-on-write save copied in", "release", "Release")
 }
 
 // TestCheckpointCoWChurn takes copy-on-write checkpoints of the A-B writer

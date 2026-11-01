@@ -62,6 +62,9 @@ const (
 	// ContMgrCheckpoint checkpoints a container.
 	ContMgrCheckpoint = "containerManager.Checkpoint"
 
+	// ContMgrAbortRelease aborts the copy-on-write release under way.
+	ContMgrAbortRelease = "containerManager.AbortRelease"
+
 	// ContMgrCreateSubcontainer creates a sub-container.
 	ContMgrCreateSubcontainer = "containerManager.CreateSubcontainer"
 
@@ -555,6 +558,18 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Checkpoint")
 	o.RunscVersion = version.Version()
 	return cm.l.save(o)
+}
+
+// AbortRelease aborts the copy-on-write release under way, a checkpoint that
+// kills the sandbox: its tasks resume once its save point is taken, and the
+// sandbox runs on. It fails if there is none to abort, or if its pages are
+// already written.
+func (cm *containerManager) AbortRelease(_ *struct{}, _ *struct{}) error {
+	log.Debugf("containerManager.AbortRelease")
+	if !state.AbortRelease() {
+		return fmt.Errorf("no copy-on-write release to abort")
+	}
+	return nil
 }
 
 // PortForwardOpts contains options for port forwarding to a port in a

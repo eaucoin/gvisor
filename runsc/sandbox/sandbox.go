@@ -1686,6 +1686,14 @@ func (s *Sandbox) WaitCheckpoint() error {
 	return s.call(boot.ContMgrWaitCheckpoint, nil, nil)
 }
 
+// AbortRelease aborts the copy-on-write release of the sandbox under way, a
+// checkpoint that kills it: its tasks resume once its save point is taken,
+// and it runs on.
+func (s *Sandbox) AbortRelease() error {
+	log.Debugf("Aborting the release of sandbox %q", s.ID)
+	return s.call(boot.ContMgrAbortRelease, nil, nil)
+}
+
 // WaitRestore waits for the Kernel to have been successfully restored.
 func (s *Sandbox) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)

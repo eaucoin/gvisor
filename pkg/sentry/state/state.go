@@ -156,7 +156,15 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		}
 	}
 
-	if k.CoWSaveApplies(opts.Resume, opts.PagesMetadata, opts.PagesFile, precopy, opts.FSSaveOpts) {
+	var rel *release
+	if k.CoWSaveApplies(true /* resume */, opts.PagesMetadata, opts.PagesFile, precopy, opts.FSSaveOpts) {
+		if !opts.Resume {
+			// A copy-on-write release saves as a live save does, so that
+			// its tasks can resume if it is aborted, but keeps them paused
+			// until its pages are written.
+			rel = beginRelease()
+			defer endRelease()
+		}
 		k.PreArmCoWSave(ctx)
 	}
 	log.Infof("Sandbox save started, pausing all tasks.")
@@ -166,6 +174,8 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	log.Infof("Tasks paused in %v.", time.Since(pauseStart))
 	w.Stop()
 	paused := true
+	// resumed is true once tasks resumed before the save ends.
+	resumed := false
 	unpause := func() {
 		if !paused {
 			return
@@ -221,32 +231,51 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, opts.Parent, precopy) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume || rel != nil, opts.FSSaveOpts, opts.Parent, precopy) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
 		if copying := k.TakeCoWSave(); copying != nil {
-			// A copy-on-write save writes its pages while tasks run.
-			unpause()
-			if opts.Autosave {
-				// A test goes on while its save writes, as a sandbox does
-				// beside a live save, so that its writes are copied before
-				// they land.
-				k.CopyCoWSaveInBackground(copying, func(err error) {
-					if err == nil {
-						return
-					}
-					log.Warningf("Copy-on-write autosave failed: %v", err)
-					if errors.Is(err, pgalloc.ErrCoWEscapes) || errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
-						k.Kill(linux.WaitStatusExit(1))
-					}
+			if rel != nil {
+				// A copy-on-write release keeps its tasks paused until its
+				// pages are written, unless it is aborted first.
+				var aborted bool
+				aborted, err = rel.copy(copying, func() {
+					opts.Resume = true
+					k.BeforeResume(ctx)
+					unpause()
 				})
+				resumed = aborted
 			} else {
-				copyStart := time.Now()
-				err = copying()
-				log.Infof("Copy-on-write save: pages written %v after tasks resumed.", time.Since(copyStart))
+				// A copy-on-write save writes its pages while tasks run.
+				k.BeforeResume(ctx)
+				resumed = true
+				unpause()
+				if opts.Autosave {
+					// A test goes on while its save writes, as a sandbox does
+					// beside a live save, so that its writes are copied before
+					// they land.
+					k.CopyCoWSaveInBackground(copying, func(err error) {
+						if err == nil {
+							return
+						}
+						log.Warningf("Copy-on-write autosave failed: %v", err)
+						if errors.Is(err, pgalloc.ErrCoWEscapes) || errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
+							k.Kill(linux.WaitStatusExit(1))
+						}
+					})
+				} else {
+					copyStart := time.Now()
+					err = copying()
+					log.Infof("Copy-on-write save: pages written %v after tasks resumed.", time.Since(copyStart))
+				}
 			}
 		}
+	}
+	if rel != nil && !resumed && rel.end() {
+		// The release was aborted, but its save failed before its save
+		// point: its tasks resume all the same.
+		opts.Resume = true
 	}
 
 	t1, _ := CPUTime()
@@ -259,7 +288,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		k.SetSaveError(err)
 	}
 	if opts.Resume {
-		k.BeforeResume(ctx)
+		if !resumed {
+			k.BeforeResume(ctx)
+		}
 	} else {
 		// Kill the sandbox. An autosave that dirty tracking verification
 		// failed fails the test that made it: the image is complete, and the
