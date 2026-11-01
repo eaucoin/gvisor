@@ -191,6 +191,7 @@ func (srv *standbyServer) restore(ctx context.Context, req *standbyRestoreReques
 	for _, c := range srv.s.createdContainers() {
 		conf := c.takeStandby()
 		if conf == nil {
+			log.L.Infof("Container %q of the standby sandbox (PID %d) is not a standby's: not restored", c.ID, srv.pid)
 			continue
 		}
 		conf.ImagePath = req.ImagePath
@@ -292,6 +293,7 @@ func processState(pid int) (string, bool) {
 // sandbox, if c is its root container, whose exit watch reports; c alone
 // otherwise, whose exit is reported at once.
 func (s *runscService) killStandby(c *Container, signal uint32) {
+	log.L.Infof("Signal %d to container %q of a standby sandbox, which runs nothing", signal, c.ID)
 	p, err := c.Process("")
 	if err != nil {
 		return

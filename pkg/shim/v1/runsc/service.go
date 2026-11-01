@@ -238,6 +238,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		return nil, err
 	}
 
+	log.L.Infof("Created container %q, a standby's: %t (sandbox standby socket %q)", rfs.Create.ID, restore.standby != "", s.standbySocket)
 	if restore.standby != "" {
 		if s.standbySocket != "" && s.standbySocket != restore.standby {
 			return nil, fmt.Errorf("standby socket %q differs from the sandbox's, %q: %w", restore.standby, s.standbySocket, errdefs.ErrInvalidArgument)
