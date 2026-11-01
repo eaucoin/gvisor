@@ -174,9 +174,15 @@ func (mm *MemoryManager) disarmDirtyLocked(vseg vmaIterator, pseg pmaIterator, a
 const dirtyLimitBurst = 100 * time.Millisecond
 
 // TakeDirtied returns the number of bytes that mm's tasks disarmed since the
-// last call.
-func (mm *MemoryManager) TakeDirtied() uint64 {
-	return mm.dirtied.Swap(0)
+// last call, to charge against a dirtying limit during the limiting period
+// session: none at mm's first call of a session, whose tasks are not charged
+// for what they dirtied before it.
+func (mm *MemoryManager) TakeDirtied(session uint64) uint64 {
+	n := mm.dirtied.Swap(0)
+	if mm.dirtiedSession.Swap(session) != session {
+		return 0
+	}
+	return n
 }
 
 // DirtyLimiter limits the rate at which tasks dirty memory: a token bucket of
@@ -207,26 +213,23 @@ type DirtyLimiter struct {
 // and returns how long the task should wait for the tasks to be back within
 // it. now is the current time, in nanoseconds of a monotonic clock. session
 // identifies the period during which the limit applies: the first call of a
-// new session starts with full credit, and does not charge what was dirtied
-// before.
+// new session starts with full credit.
 //
 // Preconditions: limit > 0.
 func (l *DirtyLimiter) Delay(dirtied, limit, session uint64, now int64) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	burst := int64(limit) * int64(dirtyLimitBurst) / int64(time.Second)
-	charged := int64(dirtied)
 	if l.session != session {
 		l.session = session
 		l.credit = burst
-		charged = 0
 	} else if elapsed := now - l.last; elapsed > 0 {
 		// Credit refills at limit, up to burst.
 		refill := float64(limit) * time.Duration(elapsed).Seconds()
 		l.credit = int64(min(float64(l.credit)+refill, float64(burst)))
 	}
 	l.last = now
-	l.credit -= charged
+	l.credit -= int64(dirtied)
 	if l.credit >= 0 {
 		return 0
 	}

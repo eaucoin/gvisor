@@ -502,18 +502,17 @@ func TestDirtyLimiter(t *testing.T) {
 	otherAR := mmap(t, ctx, other, 16, true)
 	copyOut(t, ctx, other, otherAR.Start, int(otherAR.Length()))
 	other.ArmDirtyTracking(hostarch.PageSize)
-	// What it dirtied before is not charged.
-	other.TakeDirtied()
 	const (
 		limit = 40 * hostarch.PageSize // bytes per second; 4 pages of burst
 		ms    = int64(time.Millisecond)
 	)
 	var l DirtyLimiter
 	delay := func(m *MemoryManager, session uint64, now int64) time.Duration {
-		return l.Delay(m.TakeDirtied(), limit, session, now)
+		return l.Delay(m.TakeDirtied(session), limit, session, now)
 	}
 
-	// The first call of a session charges nothing dirtied before it.
+	// A MemoryManager's first call of a session charges nothing dirtied
+	// before it.
 	copyOut(t, ctx, mm, page(ar, 0), hostarch.PageSize)
 	if d := delay(mm, 1, 0); d != 0 {
 		t.Errorf("first delay of a session: got %v, want 0", d)
@@ -537,19 +536,24 @@ func TestDirtyLimiter(t *testing.T) {
 	if d := delay(mm, 1, 125*ms); d != 0 {
 		t.Errorf("delay after rewriting dirty units: got %v, want 0", d)
 	}
-	// Another MemoryManager's tasks dirty against the same limit: 4 pages
-	// of each use the burst, and the first delay goes to whichever charges
+	// Another MemoryManager's first call of the session charges nothing
+	// either; then its tasks dirty against the same limit: 4 pages of each
+	// use the refilled burst, and the delay goes to the one that charges
 	// past it.
+	copyOut(t, ctx, other, page(otherAR, 0), 2*hostarch.PageSize)
+	if d := delay(other, 1, 125*ms); d != 0 {
+		t.Errorf("first delay of another MemoryManager in the session: got %v, want 0", d)
+	}
 	copyOut(t, ctx, mm, page(ar, 10), 4*hostarch.PageSize)
 	if d := delay(mm, 1, 225*ms); d != 0 {
 		t.Errorf("delay within the shared burst: got %v, want 0", d)
 	}
-	copyOut(t, ctx, other, page(otherAR, 0), 4*hostarch.PageSize)
+	copyOut(t, ctx, other, page(otherAR, 2), 4*hostarch.PageSize)
 	if d, want := delay(other, 1, 225*ms), 100*time.Millisecond; d != want {
 		t.Errorf("delay of another MemoryManager over the shared limit: got %v, want %v", d, want)
 	}
 	// A new session starts with full credit.
-	copyOut(t, ctx, other, page(otherAR, 4), 6*hostarch.PageSize)
+	copyOut(t, ctx, other, page(otherAR, 6), 6*hostarch.PageSize)
 	if d := delay(other, 2, 225*ms); d != 0 {
 		t.Errorf("first delay of a new session: got %v, want 0", d)
 	}

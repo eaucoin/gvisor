@@ -478,7 +478,8 @@ func (t *Task) throttleDirtying() {
 	if limit == 0 {
 		return
 	}
-	d := t.k.dirtyLimiter.Delay(t.MemoryManager().TakeDirtied(), limit, t.k.dirtyLimitSession.Load(), t.k.MonotonicClock().Now().Nanoseconds())
+	session := t.k.dirtyLimitSession.Load()
+	d := t.k.dirtyLimiter.Delay(t.MemoryManager().TakeDirtied(session), limit, session, t.k.MonotonicClock().Now().Nanoseconds())
 	if d <= 0 {
 		return
 	}

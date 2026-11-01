@@ -171,6 +171,10 @@ type MemoryManager struct {
 	// dirty.go.
 	dirtied atomicbitops.Uint64 `state:"nosave"`
 
+	// dirtiedSession is the limiting period of the last call to
+	// TakeDirtied.
+	dirtiedSession atomicbitops.Uint64 `state:"nosave"`
+
 	// hasPinned is true if pages in this MemoryManager have ever been pinned
 	// by Pin. It is never cleared, even if all pinned pages are unpinned;
 	// compare Linux's MMF_HAS_PINNED.
