@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 )
@@ -69,6 +70,12 @@ type DirtyTrackingOpts struct {
 	// end of every save and restore, and restores wait for every page to be
 	// loaded; it is meant for tests and debugging.
 	Verify bool
+
+	// If CoW is not nil, saves that resume the Kernel and write a pages file
+	// are copy-on-write (pgalloc's cow.go): their pause ends at their save
+	// point, and their pages are written while tasks run. CoW requires
+	// tracking by write-protection, which marks every write before it lands.
+	CoW *pgalloc.CoWOpts
 }
 
 // dirtyTracking is the dirty tracking state of a Kernel.
@@ -82,8 +89,14 @@ type dirtyTracking struct {
 
 	// last is the image that the Kernel was last saved to or restored from,
 	// if it has a pages file: the parent of the next incremental save. last
-	// is only mutated with the Kernel paused, during saves and restores.
+	// is only mutated during saves and restores, which are serialized, with
+	// the Kernel paused but at the end of a copy-on-write save.
 	last *checkpointimage.Image
+
+	// If copying is not nil, it waits for the pages of the copy-on-write save
+	// that SaveTo returned from at its save point to be written, and ends the
+	// save; see TakeCoWSave.
+	copying func() error
 }
 
 var dirtyEscapes = metric.MustCreateNewUint64Metric("/checkpoint/dirty_tracking_escapes", metric.Uint64Metadata{
@@ -248,6 +261,74 @@ func (k *Kernel) endDirtySave(ctx context.Context, e *DirtyEpochResult, saved []
 	}
 	k.dirty.last = image
 	return k.trackDirty(ctx, saved)
+}
+
+// beginCoWSave starts a copy-on-write save at its save point, after
+// beginSave returned e and delta: it verifies e (with verification), makes
+// saved the tracked MemoryFiles and arms every source, so that every write
+// after the save point is marked before it lands, and freezes the contents of
+// saved for SaveTo to write. If it fails, the save must fail with
+// endCoWSave.
+//
+// Preconditions: The Kernel is paused and quiesced.
+func (k *Kernel) beginCoWSave(ctx context.Context, e *DirtyEpochResult, saved []*pgalloc.MemoryFile, owners map[*pgalloc.MemoryFile]*checkpoint.ResourceID, delta *incrementalSave, appMFExcludeCommittedZeroPages bool) error {
+	for _, s := range k.dirty.Sources {
+		if _, ok := s.(*WriteProtectDirtySource); !ok {
+			return fmt.Errorf("copy-on-write saves require dirty tracking by write-protection (--dirty-tracking=wp), not %q", s.Name())
+		}
+	}
+	if e != nil && k.dirty.Verify {
+		if err := verifyDirty(e, saved); err != nil {
+			return err
+		}
+	}
+	if err := k.trackDirty(ctx, saved); err != nil {
+		return err
+	}
+	for _, mf := range saved {
+		opts := pgalloc.SaveOpts{
+			ExcludeCommittedZeroPages: mf == k.mf && appMFExcludeCommittedZeroPages,
+			PageHashes:                true,
+		}
+		setMemoryFileSaveOpts(&opts, mf, owners[mf], delta, nil /* precopy */, nil /* lastRound */)
+		var dirty *pgalloc.DirtySet
+		if opts.Base != nil {
+			dirty = delta.sets[mf]
+		}
+		if err := mf.FreezeForCoWSave(&opts, dirty, *k.dirty.CoW); err != nil {
+			return fmt.Errorf("MemoryFile %p: %w", mf, err)
+		}
+	}
+	return nil
+}
+
+// endCoWSave ends a copy-on-write save that began with beginCoWSave, as
+// endDirtySave ends other saves: if the save succeeded (err is nil), image
+// becomes the parent of the next incremental save; otherwise the copying of
+// saved stops, and e's pages are returned to the dirty sets, so that the next
+// save writes them. Tracking already continued with saved at the save point.
+func (k *Kernel) endCoWSave(e *DirtyEpochResult, saved []*pgalloc.MemoryFile, image *checkpointimage.Image, err error) error {
+	if err != nil {
+		for _, mf := range saved {
+			mf.CancelCoWSave()
+		}
+		if e != nil {
+			e.Abort()
+		}
+		return err
+	}
+	k.dirty.last = image
+	return nil
+}
+
+// TakeCoWSave returns a function that waits for the pages of the
+// copy-on-write save that SaveTo just returned from to be written, and
+// returns the save's result; or nil if that save was not copy-on-write. Tasks
+// may run while the function waits.
+func (k *Kernel) TakeCoWSave() func() error {
+	copying := k.dirty.copying
+	k.dirty.copying = nil
+	return copying
 }
 
 // verifyDirty checks that every page of the MemoryFiles in saved that are in

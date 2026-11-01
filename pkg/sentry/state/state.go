@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -32,6 +33,11 @@ import (
 )
 
 var previousMetadata map[string]string
+
+// autosaveCopying is closed once the copy-on-write autosave that last
+// returned before its pages were written has written them. Saves are
+// serialized, and each waits for it.
+var autosaveCopying chan struct{}
 
 const (
 	// GvisorCPUUsageKey is the metadata key to store and retrieve CPU time usage
@@ -119,6 +125,10 @@ func (opts *SaveOpts) Close() error {
 
 // Save saves the system state.
 func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
+	if autosaveCopying != nil {
+		<-autosaveCopying
+		autosaveCopying = nil
+	}
 	t, err := CPUTime()
 	if err != nil {
 		log.Warningf("Error getting cpu time: %v", err)
@@ -152,17 +162,22 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	pauseStart := time.Now()
 	k.Pause()
 	k.ReceiveTaskStates()
-	defer func() {
+	w.Stop()
+	paused := true
+	unpause := func() {
+		if !paused {
+			return
+		}
+		paused = false
+		w.Start()
 		k.Unpause()
 		pause := time.Since(pauseStart)
 		log.Infof("Tasks resumed after save, paused for %v.", pause)
 		if precopy != nil {
 			precopy.RecordPause(pause)
 		}
-	}()
-
-	w.Stop()
-	defer w.Start()
+	}
+	defer unpause()
 
 	// Supplement the metadata.
 	if opts.Metadata == nil {
@@ -208,6 +223,30 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
+		if copying := k.TakeCoWSave(); copying != nil {
+			// A copy-on-write save writes its pages while tasks run.
+			unpause()
+			if opts.Autosave {
+				// A test goes on while its save writes, as a sandbox does
+				// beside a live save, so that its writes are copied before
+				// they land. The next save waits for this one.
+				done := make(chan struct{})
+				autosaveCopying = done
+				go func() {
+					defer close(done)
+					if err := copying(); err != nil {
+						log.Warningf("Copy-on-write autosave failed: %v", err)
+						if errors.Is(err, pgalloc.ErrCoWEscapes) || errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
+							k.Kill(linux.WaitStatusExit(1))
+						}
+					}
+				}()
+			} else {
+				copyStart := time.Now()
+				err = copying()
+				log.Infof("Copy-on-write save: pages written %v after tasks resumed.", time.Since(copyStart))
+			}
+		}
 	}
 
 	t1, _ := CPUTime()

@@ -859,6 +859,14 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return fmt.Errorf("incremental save requires a pages file")
 		}
 	}
+	// A copy-on-write save ends its pause at its save point, and writes its
+	// pages while tasks run: it must resume them, and write a pages file
+	// from its own copies of the pages.
+	cow := k.dirty.CoW != nil && resume && pagesMetadata != nil && pagesFile != nil && !pagesFile.NeedRegisterSourceFD() && precopy == nil && fsOpts == nil
+	var (
+		mfSaveWg  sync.WaitGroup
+		mfSaveErr error
+	)
 	if k.DirtyTrackingEnabled() {
 		var (
 			saveEpoch *DirtyEpochResult
@@ -866,25 +874,48 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		)
 		saveEpoch, lastRound, delta, err = k.beginSave(ctx, parent, precopy)
 		saved := []*pgalloc.MemoryFile{k.mf}
-		for _, mf := range mfsToSaveActual {
+		owners := map[*pgalloc.MemoryFile]*checkpoint.ResourceID{k.mf: nil}
+		for fsID, mf := range mfsToSaveActual {
 			saved = append(saved, mf)
+			owners[mf] = &fsID
 		}
-		// This must run after k.saveMemoryFiles() completes, so it must be
-		// deferred before the wait for it below.
-		defer func() {
-			retErr = k.endDirtySave(ctx, saveEpoch, saved, image, retErr)
-		}()
+		if cow {
+			if err == nil {
+				err = k.beginCoWSave(ctx, saveEpoch, saved, owners, delta, appMFExcludeCommittedZeroPages)
+			}
+			// The save ends when its pages are written, after the pause:
+			// TakeCoWSave returns the wait for it, unless the save fails
+			// before.
+			defer func() {
+				if retErr != nil {
+					retErr = k.endCoWSave(saveEpoch, saved, nil, retErr)
+					mfSaveWg.Wait()
+					return
+				}
+				k.dirty.copying = func() error {
+					mfSaveWg.Wait()
+					return k.endCoWSave(saveEpoch, saved, image, mfSaveErr)
+				}
+			}()
+		} else {
+			// This must run after k.saveMemoryFiles() completes, so it must be
+			// deferred before the wait for it below.
+			defer func() {
+				retErr = k.endDirtySave(ctx, saveEpoch, saved, image, retErr)
+			}()
+		}
 		if err != nil {
 			return err
 		}
 	}
 
 	parallelMFSave := pagesMetadata != nil
-	var (
-		mfSaveWg  sync.WaitGroup
-		mfSaveErr error
-	)
 	if parallelMFSave {
+		if cow {
+			// The image's working set is the one recorded until the save
+			// point.
+			k.mf.StopWorkingSetRecording()
+		}
 		// Parallelize MemoryFile save and kernel save. Both are independent.
 		mfSaveWg.Add(1)
 		go func() {
@@ -892,9 +923,11 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			image, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, delta, precopy, lastRound) // transfers ownership
 		}()
 		pagesCleanup.Release()
-		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
-		// error out without reaching the other Wait() below.
-		defer mfSaveWg.Wait()
+		if !cow {
+			// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if
+			// we error out without reaching the other Wait() below.
+			defer mfSaveWg.Wait()
+		}
 	}
 
 	// Save the CPUID FeatureSet before the rest of the kernel so we can
@@ -946,6 +979,10 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		stateFileCleanup.Release()
 		if err != nil {
 			return fmt.Errorf("closing state file failed: %w", err)
+		}
+		if cow {
+			log.Infof("Save point taken in [%s]; pages are written while tasks run.", time.Since(saveStart))
+			return nil
 		}
 		mfSaveWg.Wait()
 		if mfSaveErr != nil {

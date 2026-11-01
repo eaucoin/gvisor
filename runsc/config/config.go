@@ -380,6 +380,31 @@ type Config struct {
 	// tests can check that DirtyTrackingVerify catches the writes it misses.
 	TestOnlyDirtyTrackingBreak DirtyTrackingBreak `flag:"TESTONLY-dirty-tracking-break"`
 
+	// CoW makes the checkpoints that leave the sandbox running and write a
+	// pages file copy-on-write: they pause the sandbox only to take their
+	// save point, and write its memory while it runs.
+	CoW bool `flag:"cow"`
+
+	// CoWStagingMax is the most bytes of memory that a copy-on-write
+	// checkpoint holds copied before writes and not yet written.
+	CoWStagingMax uint64 `flag:"cow-staging-max"`
+
+	// TestOnlyCoWVerify should only be used in tests. It makes every
+	// copy-on-write checkpoint check that the memory it writes is the
+	// memory at its save point, and fail if it is not.
+	TestOnlyCoWVerify bool `flag:"TESTONLY-cow-verify"`
+
+	// TestOnlyCoWBreak should only be used in tests. It disables the copies
+	// that copy-on-write checkpoints make before the writes of one dirty
+	// tracking path, so that tests can check that TestOnlyCoWVerify catches
+	// them.
+	TestOnlyCoWBreak DirtyTrackingBreak `flag:"TESTONLY-cow-break"`
+
+	// TestOnlyCoWCopyDelay should only be used in tests. It delays the
+	// writing of a copy-on-write checkpoint's memory after its save point,
+	// so that the sandbox's writes are copied before they land.
+	TestOnlyCoWCopyDelay time.Duration `flag:"TESTONLY-cow-copy-delay"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
@@ -601,6 +626,12 @@ func (c *Config) Validate() error {
 		}
 	} else if u := c.DirtyTrackingUnit; u < 4096 || u&(u-1) != 0 {
 		return fmt.Errorf("dirty-tracking-unit must be a power of 2 of at least 4096, got: %d", u)
+	}
+	if c.CoW && c.DirtyTracking != DirtyTrackingWriteProtect {
+		return fmt.Errorf("cow requires --dirty-tracking=wp")
+	}
+	if !c.CoW && (c.TestOnlyCoWVerify || c.TestOnlyCoWBreak != DirtyTrackingBreakNone || c.TestOnlyCoWCopyDelay != 0) {
+		return fmt.Errorf("TESTONLY-cow-verify, TESTONLY-cow-break and TESTONLY-cow-copy-delay require --cow")
 	}
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")

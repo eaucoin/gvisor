@@ -1243,10 +1243,23 @@ func configureDirtyTracking(k *kernel.Kernel, conf *config.Config, uffd bool, tr
 		log.Warningf("TESTONLY-dirty-tracking-break=%v: dirty tracking misses the writes of a disabled path, for tests only", b)
 		pgalloc.TestOnlyDisableDirtyMarkPath(dirtyMarkPaths[b])
 	}
-	k.SetDirtyTracking(kernel.DirtyTrackingOpts{
+	opts := kernel.DirtyTrackingOpts{
 		Sources: []kernel.DirtySource{source},
 		Verify:  conf.DirtyTrackingVerify == config.DirtyTrackingVerifyHash,
-	})
+	}
+	if conf.CoW {
+		opts.CoW = &pgalloc.CoWOpts{
+			StagingMax: conf.CoWStagingMax,
+			Verify:     conf.TestOnlyCoWVerify,
+			CopyDelay:  conf.TestOnlyCoWCopyDelay,
+		}
+		log.Infof("Copy-on-write checkpoints: staging up to %d bytes, verification %v", conf.CoWStagingMax, conf.TestOnlyCoWVerify)
+		if b := conf.TestOnlyCoWBreak; b != config.DirtyTrackingBreakNone {
+			log.Warningf("TESTONLY-cow-break=%v: copy-on-write checkpoints miss the writes of a disabled path, for tests only", b)
+			pgalloc.TestOnlyDisableCoWCapturePath(dirtyMarkPaths[b])
+		}
+	}
+	k.SetDirtyTracking(opts)
 	return nil
 }
 

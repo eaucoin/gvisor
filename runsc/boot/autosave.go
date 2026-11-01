@@ -15,14 +15,17 @@
 package boot
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
@@ -40,9 +43,32 @@ func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
 			Resume:      true,
 			Destination: io.Discard,
 		}
+		if l.root.conf.CoW {
+			// Copy-on-write saves write a pages file, which they write
+			// while the test runs.
+			saveOpts.PagesMetadata = discardWriteCloser{}
+			saveOpts.PagesFile = stateio.NewIOWriter(io.Discard, 1<<20, 64, 4)
+		}
 		defer saveOpts.Close()
-		l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
+		if err := l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{}); errors.Is(err, kernel.ErrDirtyTrackingEscapes) || errors.Is(err, pgalloc.ErrCoWEscapes) {
+			// The save is complete, and the test would otherwise go on from
+			// it as if nothing had escaped.
+			k.Kill(linux.WaitStatusExit(1))
+		}
 	}
+}
+
+// discardWriteCloser is an io.WriteCloser that discards what is written to it.
+type discardWriteCloser struct{}
+
+// Write implements io.Writer.Write.
+func (discardWriteCloser) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+// Close implements io.Closer.Close.
+func (discardWriteCloser) Close() error {
+	return nil
 }
 
 func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {

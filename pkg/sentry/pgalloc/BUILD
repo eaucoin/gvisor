@@ -29,6 +29,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "cow_mutex",
+    out = "cow_mutex.go",
+    package = "pgalloc",
+    prefix = "cow",
+)
+
+declare_mutex(
     name = "dirty_mutex",
     out = "dirty_mutex.go",
     package = "pgalloc",
@@ -168,6 +175,8 @@ go_library(
         "apl_unloaded_set.go",
         "async_load_budget.go",
         "context.go",
+        "cow.go",
+        "cow_mutex.go",
         "debug.go",
         "dirty.go",
         "dirty_mutex.go",
@@ -224,6 +233,7 @@ go_test(
     size = "small",
     srcs = [
         "async_load_budget_test.go",
+        "cow_test.go",
         "dirty_test.go",
         "image_test.go",
         "loader_test.go",

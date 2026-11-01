@@ -232,7 +232,13 @@ type SaveOpts struct {
 // checkpointimage record, with the extents of its pages in the image's layers
 // (layer 0 is opts.PagesFile) and, if opts.PageHashes, their page hashes.
 // Otherwise, it writes the metadata followed by the pages.
+//
+// If FreezeForCoWSave froze f, SaveTo saves f's contents at that save point
+// (see cow.go) while f's users run.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if c := f.takeCoWSave(); c != nil {
+		return f.cowSaveTo(ctx, w, c, opts)
+	}
 	// Pages still loading are clean (writing them requires loading them
 	// first), so a save with Clean refers to their data in the layers it is
 	// loading from instead of waiting for it.
@@ -798,6 +804,32 @@ type asyncMemoryFileSave struct {
 type apsRange struct {
 	amfs *asyncMemoryFileSave
 	memmap.FileRange
+
+	// If src is not nil, it holds the contents of the range, src[0] being
+	// the byte at Start, which are written from it rather than from the
+	// MemoryFile's mappings: the pages captured by a copy-on-write save
+	// (cow.go).
+	src []byte
+
+	// If release is not nil, it is called with the number of bytes of the
+	// range once their write completes, or async page saving ends without
+	// writing them.
+	release func(uint64)
+}
+
+// advance removes the first n bytes from r.
+func (r *apsRange) advance(n uint64) {
+	r.Start += n
+	if r.src != nil {
+		r.src = r.src[n:]
+	}
+}
+
+// apsRelease is a call to an apsRange's release that an apsOp makes once it
+// completes.
+type apsRelease struct {
+	release func(uint64)
+	n       uint64
 }
 
 // apsOp tracks async page save state corresponding to a single AIO write
@@ -814,6 +846,9 @@ type apsOp struct {
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// releases are made once the operation completes.
+	releases []apsRelease
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
@@ -953,6 +988,7 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 			op.total = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
+			op.releases = op.releases[:0]
 			apfs.curOp = op
 			apfs.curOpID = id
 		}
@@ -1000,7 +1036,13 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	mfr.amfs.f.forEachMappingSlice(mfr.FileRange, func(bs []byte) {
+	forEachSlice := mfr.amfs.f.forEachMappingSlice
+	if mfr.src != nil {
+		forEachSlice = func(fr memmap.FileRange, fn func([]byte)) {
+			fn(mfr.src[:fr.Length()])
+		}
+	}
+	forEachSlice(mfr.FileRange, func(bs []byte) {
 		if len(op.iovecs) > 0 {
 			if canMergeIovecAndSlice(op.iovecs[len(op.iovecs)-1], bs) {
 				op.iovecs[len(op.iovecs)-1].Len += uint64(len(bs))
@@ -1032,6 +1074,9 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 	} else {
 		op.frs = append(op.frs, mfr.FileRange)
 	}
+	if mfr.release != nil {
+		op.releases = append(op.releases, apsRelease{mfr.release, n})
+	}
 	return n
 }
 
@@ -1048,11 +1093,26 @@ func (apfs *AsyncPagesFileSave) main() {
 		} else {
 			apfs.completeFlushesLocked(errAPFSCompleted)
 		}
+		// Writes that will not be made release their ranges.
+		var releases []apsRelease
+		for i := range apfs.ops {
+			releases = append(releases, apfs.ops[i].releases...)
+			apfs.ops[i].releases = nil
+		}
+		for !apfs.unsaved.Empty() {
+			if r := apfs.unsaved.PeekFrontPtr(); r.release != nil {
+				releases = append(releases, apsRelease{r.release, r.Length()})
+			}
+			apfs.unsaved.RemoveFront()
+		}
 		apfs.mu.Unlock()
 		if err := apfs.aw.Close(); err != nil {
 			// Saving success is independent of err, so log it rather than
 			// propagating it.
 			log.Warningf("Async page saving: stateio.AsyncWriter.Close failed: %v", err)
+		}
+		for _, r := range releases {
+			r.release(r.n)
 		}
 		if apfs.doneCallback != nil {
 			apfs.doneCallback(apfs.err)
@@ -1128,7 +1188,7 @@ func (apfs *AsyncPagesFileSave) main() {
 			if n == mfr.Length() {
 				apfs.unsaved.RemoveFront()
 			} else if n != 0 {
-				mfr.Start += n
+				mfr.advance(n)
 			} else {
 				break
 			}
@@ -1207,6 +1267,7 @@ func (apfs *AsyncPagesFileSave) main() {
 		}
 
 		// Process completions.
+		var releases []apsRelease
 		apfs.mu.Lock()
 		for _, c := range completions {
 			op := &apfs.ops[c.ID]
@@ -1227,8 +1288,16 @@ func (apfs *AsyncPagesFileSave) main() {
 				apfs.bytesFull += op.total
 			}
 		}
+		for _, c := range completions {
+			op := &apfs.ops[c.ID]
+			releases = append(releases, op.releases...)
+			op.releases = op.releases[:0]
+		}
 		apfs.completeFlushesLocked(nil)
 		apfs.mu.Unlock()
+		for _, r := range releases {
+			r.release(r.n)
+		}
 	}
 }
 

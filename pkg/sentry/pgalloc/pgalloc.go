@@ -205,6 +205,14 @@ type MemoryFile struct {
 
 	// dirty is the dirty tracking state; see dirty.go.
 	dirty dirtyState
+
+	// cowSave is the copy-on-write save that FreezeForCoWSave started and
+	// SaveTo has not taken yet; see cow.go. cowSave is protected by mu.
+	cowSave *cowSave
+
+	// cow is the copy-on-write save whose pages marks must capture before
+	// writes, while it has pages to capture.
+	cow atomic.Pointer[cowSave]
 	// ws records and holds the working set of the MemoryFile.
 	ws workingSet
 

@@ -279,6 +279,7 @@ func (f *MemoryFile) DirtyTracked() bool {
 //
 // Preconditions: fr must be within an allocated range of f.
 func (f *MemoryFile) MarkDirty(fr memmap.FileRange) {
+	f.cowBeforeWrite(DirtyMarkNone, fr)
 	if !f.dirty.tracked.Load() {
 		return
 	}
@@ -288,6 +289,7 @@ func (f *MemoryFile) MarkDirty(fr memmap.FileRange) {
 // MarkDirtyBy is MarkDirty for a mark made by path p, which tests may disable
 // (see TestOnlyDisableDirtyMarkPath).
 func (f *MemoryFile) MarkDirtyBy(p DirtyMarkPath, fr memmap.FileRange) {
+	f.cowBeforeWrite(p, fr)
 	if !f.dirty.tracked.Load() || !DirtyMarkPathEnabled(p) {
 		return
 	}
@@ -297,6 +299,7 @@ func (f *MemoryFile) MarkDirtyBy(p DirtyMarkPath, fr memmap.FileRange) {
 // markDirtyInternal records that the caller of MapInternal may write the
 // pages overlapping fr through the mappings it returns.
 func (f *MemoryFile) markDirtyInternal(fr memmap.FileRange) {
+	f.cowBeforeWrite(DirtyMarkMapInternal, fr)
 	if !f.dirty.tracked.Load() || !DirtyMarkPathEnabled(DirtyMarkMapInternal) {
 		return
 	}
