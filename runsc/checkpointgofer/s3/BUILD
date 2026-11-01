@@ -14,6 +14,7 @@ go_library(
         "writer.go",
     ],
     visibility = [
+        "//:__pkg__",
         "//runsc:__subpackages__",
     ],
     deps = [
