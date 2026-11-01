@@ -85,6 +85,10 @@ type Reader struct {
 	// cache, if not nil, is written the bytes read (FileServerOptions.CacheDir).
 	cache *cacheWriter
 
+	// zst, if not nil, says the object is a seekable zstd file, read in
+	// logical offsets (FileServerOptions.PagesCompression).
+	zst *zstdPages
+
 	// size is the object's size, once the store has said it in the
 	// Content-Range of an answer to a GET, or -1 before: a read that would
 	// begin at or past it then ends there, without a GET the store would
@@ -238,6 +242,13 @@ func (r *Reader) Close() error {
 	if r.cache != nil {
 		r.cache.close()
 	}
+	if r.zst != nil {
+		for _, dec := range r.zst.decs {
+			if dec != nil {
+				dec.Close()
+			}
+		}
+	}
 	if r.trace {
 		var gets, hedges uint64
 		if r.hedge != nil {
@@ -340,7 +351,15 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission, worker int) (uin
 		if size := r.size.Load(); size >= 0 && sub.off+int64(done) >= size {
 			return done, io.EOF
 		}
-		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s, worker)
+		var (
+			n   uint64
+			err error
+		)
+		if r.zst != nil {
+			n, err = r.readOnceZstd(ctx, sub.off+int64(done), sub.total-done, &dst, worker)
+		} else {
+			n, err = r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s, worker)
+		}
 		done += n
 		if r.whileRunning && transient(err) {
 			if n != 0 {

@@ -206,6 +206,12 @@ type FileServerOptions struct {
 	// other's request canceled.
 	HedgePercentile int
 
+	// PagesCompression, if "zstd", has pages files read from the object of
+	// their name with ".zst" added, a seekable zstd file of their bytes in
+	// independent frames (zstd's contrib/seekable_format), each read a GET of
+	// the frames that hold its bytes, decoded as they stream.
+	PagesCompression string
+
 	// CacheDir, if not empty, is a directory into which the bytes of each
 	// pages file read are written at their offsets, in a file named after its
 	// object, with O_DIRECT, from a buffer of the FileServer's own that they
@@ -315,6 +321,8 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 		return nil, fmt.Errorf("pages file part size %d is not between %d and %d", o.PagesFilePartBytes, minPartBytes, maxPartBytes)
 	case o.HedgePercentile < 0 || o.HedgePercentile >= 100:
 		return nil, fmt.Errorf("hedge percentile %d is not between 0 and 99", o.HedgePercentile)
+	case o.PagesCompression != "" && o.PagesCompression != "zstd":
+		return nil, fmt.Errorf("unknown pages compression %q", o.PagesCompression)
 	}
 
 	if o.Socket != "" {
@@ -478,11 +486,17 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		return nil, fs.ErrPermission
 	}
 	obj := s.object(path)
+	if name == checkpointfiles.PagesFileName && s.opts.PagesCompression == "zstd" {
+		obj.key += ".zst"
+	}
 	log.Infof("Opening %s for reading", obj)
 	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
 	if name == checkpointfiles.PagesFileName {
 		r.trace = s.opts.Trace
 		r.hedge = s.hedge
+		if s.opts.PagesCompression == "zstd" {
+			r.zst = newZstdPages(maxParallel)
+		}
 		if s.opts.CacheDir != "" {
 			cache, err := newCacheWriter(filepath.Join(s.opts.CacheDir, strings.ReplaceAll(obj.key, "/", "_")), maxParallel)
 			if err != nil {

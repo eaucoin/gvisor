@@ -512,6 +512,11 @@ type Config struct {
 	// O_DIRECT, from a buffer of its own, at their offsets.
 	CheckpointGoferCacheDir string `flag:"checkpoint-gofer-cache-dir"`
 
+	// CheckpointGoferPagesCompression, if "zstd", has the S3 checkpoint gofer
+	// read each pages file from a seekable zstd file of its bytes beside it,
+	// named after it with ".zst" added, which it decodes.
+	CheckpointGoferPagesCompression string `flag:"checkpoint-gofer-pages-compression"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 

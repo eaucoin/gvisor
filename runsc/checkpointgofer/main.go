@@ -316,6 +316,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		Trace:                   conf.AsyncLoadTrace,
 		HedgePercentile:         conf.CheckpointGoferHedgePercentile,
 		CacheDir:                conf.CheckpointGoferCacheDir,
+		PagesCompression:        conf.CheckpointGoferPagesCompression,
 	}
 	switch opts.Addressing {
 	case "":

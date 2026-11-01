@@ -8,11 +8,12 @@ package(
 go_library(
     name = "s3",
     srcs = [
-        "errors.go",
         "cache.go",
+        "errors.go",
         "hedge.go",
         "reader.go",
         "s3.go",
+        "seekable.go",
         "writer.go",
     ],
     visibility = [
@@ -33,6 +34,7 @@ go_library(
         "@com_github_aws_aws_sdk_go_v2_service_s3//:go_default_library",
         "@com_github_aws_aws_sdk_go_v2_service_s3//types:go_default_library",
         "@com_github_aws_smithy_go//:go_default_library",
+        "@com_github_klauspost_compress//zstd:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -40,7 +42,10 @@ go_library(
 go_test(
     name = "s3_test",
     size = "small",
-    srcs = ["s3_test.go"],
+    srcs = [
+        "s3_test.go",
+        "seekable_test.go",
+    ],
     library = ":s3",
     deps = [
         "//pkg/sentry/memmap",
@@ -49,6 +54,7 @@ go_test(
         "//pkg/sentry/state/stateio",
         "//runsc/checkpointgofer/s3/s3test",
         "@com_github_aws_aws_sdk_go_v2_credentials//:go_default_library",
+        "@com_github_klauspost_compress//zstd:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
