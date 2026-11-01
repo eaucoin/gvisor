@@ -34,11 +34,6 @@ import (
 
 var previousMetadata map[string]string
 
-// autosaveCopying is closed once the copy-on-write autosave that last
-// returned before its pages were written has written them. Saves are
-// serialized, and each waits for it.
-var autosaveCopying chan struct{}
-
 const (
 	// GvisorCPUUsageKey is the metadata key to store and retrieve CPU time usage
 	// across save restore.
@@ -125,10 +120,7 @@ func (opts *SaveOpts) Close() error {
 
 // Save saves the system state.
 func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
-	if autosaveCopying != nil {
-		<-autosaveCopying
-		autosaveCopying = nil
-	}
+	k.WaitCoWSave()
 	t, err := CPUTime()
 	if err != nil {
 		log.Warningf("Error getting cpu time: %v", err)
@@ -238,18 +230,16 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 			if opts.Autosave {
 				// A test goes on while its save writes, as a sandbox does
 				// beside a live save, so that its writes are copied before
-				// they land. The next save waits for this one.
-				done := make(chan struct{})
-				autosaveCopying = done
-				go func() {
-					defer close(done)
-					if err := copying(); err != nil {
-						log.Warningf("Copy-on-write autosave failed: %v", err)
-						if errors.Is(err, pgalloc.ErrCoWEscapes) || errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
-							k.Kill(linux.WaitStatusExit(1))
-						}
+				// they land.
+				k.CopyCoWSaveInBackground(copying, func(err error) {
+					if err == nil {
+						return
 					}
-				}()
+					log.Warningf("Copy-on-write autosave failed: %v", err)
+					if errors.Is(err, pgalloc.ErrCoWEscapes) || errors.Is(err, kernel.ErrDirtyTrackingEscapes) {
+						k.Kill(linux.WaitStatusExit(1))
+					}
+				})
 			} else {
 				copyStart := time.Now()
 				err = copying()

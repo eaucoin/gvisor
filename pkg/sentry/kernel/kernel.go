@@ -2531,6 +2531,8 @@ func (k *Kernel) releaseCgroupMounts(ctx context.Context) {
 // Precondition: This should only be called after the kernel is fully
 // initialized, e.g. after k.Start() has been called.
 func (k *Kernel) Release() {
+	// A copy-on-write save still writing reads the MemoryFiles.
+	k.WaitCoWSave()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)
 	k.hostMount.DecRef(ctx)

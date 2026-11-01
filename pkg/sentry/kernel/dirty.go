@@ -100,6 +100,11 @@ type dirtyTracking struct {
 	// that SaveTo returned from at its save point to be written, and ends the
 	// save; see TakeCoWSave.
 	copying func() error
+
+	// If copied is not nil, it is closed once the copy-on-write save whose
+	// pages are written in the background (CopyCoWSaveInBackground) has
+	// written them.
+	copied chan struct{}
 }
 
 var dirtyEscapes = metric.MustCreateNewUint64Metric("/checkpoint/dirty_tracking_escapes", metric.Uint64Metadata{
@@ -357,6 +362,27 @@ func (k *Kernel) TakeCoWSave() func() error {
 	copying := k.dirty.copying
 	k.dirty.copying = nil
 	return copying
+}
+
+// CopyCoWSaveInBackground has the copy-on-write save that copying ends
+// (TakeCoWSave) write its pages in the background, and calls done with its
+// result. The next save, and Release, wait for it (WaitCoWSave).
+func (k *Kernel) CopyCoWSaveInBackground(copying func() error, done func(error)) {
+	copied := make(chan struct{})
+	k.dirty.copied = copied
+	go func() {
+		defer close(copied)
+		done(copying())
+	}()
+}
+
+// WaitCoWSave waits for the copy-on-write save whose pages are written in the
+// background, if any, to have written them.
+func (k *Kernel) WaitCoWSave() {
+	if k.dirty.copied != nil {
+		<-k.dirty.copied
+		k.dirty.copied = nil
+	}
 }
 
 // verifyDirty checks that every page of the MemoryFiles in saved that are in
