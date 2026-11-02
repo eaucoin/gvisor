@@ -5,8 +5,9 @@
 # spike/val-tier2-wire, whose one commit more makes wire the default. Its jobs
 # run one after another, the matrices two at a time, so that it holds at
 # most two runners, the validation's third left to its other runs; on
-# spike/val-tier2-wire one at a time, as it runs beside the graph run. It posts
-# no commit status. Like fork-nightly.yml, and
+# spike/val-tier2-wire one at a time, as it ran beside the graph run; and on
+# spike/val-tier2-wire-rest, which goes on with what that run had not run once
+# the graph run ended, three at a time. It posts no commit status. Like fork-nightly.yml, and
 # unlike the measurements, its runners are not pinned to a CPU: it says what
 # passes, not how fast.
 name: Tier 2 spike
@@ -120,10 +121,24 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix:
         variant: [save_restore, save_resume, save_verify, save_incremental]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        # The shards run 41336874874 ran before it was cancelled to go on here three at a time.
+        exclude:
+          - variant: save_restore
+            shard: 1
+          - variant: save_restore
+            shard: 2
+          - variant: save_restore
+            shard: 3
+          - variant: save_restore
+            shard: 4
+          - variant: save_restore
+            shard: 5
+          - variant: save_restore
+            shard: 6
     steps:
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
@@ -306,7 +321,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix:
         include:
           - platform: systrap
