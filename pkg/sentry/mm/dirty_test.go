@@ -49,6 +49,16 @@ func (recordingPlatform) NewAddressSpace() (platform.AddressSpace, error) {
 // over the MemoryFile of ctx, with dirty tracking enabled on it.
 func dirtyTestMM(t testing.TB, ctx context.Context) (*MemoryManager, *recordingAddressSpace) {
 	t.Helper()
+	mm, as := recordingTestMM(t, ctx)
+	mm.mf.EnableDirtyTracking()
+	mm.mf.SwapDirty(true)
+	return mm, as
+}
+
+// recordingTestMM returns a MemoryManager whose AddressSpace records
+// mappings, over the MemoryFile of ctx.
+func recordingTestMM(t testing.TB, ctx context.Context) (*MemoryManager, *recordingAddressSpace) {
+	t.Helper()
 	p := recordingPlatform{platform.FromContext(ctx)}
 	mf := pgalloc.MemoryFileFromContext(ctx)
 	mm, err := NewMemoryManager(p, mf)
@@ -63,8 +73,6 @@ func dirtyTestMM(t testing.TB, ctx context.Context) (*MemoryManager, *recordingA
 		TopDownBase:      p.MaxUserAddress(),
 		DefaultDirection: arch.MmapBottomUp,
 	}
-	mf.EnableDirtyTracking()
-	mf.SwapDirty(true)
 	return mm, mm.as.(*recordingAddressSpace)
 }
 
@@ -274,6 +282,54 @@ func TestDirtyTrackingArmInSteps(t *testing.T) {
 	mm.activeMu.RUnlock()
 	if npmas > len(ars) {
 		t.Errorf("%d pmas after a full arm, want at most %d", npmas, len(ars))
+	}
+}
+
+func TestDirtyTrackingArmInStepsSplitsLargePMAs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	// Memory written before tracking starts, as a session's first save
+	// finds it, lies in pmas as large as their allocations.
+	mm, as := recordingTestMM(t, ctx)
+	const length = 8 << 20
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:         length,
+		Private:        true,
+		Perms:          hostarch.ReadWrite,
+		MaxPerms:       hostarch.AnyAccess,
+		PlatformEffect: memmap.PlatformEffectCommit,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + length}
+	copyOut(t, ctx, mm, ar.Start, length)
+	mm.mf.EnableDirtyTracking()
+	mm.mf.SwapDirty(true)
+
+	// Steps of a huge page arm the mapping a huge page at a time, however
+	// large its pmas: each step leaves its own pma.
+	steps, _ := mm.ArmDirtyTrackingInSteps(hostarch.PageSize, hostarch.HugePageSize)
+	if want := length / hostarch.HugePageSize; steps < want {
+		t.Errorf("armed in %d steps, want at least %d", steps, want)
+	}
+	mm.activeMu.RLock()
+	for pseg := mm.pmas.LowerBoundSegment(ar.Start); pseg.Ok() && pseg.Start() < ar.End; pseg = pseg.NextSegment() {
+		if !pseg.ValuePtr().dirtyArmed {
+			t.Errorf("pma %v not armed", pseg.Range())
+		}
+		if pseg.Range().Length() > hostarch.HugePageSize {
+			t.Errorf("pma %v armed in one step, longer than a huge page", pseg.Range())
+		}
+	}
+	mm.activeMu.RUnlock()
+	for a, at := range as.pages {
+		if ar.Contains(a) && at.Write {
+			t.Errorf("page %#x still mapped writable", a)
+		}
+	}
+	copyOut(t, ctx, mm, page(ar, 700), 1)
+	if got, want := dirtyPages(t, mm, ar), []uint64{700}; !slices.Equal(got, want) {
+		t.Errorf("dirty pages after one write: got %v, want %v", got, want)
 	}
 }
 

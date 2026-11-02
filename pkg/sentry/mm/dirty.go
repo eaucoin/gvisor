@@ -63,9 +63,9 @@ func (mm *MemoryManager) ArmDirtyTracking(unit uint64) {
 
 // ArmDirtyTrackingInSteps arms mm as ArmDirtyTracking does, but while its
 // tasks run: in steps, each of which holds mm's locks while it arms at most
-// step bytes of pmas, so that a task of mm that faults waits for one step
-// rather than for the whole arm. It returns the number of steps and the
-// longest.
+// step bytes of pmas (or one huge page, if step is smaller), splitting larger
+// pmas, so that a task of mm that faults waits for one step rather than for
+// the whole arm. It returns the number of steps and the longest.
 //
 // Units that tasks write between steps are disarmed by their faults, as after
 // any arm, and pmas that tasks create behind a step are armed as they are
@@ -101,8 +101,9 @@ func checkDirtyTrackingUnit(unit uint64) {
 }
 
 // armDirtyTrackingLocked arms the pmas of mm from addr on, until it has armed
-// at least limit bytes of them. If pmas are left beyond, it returns the
-// address of the first and true.
+// limit bytes of them, splitting a pma that would take it beyond in whole huge
+// pages, unless limit is the largest uint64. If pmas are left beyond, it
+// returns the address of the first and true.
 //
 // Preconditions:
 //   - mm.mappingMu must be locked for reading.
@@ -125,10 +126,17 @@ func (mm *MemoryManager) armDirtyTrackingLocked(unit uint64, addr hostarch.Addr,
 		armed   uint64
 	)
 	for ; pseg.Ok() && armed < limit; pseg = pseg.NextSegment() {
-		pma := pseg.ValuePtr()
-		if pma.dirtyArmed || !pma.dirtyTracked() {
+		if pma := pseg.ValuePtr(); pma.dirtyArmed || !pma.dirtyTracked() {
 			continue
 		}
+		if left := limit - armed; limit != ^uint64(0) && uint64(pseg.Range().Length()) > left {
+			// Arm what is left of the step of a larger pma, in whole huge
+			// pages, and the rest of it in the steps that follow.
+			if n := max(hostarch.Addr(left)&^(hostarch.HugePageSize-1), hostarch.HugePageSize); n < pseg.Range().Length() {
+				pseg = mm.pmas.Isolate(pseg, hostarch.AddrRange{pseg.Start(), pseg.Start() + n})
+			}
+		}
+		pma := pseg.ValuePtr()
 		wasWritable := pma.effectivePerms.Write
 		pma.armDirty()
 		armed += uint64(pseg.Range().Length())
