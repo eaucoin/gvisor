@@ -167,6 +167,13 @@ type cowSave struct {
 	markBytes uint64
 	// +checklocks:mu
 	markWaits uint64
+	// markWaited is how long marks waited for staged bytes to be written, in
+	// all, and markWaitedLongest the longest that one mark did.
+	//
+	// +checklocks:mu
+	markWaited time.Duration
+	// +checklocks:mu
+	markWaitedLongest time.Duration
 	// +checklocks:mu
 	stagedPeak uint64
 
@@ -358,6 +365,7 @@ func (f *MemoryFile) cowBeforeWrite(p DirtyMarkPath, fr memmap.FileRange) {
 func (c *cowSave) captureLocked(fr memmap.FileRange, mark bool) {
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = min(hostarch.MustPageRoundUp(fr.End), c.size)
+	var waited time.Duration
 	for c.err == nil && c.pendingBytes != 0 && fr.Start < fr.End {
 		var run memmap.FileRange
 		c.forEachPendingLocked(fr, func(r memmap.FileRange) {
@@ -366,16 +374,22 @@ func (c *cowSave) captureLocked(fr memmap.FileRange, mark bool) {
 			}
 		})
 		if run.Length() == 0 {
-			return
+			break
 		}
 		if mark && c.staged != 0 && c.staged+run.Length() > c.opts.StagingMax {
 			c.markWaits++
+			waitStart := gohacks.Nanotime()
 			c.stagedCond.Wait()
+			waited += time.Duration(gohacks.Nanotime() - waitStart)
 			// The copier may have captured pages of fr meanwhile.
 			continue
 		}
 		c.captureRunLocked(run, mark)
 		fr.Start = run.End
+	}
+	if waited != 0 {
+		c.markWaited += waited
+		c.markWaitedLongest = max(c.markWaitedLongest, waited)
 	}
 }
 
@@ -748,10 +762,10 @@ func (f *MemoryFile) cowSaveTo(ctx context.Context, w io.Writer, c *cowSave, opt
 	}
 
 	c.mu.Lock()
-	markCaptures, markBytes, markWaits, stagedPeak := c.markCaptures, c.markBytes, c.markWaits, c.stagedPeak
+	markCaptures, markBytes, markWaits, markWaited, markWaitedLongest, stagedPeak := c.markCaptures, c.markBytes, c.markWaits, c.markWaited, c.markWaitedLongest, c.stagedPeak
 	c.mu.Unlock()
-	log.Infof("MemoryFile(%p): copy-on-write save copied in %s: %d bytes written to the pages file, %d bytes in the base image, %d bytes zero, %d bytes committed; marks captured %d bytes in %d runs, waited %d times, staging peak %d bytes; metadata in %s",
-		f, durCopy, writtenBytes, baseBytes, zeroBytes, committedBytes, markBytes, markCaptures, markWaits, stagedPeak, time.Duration(gohacks.Nanotime()-timeMetadataStart))
+	log.Infof("MemoryFile(%p): copy-on-write save copied in %s: %d bytes written to the pages file, %d bytes in the base image, %d bytes zero, %d bytes committed; marks captured %d bytes in %d runs, waited %d times for %s, one mark %s at most, staging peak %d bytes; metadata in %s",
+		f, durCopy, writtenBytes, baseBytes, zeroBytes, committedBytes, markBytes, markCaptures, markWaits, markWaited, markWaitedLongest, stagedPeak, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 	return nil
 }
 
