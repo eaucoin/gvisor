@@ -2290,6 +2290,13 @@ func TestCheckpointRestoreNoRootContainerSplitFS(t *testing.T) {
 
 	// The new root holds only /app, so the tree comes from the filesystem
 	// checkpoint in the image directory.
+	//
+	// That root is a fresh copy, made after the checkpoint, so /app's
+	// modification time is not the one the checkpoint recorded. Restore-time
+	// file validation (--restore-validate-files, rootfs by default) exists to
+	// refuse exactly that, a root that changed under the checkpoint; this test's
+	// premise is a root rebuilt on purpose, so it restores with validation off.
+	conf.RestoreValidateFiles = config.RestoreValidateFilesNone
 	newSbID := testutil.RandomContainerID()
 	_, subs := restoreNoRootContainer(t, conf, dir, newSbID, []*specs.Spec{testAppNoRootContainerSubSpec(t, newSbID)})
 	if ws, err := execute(conf, subs[0], "/app", append([]string{"fsTreeVerify"}, treeArgs...)...); err != nil || ws != 0 {
