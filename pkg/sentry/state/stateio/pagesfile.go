@@ -19,7 +19,17 @@ import (
 )
 
 const (
-	pagesFileFDDefaultMaxReadBytes  = 4 << 20
+	// pagesFileFDDefaultMaxReadBytes is 256 KiB in this fork, where upstream
+	// reads 4 MiB at once (b23d3c7541). The fork's async page loader keeps a
+	// full-size background read in flight at least, and serves a page fault
+	// after the reads in flight before it on a pages file that serves reads in
+	// the order they come (a FUSE or network mount, a throttled disk): the
+	// fault waits one read's transfer time, 23 ms at 11 MB/s for 256 KiB, and
+	// 373 ms for 4 MiB, which left a restored application waiting for every
+	// page before it answered (TestCheckpointRestoreBackgroundSlowPagesFile).
+	// The loader's budget was designed and measured with 256 KiB reads.
+	// Upstream's bound on concurrent reads (pagesFileFDReads) is kept.
+	pagesFileFDDefaultMaxReadBytes  = 256 << 10
 	pagesFileFDMaxReads             = 12
 	pagesFileFDMinReads             = 4
 	pagesFileFDDefaultMaxWriteBytes = 256 << 10
