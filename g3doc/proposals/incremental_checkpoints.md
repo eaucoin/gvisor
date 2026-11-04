@@ -268,16 +268,29 @@ A sandbox that dirties memory faster than half the store's speed keeps the
 rounds from converging; the halving rule then stops them, and the pause writes
 most of memory anyway (2.3 s at 200 MiB/s against a 100 MiB/s store). With
 `--precopy-throttle=on`, the first round that does not halve the bytes left
-throttles instead of stopping: until the save completes, each MemoryManager's
-tasks may dirty memory at most at a quarter of the write bandwidth measured,
-at which each round writes at most a quarter of the bytes of the previous one.
-This is QEMU's dirty-limit, applied to MemoryManagers rather than vCPUs: the
-write-protection source counts the bytes that each MemoryManager's faults
-disarm, and after a fault the faulting task waits, in an interruptible block,
-as long as a token bucket (100 ms of burst) says its MemoryManager is over the
-limit. Tasks that write little are never delayed. Throttling therefore needs
-the write-protection source's faults; a source without per-task faults, such
-as userfaultfd, would have to throttle through scheduling.
+throttles instead of stopping: until the save completes, the sandbox's tasks
+may dirty memory at most at a quarter of the write bandwidth measured, all
+together, at which each round writes at most a quarter of the bytes of the
+previous one. This is QEMU's dirty-limit, applied to the sandbox's tasks
+rather than vCPUs: the write-protection source counts the bytes that each
+MemoryManager's faults disarm, and after a fault the faulting task charges its
+MemoryManager's count to the Kernel's token bucket (100 ms of burst), then
+waits, in an interruptible block, as long as the bucket says the tasks are
+over the limit. A MemoryManager is not charged what it dirtied before its
+first charge of a save, as the bucket starts each save full. Tasks that write
+little are never delayed. Throttling therefore needs the write-protection
+source's faults; a source without per-task faults, such as userfaultfd, would
+have to throttle through scheduling.
+
+The limit is the sandbox's, not each MemoryManager's: n processes each held to
+a quarter of the bandwidth would dirty n quarters together, and from two on a
+round would no longer halve the bytes left. With 2, 3, 4 and 8 processes
+rewriting 256 MiB as fast as they can against a store limited to 32 MiB/s
+(median of 5), a limit per MemoryManager stopped the rounds not halved after
+3, leaving 130, 193, 257 and 257 MiB to the pause, which took 4.1, 6.1, 8.1
+and 8.1 s; the sandbox's limit converges after 6 rounds with a 62–65 ms pause
+in every case, as with one process (60 ms), no task delayed more than 44 ms at
+once.
 
 On experiment 06's workload at 200 MiB/s with writes limited to 100 MiB/s
 (median of 3), the rounds stop after the first without throttling, with a

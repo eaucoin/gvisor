@@ -289,6 +289,123 @@ func TestCheckpointPrecopyAB(t *testing.T) {
 	}
 }
 
+// TestCheckpointPrecopyThrottleWriters pre-copies 1, 2, 4 and 8 A-B writers,
+// each a process of its own, that share 256 MiB and rewrite it as fast as they
+// can, to a store that takes 32 MiB/s, with throttling. Throttling limits the
+// dirtying of all the sandbox's processes together to a quarter of the write
+// speed, so the rounds must converge, and the pause write less than half a
+// second of the store's time, whatever the number of writers:
+// were each process limited alone, n writers would dirty n quarters of it
+// together, and from 2 on the rounds would stop not halved, leaving the pause
+// about n × 64 MiB. Each image, restored, must pass every writer's check.
+func TestCheckpointPrecopyThrottleWriters(t *testing.T) {
+	const (
+		storeRate = 32 << 20
+		heapMiB   = 256
+	)
+	app, err := testutil.FindFile("test/cmd/precopy/abwriter")
+	if err != nil {
+		t.Fatalf("finding abwriter: %v", err)
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, writers := range []int{1, 2, 4, 8} {
+			t.Run(fmt.Sprintf("%s/%dwriters", name, writers), func(t *testing.T) {
+				// After the containers' cleanups, which run first.
+				te, cleanup := setupMetrics(t, false /* forceTempUDS */)
+				t.Cleanup(cleanup)
+				c := precopyConf(conf, storeRate)
+				c.AppHugePages = false
+				c = te.applyConf(c)
+				dir, err := os.MkdirTemp(testutil.TmpDir(), "writers")
+				if err != nil {
+					t.Fatalf("os.MkdirTemp: %v", err)
+				}
+				t.Cleanup(func() { os.RemoveAll(dir) })
+
+				// Each writer rewrites its share at 100 GiB/s, as fast as
+				// it can. The last is the container's init, so that a
+				// signal to every process reaches writers alone.
+				var script strings.Builder
+				outs := make([]reports, writers)
+				for i := range outs {
+					out := filepath.Join(dir, fmt.Sprint(i))
+					if err := os.Mkdir(out, 0777); err != nil {
+						t.Fatal(err)
+					}
+					outs[i].path = filepath.Join(out, "out")
+					cmd := fmt.Sprintf("%s %d 102400 %s", app, heapMiB/writers, out)
+					if i < writers-1 {
+						fmt.Fprintf(&script, "%s & ", cmd)
+					} else {
+						fmt.Fprintf(&script, "exec %s", cmd)
+					}
+				}
+				spec := testutil.NewSpecWithArgs("/bin/sh", "-c", script.String())
+				bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
+				if err != nil {
+					t.Fatalf("error setting up bundle: %v", err)
+				}
+				t.Cleanup(cleanup)
+				newContainer := func() *Container {
+					cont, err := New(c, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir})
+					if err != nil {
+						t.Fatalf("error creating container: %v", err)
+					}
+					t.Cleanup(func() { cont.Destroy() })
+					return cont
+				}
+				cont := newContainer()
+				if err := cont.Start(c); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				for i := range outs {
+					if got, err := outs[i].next(cont); err != nil || got != "READY" {
+						t.Fatalf("writer %d reported %q (%v), want READY", i, got, err)
+					}
+				}
+
+				image := filepath.Join(dir, "image")
+				if err := os.Mkdir(image, 0755); err != nil {
+					t.Fatal(err)
+				}
+				opts := precopyOpts("on")
+				opts.PrecopyThrottle = true
+				opts.Direct = true
+				opts.Compression = statefile.CompressionLevelNone
+				opts.Resume = true
+				if err := cont.Checkpoint(c, image, opts); err != nil {
+					t.Fatalf("error checkpointing with throttled pre-copy: %v", err)
+				}
+				if stops := te.precopyStops(t, cont); len(stops) != 1 || stops["converged"] != 1 {
+					t.Errorf("pre-copies by why their rounds stopped: %v, want 1 converged", stops)
+				}
+				st, err := os.Stat(filepath.Join(image, checkpointfiles.PagesFileName))
+				if err != nil {
+					t.Fatal(err)
+				}
+				copied := te.metric(t, cont, "checkpoint_precopy_bytes", nil)
+				if paused := st.Size() - copied; paused >= storeRate/2 {
+					t.Errorf("the pause wrote %d bytes (pages file %d bytes, rounds %d), want less than half a second's worth of the store", paused, st.Size(), copied)
+				}
+
+				cont.Destroy()
+				cont = newContainer()
+				if err := cont.Restore(c, image, sandbox.RestoreOpts{}); err != nil {
+					t.Fatalf("error restoring %s: %v", image, err)
+				}
+				if err := cont.SignalContainer(unix.SIGUSR1, true /* all */); err != nil {
+					t.Fatalf("error signaling the writers: %v", err)
+				}
+				for i := range outs {
+					if got, err := outs[i].next(cont); err != nil || !strings.HasPrefix(got, "PASS ") {
+						t.Errorf("writer %d's check after restoring: %q (%v)", i, got, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestCheckpointPrecopyChurn pre-copies the A-B writer while it churns memory
 // as well (it allocates, fills and frees regions, discards pages with
 // MADV_DONTNEED, and forks children that write their copies of its pages),
