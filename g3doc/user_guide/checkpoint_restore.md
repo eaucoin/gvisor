@@ -485,12 +485,12 @@ runsc checkpoint --image-path=<path> --precopy=on --direct <container id>
 
 A container that writes memory faster than half the checkpoint's write speed
 keeps the rounds from converging. With `--precopy-throttle=on`, the first round
-that does not halve the memory left to write does not stop the rounds: from
-then on until the checkpoint completes, each process may dirty memory at most
-at a quarter of the write speed measured, and the processes that write faster
-are delayed after the page faults that record their first writes, as QEMU's
-dirty-limit does for vCPUs. The rounds then converge, at the cost of slowing
-those processes during the checkpoint. Throttling requires
+that does not halve the memory left to write does not stop the rounds: from then
+on until the checkpoint completes, the container's processes may dirty memory at
+most at a quarter of the write speed measured, all together, and the processes
+that write are delayed after the page faults that record their first writes, as
+QEMU's dirty-limit does for vCPUs. The rounds then converge, at the cost of
+slowing those processes during the checkpoint. Throttling requires
 `--dirty-tracking=wp`: with `uffd`, which records writes without faults that
 could delay them, a checkpoint with `--precopy-throttle=on` fails.
 

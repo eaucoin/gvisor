@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -157,77 +156,82 @@ func (mm *MemoryManager) disarmDirtyLocked(vseg vmaIterator, pseg pmaIterator, a
 	// The mark precedes the write, which is made possible only after
 	// getPMAsLocked returns.
 	pma.file.(*pgalloc.MemoryFile).MarkDirtyBy(pgalloc.DirtyMarkWriteProtectFault, pseg.fileRange())
-	mm.dirtyThrottle.dirtied.Add(uint64(pseg.Range().Length()))
+	mm.dirtied.Add(uint64(pseg.Range().Length()))
 	return pseg
 }
 
 // Dirty rate limiting.
 //
-// While a checkpoint pre-copies memory, a task that dirties memory faster than
-// the checkpoint can write it keeps the pre-copy from converging. As QEMU's
-// dirty-limit does for vCPUs, the kernel can then limit the rate at which each
-// MemoryManager's tasks dirty memory, delaying a task after the faults that
-// disarm units (DirtyThrottleDelay); tasks that write little are not delayed.
+// While a checkpoint pre-copies memory, tasks that dirty memory faster than
+// the checkpoint can write it keep the pre-copy from converging. As QEMU's
+// dirty-limit does for vCPUs, the kernel can then limit the rate at which its
+// tasks dirty memory, all MemoryManagers together, delaying a task after the
+// faults that disarm units (DirtyLimiter); tasks that write little are not
+// delayed.
 
-// dirtyThrottleBurst is the time's worth of the limit that a MemoryManager may
-// dirty at once.
-const dirtyThrottleBurst = 100 * time.Millisecond
+// dirtyLimitBurst is the time's worth of the limit that may be dirtied at
+// once.
+const dirtyLimitBurst = 100 * time.Millisecond
 
-// dirtyThrottle is the rate limiting state of a MemoryManager: a token bucket
-// of credit in bytes.
-type dirtyThrottle struct {
-	// dirtied is the number of bytes disarmed since the last call to
-	// DirtyThrottleDelay.
-	dirtied atomicbitops.Uint64
+// TakeDirtied returns the number of bytes that mm's tasks disarmed since the
+// last call, to charge against a dirtying limit during the limiting period
+// session: none at mm's first call of a session, whose tasks are not charged
+// for what they dirtied before it.
+func (mm *MemoryManager) TakeDirtied(session uint64) uint64 {
+	n := mm.dirtied.Swap(0)
+	if mm.dirtiedSession.Swap(session) != session {
+		return 0
+	}
+	return n
+}
 
+// DirtyLimiter limits the rate at which tasks dirty memory: a token bucket of
+// credit in bytes, shared by the MemoryManagers it limits together.
+type DirtyLimiter struct {
 	mu sync.Mutex
 
 	// credit is the number of bytes that may be dirtied without delay; it is
-	// negative when the MemoryManager is over its limit.
+	// negative when the tasks are over their limit.
 	//
 	// +checklocks:mu
 	credit int64
 
-	// last is the time of the last call to DirtyThrottleDelay, in
-	// nanoseconds of the caller's monotonic clock.
+	// last is the time of the last call to Delay, in nanoseconds of the
+	// caller's monotonic clock.
 	//
 	// +checklocks:mu
 	last int64
 
-	// session identifies the limiting period of the last call to
-	// DirtyThrottleDelay.
+	// session identifies the limiting period of the last call to Delay.
 	//
 	// +checklocks:mu
 	session uint64
 }
 
-// DirtyThrottleDelay charges the bytes that mm's tasks dirtied since its last
-// call against a limit of limit bytes per second, and returns how long the
-// calling task should wait for mm to be back within it. now is the current
-// time, in nanoseconds of a monotonic clock. session identifies the period
-// during which the limit applies: the first call of a new session starts with
-// full credit, and does not charge what was dirtied before.
+// Delay charges dirtied bytes, which a task's MemoryManager dirtied since it
+// last charged them (TakeDirtied), against a limit of limit bytes per second,
+// and returns how long the task should wait for the tasks to be back within
+// it. now is the current time, in nanoseconds of a monotonic clock. session
+// identifies the period during which the limit applies: the first call of a
+// new session starts with full credit.
 //
 // Preconditions: limit > 0.
-func (mm *MemoryManager) DirtyThrottleDelay(limit, session uint64, now int64) time.Duration {
-	t := &mm.dirtyThrottle
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	dirtied := int64(t.dirtied.Swap(0))
-	burst := int64(limit) * int64(dirtyThrottleBurst) / int64(time.Second)
-	if t.session != session {
-		t.session = session
-		t.credit = burst
-		dirtied = 0
-	} else if elapsed := now - t.last; elapsed > 0 {
+func (l *DirtyLimiter) Delay(dirtied, limit, session uint64, now int64) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	burst := int64(limit) * int64(dirtyLimitBurst) / int64(time.Second)
+	if l.session != session {
+		l.session = session
+		l.credit = burst
+	} else if elapsed := now - l.last; elapsed > 0 {
 		// Credit refills at limit, up to burst.
 		refill := float64(limit) * time.Duration(elapsed).Seconds()
-		t.credit = int64(min(float64(t.credit)+refill, float64(burst)))
+		l.credit = int64(min(float64(l.credit)+refill, float64(burst)))
 	}
-	t.last = now
-	t.credit -= dirtied
-	if t.credit >= 0 {
+	l.last = now
+	l.credit -= int64(dirtied)
+	if l.credit >= 0 {
 		return 0
 	}
-	return time.Duration(float64(-t.credit) / float64(limit) * float64(time.Second))
+	return time.Duration(float64(-l.credit) / float64(limit) * float64(time.Second))
 }
