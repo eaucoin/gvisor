@@ -43,3 +43,5 @@ series/27-gofer-sync-errors on series/26-s3-reads-stop-at-end
 series/28-coalesced-page-loads on series/27-gofer-sync-errors
 # A lazy restore keeps as many background reads in flight as its pages file serves at once (pgalloc, stateio, checkpoint gofers).
 series/29-parallel-reads on series/28-coalesced-page-loads
+# Pre-copy dirtying is limited for the whole sandbox, I/O to a large loading pma waits for its own pages, and the OOM killer kills a sandbox whole (kernel, mm, runsc/cgroup).
+series/30-sandbox-fixes on series/29-parallel-reads
