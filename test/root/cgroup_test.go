@@ -433,6 +433,11 @@ func TestCgroupV2(t *testing.T) {
 			skipIfNotFound: true, // blkio groups may not be available.
 		},
 		{
+			// Not an option: runsc kills a sandbox whole on OOM.
+			file: "memory.oom.group",
+			want: "1",
+		},
+		{
 			field: "pids-limit",
 			value: 1000,
 			file:  "pids.max",

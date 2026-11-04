@@ -269,6 +269,43 @@ func TestInstall(t *testing.T) {
 	}
 }
 
+func TestSystemdSetOOMGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		version   int
+		wantProps []systemdDbus.Property
+	}{
+		{
+			name:      "OOMPolicy for scopes",
+			version:   minOOMPolicyScopeVersion,
+			wantProps: []systemdDbus.Property{{"OOMPolicy", dbus.MakeVariant("kill")}},
+		},
+		{
+			name:      "no OOMPolicy for scopes",
+			version:   minOOMPolicyScopeVersion - 1,
+			wantProps: []systemdDbus.Property{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cg := cgroupSystemd{Name: "123", Parent: "parent.slice", version: tc.version}
+			cg.Controllers = mandatoryControllers
+			if err := cg.Install(nil); err != nil {
+				t.Fatalf("Install(): %v", err)
+			}
+			if err := cg.SetOOMGroup(); err != nil {
+				t.Fatalf("SetOOMGroup(): %v", err)
+			}
+			cmper := cmp.Comparer(func(a dbus.Variant, b dbus.Variant) bool {
+				return a.String() == b.String()
+			})
+			oomPolicy := []systemdDbus.Property{{Name: "OOMPolicy"}}
+			if diff := cmp.Diff(filterProperties(cg.properties, oomPolicy), tc.wantProps, cmper); diff != "" {
+				t.Errorf("cgroup properties list diff %s", diff)
+			}
+		})
+	}
+}
+
 // filterProperties filters the list of properties in got to ones with
 // the names of properties specified in want.
 func filterProperties(got []systemdDbus.Property, want []systemdDbus.Property) []systemdDbus.Property {

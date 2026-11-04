@@ -713,3 +713,66 @@ func TestUpdateUnified(t *testing.T) {
 		})
 	}
 }
+
+func TestSetOOMGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		precreated  bool
+		controllers []string
+		want        string
+	}{
+		{
+			name:        "created",
+			controllers: mandatoryControllers,
+			want:        "1",
+		},
+		{
+			name:        "pre-created",
+			precreated:  true,
+			controllers: mandatoryControllers,
+			want:        "0",
+		},
+		{
+			name:        "no memory controller",
+			controllers: []string{"cpu", "pids"},
+			want:        "0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "cgroup")
+			if err != nil {
+				t.Fatalf("error creating temporary directory: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			cg := &cgroupV2{
+				Mountpoint:  dir,
+				Path:        "user.slice/sandbox",
+				Controllers: tc.controllers,
+			}
+			cgPath := cg.MakePath("")
+			if err := os.MkdirAll(cgPath, 0o777); err != nil {
+				t.Fatalf("os.MkdirAll(): %v", err)
+			}
+			if !tc.precreated {
+				// As Install records the directories it creates.
+				cg.Own = []string{cgPath}
+			}
+			// The kernel makes the file with the cgroup.
+			if err := os.WriteFile(filepath.Join(cgPath, memoryOOMGroup), []byte("0"), 0o666); err != nil {
+				t.Fatalf("os.WriteFile(): %v", err)
+			}
+
+			if err := cg.SetOOMGroup(); err != nil {
+				t.Fatalf("SetOOMGroup(): %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(cgPath, memoryOOMGroup))
+			if err != nil {
+				t.Fatalf("os.ReadFile(): %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("%s = %q, want %q", memoryOOMGroup, got, tc.want)
+			}
+		})
+	}
+}

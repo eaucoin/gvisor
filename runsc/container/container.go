@@ -2329,6 +2329,16 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 	if parentCgroup == nil || err != nil {
 		return nil, nil, err
 	}
+	// A sandbox's memory is freed only once its last process that maps it
+	// has exited, so killing its processes one at a time on OOM frees nothing
+	// until the last: meanwhile, the OOM killer of a cgroup above it goes on
+	// to kill processes of other cgroups, such as other sandboxes. Killing
+	// them all at once frees the sandbox's memory as soon as possible, and
+	// spares the other cgroups.
+	if err := parentCgroup.SetOOMGroup(); err != nil {
+		_ = parentCgroup.Uninstall()
+		return nil, nil, fmt.Errorf("making the OOM killer kill the sandbox whole: %w", err)
+	}
 
 	subCgroup, err := c.setupCgroupForSubcontainer(conf, spec)
 	if err != nil {

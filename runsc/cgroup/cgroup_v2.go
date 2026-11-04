@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,7 @@ const (
 	controllersFile   = "cgroup.controllers"
 	cgroup2Key        = "cgroup2"
 	memoryLimitCgroup = "memory.max"
+	memoryOOMGroup    = "memory.oom.group"
 	cpuLimitCgroup    = "cpu.max"
 	maxLimitStr       = "max"
 
@@ -429,6 +431,16 @@ func (c *cgroupV2) MemoryLimit() (uint64, error) {
 // MakePath builds a path to the given controller.
 func (c *cgroupV2) MakePath(string) string {
 	return filepath.Join(c.Mountpoint, c.Path)
+}
+
+// SetOOMGroup implements Cgroup.SetOOMGroup.
+func (c *cgroupV2) SetOOMGroup() error {
+	// Install created the cgroup if it created any directory: the cgroup's
+	// is the last.
+	if len(c.Own) == 0 || !slices.Contains(c.Controllers, "memory") {
+		return nil
+	}
+	return setValue(c.MakePath(""), memoryOOMGroup, "1")
 }
 
 type controllerv2 interface {
