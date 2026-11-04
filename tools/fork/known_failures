@@ -8,7 +8,12 @@
 # when the base, or a series, makes the test pass.
 #
 # Found by fork-nightly on series/fork-infra (base + the fork's own series),
-# runs 37884262655 and 37897071711, 2026-10-09.
+# runs 37884262655 and 37897071711, 2026-10-09, on release-20260921.0; checked
+# again on release-20261102.0 with series/fork-infra, run 41864029722,
+# 2026-11-04: each listed target that the base has still fails there but
+# truncate_test's, now removed, and those that failed only in some runs
+# (openat2, socket_ip_tcp_generic_loopback, xattr), which passed in that one
+# run and stay listed; ping_socket_test's fail newly.
 
 # PipeTest.PipeFdCount: pipe2 fails with EMFILE after a save, in every file
 # access mode.
@@ -55,14 +60,25 @@
 //test/syscalls:openat2_test_runsc_systrap_directfs_save_verify_incremental
 //test/syscalls:openat2_test_runsc_systrap_directfs_save_verify_uffd_incremental
 
-# truncate.cc:204: after a save, a child that unshares a user namespace
-# truncates a 0555 file on FUSE without CAP_DAC_OVERRIDE (expected EACCES).
-//test/syscalls:truncate_test_runsc_systrap_fuse_save
-//test/syscalls:truncate_test_runsc_systrap_fuse_save_resume
-
 # xattr.cc:181, now and then: in XattrTest.WriteRemovesSecurityCapability, a
 # child that set its user ID to nobody fails to open a 0666 file on FUSE for
 # writing (exit status 2), without the FUSE server seeing a request; on the
 # base in 2 of 60 runs of fuse_save_resume (fork-repeat run 37967232154).
 //test/syscalls:xattr_test_runsc_systrap_fuse_save
 //test/syscalls:xattr_test_runsc_systrap_fuse_save_resume
+
+# The test runner fails before the test runs, in every save variant: "setting
+# host RLIMIT_NOFILE to {Cur:131072 Max:131072}: operation not permitted".
+# Upstream's runner raises the host's hard limit for ping_socket_test's
+# descriptor budget (9cfbe5fa81), which GitHub's runners do not allow.
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_resume
+//test/syscalls:ping_socket_test_runsc_systrap_hostnet_save_resume
+//test/syscalls:ping_socket_test_runsc_systrap_shared_save
+//test/syscalls:ping_socket_test_runsc_systrap_shared_save_resume
+//test/syscalls:ping_socket_test_runsc_systrap_save_background
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_verify
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_verify_4k
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_verify_uffd
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_verify_incremental
+//test/syscalls:ping_socket_test_runsc_systrap_directfs_save_verify_uffd_incremental
