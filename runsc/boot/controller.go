@@ -461,9 +461,11 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		if cm.l.root.conf.WorkingSetPrefetch == config.WorkingSetPrefetchOff {
 			prefetch = pgalloc.PrefetchOff
 		}
-		// For background restore, throttle page loading until the kernel is
-		// restored, so that restore does not wait behind page reads.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
+		// Not throttled, unlike upstream's background restore: the fork's
+		// loader bounds its background reads by a budget that leaves a slot
+		// to awaited reads, and its slow start measures the pages file from
+		// the first reads, which a throttle phase would serialize.
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{}) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")
 	}
