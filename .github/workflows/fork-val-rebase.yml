@@ -1,10 +1,9 @@
 # Spike, not for main (named fork-* so that fork-integrate.yml leaves it
 # enabled): the kernel-standby validation's rebase of the fork's series onto
 # upstream master (the endpoint package's M6 rebase spike), checked as tier 1
-# checks main, on every push of a spike/val-rebase branch: the Bazel build
-# and the affected tests, pinned to the CPU and kernel that the package's
-# measurements use. The checks and the go branch build, which passed at
-# be15019ec0 (run 41310522894), run again at the end.
+# checks main, on every push of a spike/val-rebase branch. Its jobs run one
+# after another, so that the spike holds one runner at a time; every one of
+# them is pinned to the CPU and kernel that the package's measurements use.
 name: Rebase spike
 
 "on":
@@ -26,12 +25,87 @@ env:
   SERIES_REF: ${{ github.sha }}
 
 jobs:
-  # The Bazel job passed at d9edc28bb7 (run 41317539294: the release build, both
-  # engines' smoke test, runsc/container's tests built, 179 of 179 affected
-  # tests); only this workflow changes since, so tier 1's checks and the go
-  # branch build finish it.
+  bazel:
+    name: Bazel build and affected tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    outputs:
+      base: ${{ steps.base.outputs.base }}
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          release=$(uname -r)
+          echo "$model, $release"
+          [ "$model" = "AMD EPYC 7763 64-Core Processor" ] || { echo "::error::this runner's CPU is $model: re-run this job"; exit 3; }
+          [[ $release == 7.0.* ]] || { echo "::error::this runner's kernel is $release: re-run this job"; exit 3; }
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - id: base
+        run: echo "base=$(tools/fork/series.sh base)" >>"${GITHUB_OUTPUT}"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
+          restore-keys: bazel-${{ steps.base.outputs.base }}-
+      - name: Build the release binaries
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          make copy TARGETS=//:release DESTINATION="${RUNNER_TEMP}/release/"
+          "${RUNNER_TEMP}/release/runsc" --version
+      - name: Smoke test, graph engine (upstream's default)
+        run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
+      - name: Smoke test, wire engine
+        run: tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --state-engine=wire
+      - name: Build runsc/container's tests
+        run: make build TARGETS=//runsc/container:container_test
+      - name: Affected tests
+        run: |
+          tools/fork/affected_tests.sh "${{ steps.base.outputs.base }}" >/tmp/affected.query
+          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
+          "${bazel[@]}" query --query_file=/tmp/affected.query | sort >"${RUNNER_TEMP}/tests"
+          {
+            echo "### $(wc -l <"${RUNNER_TEMP}/tests") affected tests"
+            sed 's/^/- /' "${RUNNER_TEMP}/tests"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          make test OPTIONS="${TEST_OPTIONS} --keep_going --test_tag_filters=-requires-kvm,-manual --build_tag_filters=-network_plugins --test_env=CGROUPV2=true --test_env=GVISOR_REQUIRE_UFFD_WP=1" \
+            TARGETS="$(tr '\n' ' ' <"${RUNNER_TEMP}/tests")"
+      - name: Test logs
+        if: failure()
+        run: |
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs-${{ github.sha }}
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-${{ steps.base.outputs.base }}-${{ github.sha }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+          retention-days: 7
+
   checks:
     name: Lint, license headers and documentation links
+    needs: bazel
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -55,6 +129,8 @@ jobs:
 
   go:
     name: Go branch build
+    needs: checks
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
