@@ -62,9 +62,9 @@ type PrecopyOpts struct {
 	Auto bool
 
 	// If Throttle is true, a round that does not halve the bytes left to
-	// write does not stop the rounds the first time: instead, each
-	// MemoryManager's tasks may then dirty memory at most at a quarter of the
-	// write bandwidth measured, until the save completes, as QEMU's
+	// write does not stop the rounds the first time: instead, the tasks of
+	// all MemoryManagers together may then dirty memory at most at a quarter
+	// of the write bandwidth measured, until the save completes, as QEMU's
 	// dirty-limit does for vCPUs. Only the tasks that dirty memory faster are
 	// delayed, after the faults that record their first writes, so
 	// throttling requires the write-protection dirty source.
@@ -414,7 +414,7 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 			throttling = true
 			limit := precopyThrottleLimit(cost)
 			k.setDirtyLimit(limit)
-			log.Infof("Pre-copy: limiting each MemoryManager's dirtying to %d bytes/s", limit)
+			log.Infof("Pre-copy: limiting the tasks' dirtying to %d bytes/s", limit)
 		}
 		if stop != precopyContinue {
 			p.stats.stop = stop
@@ -451,15 +451,16 @@ func precopyNext(round int, written, pending uint64, cost time.Duration, opts Pr
 }
 
 // precopyThrottleLimit returns the rate in bytes per second to which
-// throttling limits each MemoryManager's dirtying, given the write cost per
-// MiB: a quarter of the write bandwidth, at which each round writes at most a
-// quarter of the bytes of the previous one.
+// throttling limits the tasks' dirtying, all MemoryManagers together, given
+// the write cost per MiB: a quarter of the write bandwidth, at which each round
+// writes at most a quarter of the bytes of the previous one.
 func precopyThrottleLimit(cost time.Duration) uint64 {
 	return uint64(float64(1<<20) / cost.Seconds() / 4)
 }
 
-// setDirtyLimit sets the rate in bytes per second to which each
-// MemoryManager's tasks may dirty memory, or removes the limit if limit is 0.
+// setDirtyLimit sets the rate in bytes per second to which the tasks may
+// dirty memory, all MemoryManagers together, or removes the limit if limit is
+// 0.
 func (k *Kernel) setDirtyLimit(limit uint64) {
 	if limit != 0 {
 		k.dirtyLimitSession.Add(1)
@@ -468,8 +469,8 @@ func (k *Kernel) setDirtyLimit(limit uint64) {
 	k.dirtyLimit.Store(limit)
 }
 
-// throttleDirtying delays t, which just handled a fault, as long as its
-// MemoryManager is over the dirtying limit, if any; see PrecopyOpts.Throttle.
+// throttleDirtying delays t, which just handled a fault, as long as the tasks
+// are over the dirtying limit, if any; see PrecopyOpts.Throttle.
 // A signal or a stop ends the delay early: the task then delays again at its
 // next fault.
 func (t *Task) throttleDirtying() {
@@ -477,7 +478,8 @@ func (t *Task) throttleDirtying() {
 	if limit == 0 {
 		return
 	}
-	d := t.MemoryManager().DirtyThrottleDelay(limit, t.k.dirtyLimitSession.Load(), t.k.MonotonicClock().Now().Nanoseconds())
+	session := t.k.dirtyLimitSession.Load()
+	d := t.k.dirtyLimiter.Delay(t.MemoryManager().TakeDirtied(session), limit, session, t.k.MonotonicClock().Now().Nanoseconds())
 	if d <= 0 {
 		return
 	}
