@@ -382,6 +382,12 @@ type Cgroup interface {
 	NumCPU() (int, error)
 	MemoryLimit() (uint64, error)
 	MakePath(controllerName string) string
+
+	// SetOOMGroup makes the kernel's OOM killer, when it kills a process of
+	// the cgroup, kill all of them (cgroup v2's memory.oom.group). It applies
+	// to a cgroup that Install set up, not to one that it found already
+	// there, and does nothing for cgroups v1, which have no such setting.
+	SetOOMGroup() error
 }
 
 // cgroupV1 represents a group inside all controllers. For example:
@@ -859,6 +865,11 @@ func (c *cgroupV1) MemoryLimit() (uint64, error) {
 		return 0, err
 	}
 	return strconv.ParseUint(strings.TrimSpace(limStr), 10, 64)
+}
+
+// SetOOMGroup implements Cgroup.SetOOMGroup.
+func (*cgroupV1) SetOOMGroup() error {
+	return nil
 }
 
 // MakePath builds a path to the given controller.
