@@ -1,0 +1,86 @@
+# Spike, not for main (named fork-* so that fork-integrate.yml leaves it
+# enabled): the kernel-standby validation's recomputation of
+# tools/fork/known_failures on the rebase spike's base, upstream
+# release-20261102.0 with series/fork-infra rebased onto it, as fork-nightly
+# found the list on release-20260921.0 with series/fork-infra. It runs, on every push of
+# spike/val-known-failures, the save variants' targets that the list names,
+# and those of ping_socket_test, which failed on the rebase in every save
+# variant, so that the list keeps what still fails on the new base and gains
+# what newly does. One job, on one runner.
+name: Known failures spike
+
+"on":
+  push:
+    branches:
+      - spike/val-known-failures
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BAZEL_REMOTE_CACHE: --disk_cache=/home/runner/.cache/bazel/disk
+  TEST_OPTIONS: --modify_execution_info=TestRunner=+no-cache
+  BASE: 7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c
+
+jobs:
+  known-failures:
+    name: The known failures' targets on the new base
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-known-failures-${{ env.BASE }}-${{ github.sha }}
+          restore-keys: |
+            bazel-nightly-${{ env.BASE }}-
+            bazel-${{ env.BASE }}-
+      - name: The targets
+        run: |
+          read -ra bazel < <(make --no-print-directory bazel-alias | sed -n "s/^alias bazel='\(.*\)'\$/\1/p")
+          printf '%s\n' "attr(tags, '\\bsave_(restore|resume|verify|incremental)\\b', tests(//test/syscalls/...))" >/tmp/sr.query
+          "${bazel[@]}" query --query_file=/tmp/sr.query | sort >"${RUNNER_TEMP}/all"
+          sed -e 's/#.*//' -e '/^[[:space:]]*$/d' tools/fork/known_failures | sort >"${RUNNER_TEMP}/listed"
+          { grep -xFf "${RUNNER_TEMP}/listed" "${RUNNER_TEMP}/all"; grep -F ':ping_socket_test_' "${RUNNER_TEMP}/all"; } | sort -u >"${RUNNER_TEMP}/targets"
+          comm -23 "${RUNNER_TEMP}/listed" "${RUNNER_TEMP}/all" >"${RUNNER_TEMP}/gone"
+          {
+            echo "### $(wc -l <"${RUNNER_TEMP}/targets") targets"
+            echo "Listed but no longer save targets: $(wc -l <"${RUNNER_TEMP}/gone")"
+            sed 's/^/- /' "${RUNNER_TEMP}/gone"
+          } >>"${GITHUB_STEP_SUMMARY}"
+          cat "${RUNNER_TEMP}/targets"
+      - name: Test
+        run: |
+          make syscall-tests OPTIONS="${TEST_OPTIONS} --keep_going" TARGETS="$(tr '\n' ' ' <"${RUNNER_TEMP}/targets")"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: /home/runner/.cache/bazel/disk
+          key: bazel-known-failures-${{ env.BASE }}-${{ github.sha }}
+      - name: Test logs
+        if: failure()
+        run: |
+          mkdir -p "${RUNNER_TEMP}/testlogs"
+          make testlogs | while read -r label log; do
+            dir="${RUNNER_TEMP}/testlogs/$(tr '/:' '__' <<<"${label#//}")"
+            mkdir -p "${dir}"
+            cp -r --no-preserve=mode "$(dirname "${log}")/." "${dir}/"
+            echo "${label}"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: testlogs-known-failures
+          path: ${{ runner.temp }}/testlogs
+          retention-days: 14
