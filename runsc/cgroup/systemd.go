@@ -69,6 +69,9 @@ type cgroupSystemd struct {
 
 	properties []systemdDbus.Property
 	dbusConn   *systemdDbus.Conn
+
+	// version is the version of the host's systemd.
+	version int
 }
 
 func newCgroupV2Systemd(cgv2 *cgroupV2) (*cgroupSystemd, error) {
@@ -103,6 +106,7 @@ func newCgroupV2Systemd(cgv2 *cgroupV2) (*cgroupSystemd, error) {
 		return nil, fmt.Errorf("systemd version %d not supported, please upgrade to at least 244", version)
 	}
 	cg.dbusConn = conn
+	cg.version = version
 	return cg, err
 }
 
@@ -214,6 +218,22 @@ func (c *cgroupSystemd) Update(res *specs.LinuxResources) error {
 
 func (c *cgroupSystemd) unitName() string {
 	return fmt.Sprintf("%s-%s.scope", c.ScopePrefix, c.Name)
+}
+
+// minOOMPolicyScopeVersion is the first version of systemd that takes
+// OOMPolicy= for scope units.
+const minOOMPolicyScopeVersion = 253
+
+// SetOOMGroup implements Cgroup.SetOOMGroup. systemd sets the attributes of
+// the cgroups of the units it starts, memory.oom.group among them (to 0 for
+// delegated units by default), so the unit's OOMPolicy= asks systemd for it.
+func (c *cgroupSystemd) SetOOMGroup() error {
+	if c.version < minOOMPolicyScopeVersion {
+		log.Warningf("systemd %d takes no OOMPolicy= for scope units (it needs %d): the OOM killer may kill the processes of %s one at a time", c.version, minOOMPolicyScopeVersion, c.unitName())
+		return nil
+	}
+	c.addProp("OOMPolicy", "kill")
+	return nil
 }
 
 // MakePath builds a path to the given controller.
