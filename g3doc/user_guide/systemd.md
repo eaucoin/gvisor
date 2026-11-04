@@ -90,3 +90,12 @@ unified.pids.max        | TasksMax                    |
 
 For documentation on systemd unit resource properties, see
 `systemd.resource-control(5)` man page.
+
+### OOM kills
+
+A sandbox's memory is freed only once all of its processes have exited, so the
+kernel's OOM killer kills a sandbox whole: runsc sets `memory.oom.group` to 1 on
+the cgroup of each sandbox that it creates. With the systemd cgroup driver, it
+sets *OOMPolicy=kill* on the sandbox's unit instead, which systemd takes for
+scope units from version 253; with an older systemd, the OOM killer may kill a
+sandbox's processes one at a time.
