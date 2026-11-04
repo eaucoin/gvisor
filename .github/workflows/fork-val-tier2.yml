@@ -53,6 +53,11 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
       base: ${{ steps.resolve.outputs.base }}
     steps:
+      - name: Free the runner's disk
+        # A build without a cache from the same base fills the runner's disk.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fork
@@ -126,6 +131,11 @@ jobs:
         variant: [save_restore]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Free the runner's disk
+        # A build without a cache from the same base fills the runner's disk.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
         # themselves in one, as on upstream's test hosts.
@@ -178,6 +188,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Free the runner's disk
+        # A build without a cache from the same base fills the runner's disk.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,6 +274,11 @@ jobs:
             thp: true
           - platform: kvm
     steps:
+      - name: Free the runner's disk
+        # A build without a cache from the same base fills the runner's disk.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
         # themselves in one, as on upstream's test hosts.
