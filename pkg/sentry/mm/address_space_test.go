@@ -16,6 +16,7 @@ package mm
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // recordingAddressSpace is a platform.AddressSpace that records the calls
@@ -82,15 +84,19 @@ func (*recordingAddressSpace) PreFork() {}
 // PostFork implements platform.AddressSpace.PostFork.
 func (*recordingAddressSpace) PostFork() {}
 
-// gatedReaderAt is an io.ReaderAt whose reads wait until open is closed.
+// gatedReaderAt is an io.ReaderAt whose reads of bytes at or past from wait
+// until open is closed.
 type gatedReaderAt struct {
 	r    io.ReaderAt
+	from int64
 	open chan struct{}
 }
 
 // ReadAt implements io.ReaderAt.ReadAt.
 func (g *gatedReaderAt) ReadAt(dst []byte, off int64) (int, error) {
-	<-g.open
+	if off+int64(len(dst)) > g.from {
+		<-g.open
+	}
 	return g.r.ReadAt(dst, off)
 }
 
@@ -115,27 +121,28 @@ func newTestMemoryFile(t *testing.T, expectHugepages bool) *pgalloc.MemoryFile {
 }
 
 // loadingMemoryFile returns a MemoryFile being restored, as runsc restore
-// --background does, from an image of one page that it has not loaded yet,
-// and a function that lets it load the page and waits until loading has
+// --background does, from an image of length bytes of 1s, of which it loads
+// the first loadable bytes and no more; the range of the MemoryFile that holds
+// them; and a function that lets it load the rest and waits until loading has
 // ended.
-func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool) (*pgalloc.MemoryFile, func()) {
+func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool, length uint64, loadable int64) (*pgalloc.MemoryFile, memmap.FileRange, func()) {
 	t.Helper()
 
-	// Save an image of one page.
+	// Save an image of the bytes.
 	src := newTestMemoryFile(t, false /* expectHugepages */)
-	fr, err := src.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndCommit})
+	fr, err := src.Allocate(length, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 	defer src.DecRef(fr)
-	// Write the page, since zero pages are saved without data, and so need no
-	// loading.
+	// Write the bytes, since zero pages are saved without data, and so need
+	// no loading.
 	ims, err := src.MapInternal(fr, hostarch.Write)
 	if err != nil {
 		t.Fatalf("MapInternal: %v", err)
 	}
-	if _, err := safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bytes.Repeat([]byte{1}, hostarch.PageSize)))); err != nil {
-		t.Fatalf("writing the page: %v", err)
+	if _, err := safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bytes.Repeat([]byte{1}, int(length))))); err != nil {
+		t.Fatalf("writing the bytes: %v", err)
 	}
 	var meta, pages bytes.Buffer
 	saved := make(chan error, 1)
@@ -156,12 +163,12 @@ func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool) 
 		t.Fatalf("Finish: %v", err)
 	}
 
-	// Restore it from a pages file whose reads wait for open.
+	// Restore it from a pages file whose reads past loadable wait for open.
 	open := make(chan struct{})
 	var openOnce sync.Once
 	letLoad := func() { openOnce.Do(func() { close(open) }) }
 	t.Cleanup(letLoad)
-	ar := stateio.NewIOReader(&gatedReaderAt{bytes.NewReader(pages.Bytes()), open}, 256<<10, 64, 4)
+	ar := stateio.NewIOReader(&gatedReaderAt{bytes.NewReader(pages.Bytes()), loadable, open}, 256<<10, 64, 4)
 	apfl, err := pgalloc.StartAsyncPagesFileLoad(ar, func(error) {}, nil /* timeline */)
 	if err != nil {
 		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
@@ -180,7 +187,7 @@ func loadingMemoryFile(ctx context.Context, t *testing.T, expectHugepages bool) 
 	if !mf.IsAsyncLoading() {
 		t.Fatalf("MemoryFile is not loading")
 	}
-	return mf, func() {
+	return mf, fr, func() {
 		t.Helper()
 		letLoad()
 		select {
@@ -211,7 +218,7 @@ func TestMapUnitWhileLoading(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := contexttest.Context(t)
-			mf, finishLoading := loadingMemoryFile(ctx, t, test.huge)
+			mf, _, finishLoading := loadingMemoryFile(ctx, t, test.huge, hostarch.PageSize, 0 /* loadable */)
 			p := platform.FromContext(ctx)
 			mm, err := NewMemoryManager(p, mf)
 			if err != nil {
@@ -287,5 +294,88 @@ func TestMapUnitWhileLoading(t *testing.T) {
 				t.Errorf("after loading, a touch mapped %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// TestIOWhileLoading checks that I/O to part of a pma larger than
+// maxCachedLoadingPMA, while its MemoryFile is being loaded by a background
+// restore, waits for the pages it accesses alone rather than for the whole pma,
+// and that I/O waiting for pages does not keep I/O to other pages waiting.
+func TestIOWhileLoading(t *testing.T) {
+	const length = 2 * maxCachedLoadingPMA
+	ctx := contexttest.Context(t)
+	// The pages of the second half are not loaded until finishLoading.
+	mf, fr, finishLoading := loadingMemoryFile(ctx, t, false /* expectHugepages */, length, length/2)
+	p := platform.FromContext(ctx)
+	mm, err := NewMemoryManager(p, mf)
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	mm.layout = arch.MmapLayout{
+		MinAddr:          p.MinUserAddress(),
+		MaxAddr:          p.MaxUserAddress(),
+		BottomUpBase:     p.MinUserAddress(),
+		TopDownBase:      p.MaxUserAddress(),
+		DefaultDirection: arch.MmapBottomUp,
+	}
+	defer mm.DecUsers(ctx)
+
+	// Map the restored bytes with one pma, as a restore does.
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   length,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	ar := hostarch.AddrRange{Start: addr, End: addr + length}
+	mf.IncRef(fr, 0 /* memCgID */)
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	// While I/O to the second half waits for its pages, I/O to the first
+	// half reads its own.
+	waiting := make(chan error, 1)
+	go func() {
+		_, err := mm.CopyIn(ctx, addr+length/2+hostarch.PageSize, make([]byte, 8), usermem.IOOpts{})
+		waiting <- err
+	}()
+	done := make(chan error, 1)
+	go func() {
+		b := make([]byte, 8)
+		for end := time.Now().Add(100 * time.Millisecond); time.Now().Before(end); {
+			if _, err := mm.CopyIn(ctx, addr+hostarch.PageSize, b, usermem.IOOpts{}); err != nil {
+				done <- err
+				return
+			}
+			if want := bytes.Repeat([]byte{1}, len(b)); !bytes.Equal(b, want) {
+				done <- fmt.Errorf("CopyIn read %v, want %v", b, want)
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("I/O to the loaded half: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Errorf("I/O to the loaded half waited for the pages of the other")
+	}
+	finishLoading()
+	if err := <-waiting; err != nil {
+		t.Errorf("I/O to the half loaded last: %v", err)
 	}
 }

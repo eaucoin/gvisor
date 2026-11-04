@@ -155,8 +155,10 @@ applications.
 
 A page the application touches waits for its own read, not for the background
 reads already under way. gVisor maps memory that is still loading 64 KiB at a
-time, and it bounds the background reads it keeps in flight to what keeps the
-storage busy: the bandwidth the storage delivers times the latency of a
+time. Its own accesses to that memory, such as a system call's to its buffers,
+wait for the pages they access alone, but in a mapping of at most 32 MiB, which
+they map whole. It bounds the background reads it keeps in flight to what keeps
+the storage busy: the bandwidth the storage delivers times the latency of a
 background read, plus 2 ms. Background reads keep the size that the storage
 reads best (256 KiB from a file, 16 MiB through the checkpoint gofer), and the
 bound is never less than one of them: slow storage gets fewer reads, never
