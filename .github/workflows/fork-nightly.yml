@@ -190,6 +190,10 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
+      # GitHub runs 20 jobs of the account at once, which other repositories'
+      # CI shares: with the 7 other jobs of this tier that run beside them, 9
+      # shards at once keep tier 2 at 16 jobs.
+      max-parallel: 9
       matrix:
         variant: [save_restore, save_resume, save_verify, save_incremental]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
