@@ -144,6 +144,10 @@ jobs:
           "${RUNNER_TEMP}/release/runsc" --version
       - name: Smoke test
         run: fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc"
+      - name: Smoke test, wire state engine
+        # Graph is the default state engine; wire stays selectable as a
+        # fallback, so its checkpoint and restore are checked too.
+        run: fork/tools/fork/smoke_test.sh "${RUNNER_TEMP}/release/runsc" --state-engine=wire
       - name: Build runsc/container's tests
         # Tier 2 runs them; building them here catches a change elsewhere that
         # breaks them, such as a new argument to a function they call.
