@@ -10,12 +10,12 @@
 #
 # Lines: "base TAG", then "BRANCH [on BRANCH...]"; "#" starts a comment.
 
-base release-20260921.0
+base release-20261102.0
 
 series/fork-infra
 # Fixes to the base: upstream's own bugs, in systrap and in its tests.
 series/00-base-fixes
-# Carries google/gvisor#14430 (pgalloc's first save/restore tests) by its author.
+# pgalloc's save/restore tests, written beside google/gvisor#14430, which upstream has merged.
 series/10-pgalloc-save-restore-tests
 series/17-image-format-v2 on series/10-pgalloc-save-restore-tests
 series/18-image-tooling on series/17-image-format-v2
@@ -43,5 +43,5 @@ series/27-gofer-sync-errors on series/26-s3-reads-stop-at-end
 series/28-coalesced-page-loads on series/27-gofer-sync-errors
 # A lazy restore keeps as many background reads in flight as its pages file serves at once (pgalloc, stateio, checkpoint gofers).
 series/29-parallel-reads on series/28-coalesced-page-loads
-# Pre-copy dirtying is limited for the whole sandbox, I/O to a large loading pma waits for its own pages, and the OOM killer kills a sandbox whole (kernel, mm, runsc/cgroup).
+# Pre-copy dirtying is limited for the whole sandbox, and the OOM killer kills a sandbox whole (kernel, runsc/cgroup).
 series/30-sandbox-fixes on series/29-parallel-reads
