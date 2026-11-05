@@ -96,6 +96,26 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
       base: ${{ steps.resolve.outputs.base }}
     steps:
+      - name: Free disk space
+        # Bazel's disk cache, restored below, takes 4 GB packed and more
+        # unpacked, and with the build's outputs more than a runner starts with
+        # free: five jobs ran out of disk restoring it on 2026-11-04. The
+        # toolchains the runner comes with that tier 2's jobs do not use (the
+        # build and the tests run in containers) are removed first, in
+        # parallel; each job that restores a Bazel cache does the same.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fork
@@ -174,6 +194,21 @@ jobs:
         variant: [save_restore, save_resume, save_verify, save_incremental]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Free disk space
+        # As in the build job.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
         # themselves in one, as on upstream's test hosts.
@@ -225,6 +260,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Free disk space
+        # As in the build job.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Give access to /dev/kvm
@@ -280,6 +330,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Free disk space
+        # As in the build job.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -359,6 +424,21 @@ jobs:
             thp: true
           - platform: kvm
     steps:
+      - name: Free disk space
+        # As in the build job.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 denies them through AppArmor; gVisor's tests re-execute
         # themselves in one, as on upstream's test hosts.
@@ -498,6 +578,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Free disk space
+        # As in the build job.
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          pids=()
+          for dir in "${dirs[@]}"; do
+            sudo rm -rf "${dir}" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fork
