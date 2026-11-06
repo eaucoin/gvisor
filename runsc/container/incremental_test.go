@@ -74,8 +74,11 @@ func incrementalConf(conf *config.Config, src incrementalDirtySource, verify boo
 }
 
 // escapesSteps are the steps of test/cmd/dirty_tracking/escapes that a run
-// takes, in order. The last re-reads memory that must still be zero.
-var escapesSteps = []string{"gofer", "net", "pipe", "tmpfs", "fork", "exec", "dontneed", "mremap", "mprotect", "aio", "reuse", "huge", "churn", "churn", "check"}
+// takes, in order. The last re-reads memory that must still be zero; "linger"
+// goes on writing memory after it reports its end, as every step does briefly
+// (escapes writes its stack until it blocks), for longer than the checkpoints
+// that follow take.
+var escapesSteps = []string{"gofer", "net", "pipe", "tmpfs", "fork", "exec", "dontneed", "mremap", "mprotect", "aio", "reuse", "huge", "linger", "churn", "churn", "check"}
 
 // escape describes writes that escaped dirty tracking, as a run of escapes
 // found them.
@@ -164,10 +167,11 @@ type escapesRun struct {
 }
 
 // runEscapes runs escapes in a container with conf, whose dirty tracking is
-// on, and after each of its steps takes an incremental checkpoint, of the
-// image the container was last checkpointed to or restored from, and a full
-// checkpoint, compares the chain's memory with the full checkpoint's page by
-// page, and restores the chain into a new container that runs the next step.
+// on, and after each of its steps pauses the container, takes an incremental
+// checkpoint, of the image the container was last checkpointed to or restored
+// from, and a full checkpoint, compares the chain's memory with the full
+// checkpoint's page by page, and restores the chain into a new container that
+// runs the next step.
 // The next comparison thus also checks the restore. If overlay is true, the
 // root filesystem is overlaid with a tmpfs backed by a file on disk, which
 // escapes writes to as well. runEscapes returns the first escape it finds, or
@@ -249,6 +253,14 @@ func runEscapes(t *testing.T, conf *config.Config, overlay bool) *escape {
 
 	for i, step := range escapesSteps {
 		sum := r.step(step)
+		// escapes reports the end of a step before it blocks, and so may
+		// still write memory once the report is read: the container is
+		// paused, through both checkpoints, so that they are of the same
+		// moment. (Pauses nest: a checkpoint that resumes the container
+		// leaves it paused.)
+		if err := r.cont.Pause(); err != nil {
+			t.Fatalf("error pausing container after step %q: %v", step, err)
+		}
 		if step == "check" && sum != "0000000000000000" {
 			t.Errorf("after the restore of %d images, %d words of memory that escapes only read are not zero", len(r.chain), parseHex(t, sum))
 		}
@@ -264,7 +276,7 @@ func runEscapes(t *testing.T, conf *config.Config, overlay bool) *escape {
 		r.checkParentID(delta, parent)
 		r.logDelta(step, delta)
 
-		// A full checkpoint of the same moment, which stops the
+		// A full checkpoint of the same moment, which stops the paused
 		// container.
 		full := r.imageDir("full")
 		if err := r.cont.Checkpoint(conf, full, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
