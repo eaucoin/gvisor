@@ -221,7 +221,8 @@ Measured on systrap, with Sentry write-protection at its 64 KiB unit:
 -   `runsc/container`: `TestCheckpointIncrementalNoEscapes` is CRIU's zdtm
     "pre-dump and compare" and Firecracker's comparison of full and diff
     snapshots, on gVisor's images: after each step of `escapes`, an
-    incremental and a full checkpoint of the same moment, compared page by page
+    incremental and a full checkpoint of the same moment, taken with the
+    container paused so that nothing runs between them, compared page by page
     (ignoring the VDSO parameter page, which the Sentry updates by itself), and
     the chain restored into the container that runs the next step. Its negative
     controls disable one marking path at a time
