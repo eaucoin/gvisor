@@ -14,8 +14,10 @@
 
 // escapes writes application memory through every path by which a write
 // reaches a sandbox's memory, one step at a time, for tests that check that
-// dirty tracking misses none of them: between steps, every thread is blocked,
-// so that two checkpoints taken one after the other see the same memory.
+// dirty tracking misses none of them. Between steps, every thread is blocked,
+// but only once it has reported the step's end, and returned from the report:
+// tests pause the sandbox before taking two checkpoints that must see the same
+// memory.
 //
 //   escapes COMM DATA DIR...
 //
@@ -51,6 +53,8 @@
 //   check     re-read the memory of "reuse": its checksum is its count of
 //             non-zero words, which must be 0
 //   huge      mmap 256 MiB and write every page
+//   linger    write a few pages, report, then go on writing them for 2 s
+//             before blocking
 //   churn     all of the above again, with different data
 //
 // This is the workload of the experiment that showed that no write escapes
@@ -73,6 +77,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MiB (1024 * 1024)
@@ -398,6 +403,38 @@ static uint64_t huge(void) {
   return sum(a, 256 * MiB);
 }
 
+#define LINGER_PAGES 16
+
+static char* lingering;
+
+static uint64_t linger(void) {
+  if (!lingering) {
+    lingering = map(LINGER_PAGES * PS, MAP_PRIVATE | MAP_ANONYMOUS);
+  }
+  fill(lingering, LINGER_PAGES * PS);
+  return sum(lingering, LINGER_PAGES * PS);
+}
+
+static int64_t monotonic_ns(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts)) die("clock_gettime");
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+// linger_after_report goes on writing the pages of "linger", after the step
+// has reported its end, for 2 s: longer than a test takes to read the report
+// and checkpoint the sandbox twice, so that the two checkpoints see different
+// memory unless the sandbox is paused through both. It checks the time only
+// every 4096 writes, so that it also writes after a checkpoint that resumes
+// the sandbox past the 2 s.
+static void linger_after_report(void) {
+  int64_t end = monotonic_ns() + 2000000000;
+  volatile uint64_t* w = (volatile uint64_t*)lingering;
+  for (uint64_t n = 1; n % 4096 != 0 || monotonic_ns() < end; n++) {
+    w[(n % LINGER_PAGES) * (PS / 8)] = n;
+  }
+}
+
 // step_requested is set by SIGUSR1's handler.
 static volatile sig_atomic_t step_requested;
 
@@ -429,8 +466,9 @@ int main(int argc, char** argv) {
 
   // Steps run on SIGUSR1. Between steps, the process is blocked in
   // sigsuspend, which a checkpoint interrupts and restarts without returning
-  // (unlike sigwaitinfo, which returns EINTR): the process writes no memory
-  // between two checkpoints.
+  // (unlike sigwaitinfo, which returns EINTR): once there, the process writes
+  // no memory between two checkpoints. SIGUSR1 is blocked everywhere else, so
+  // that a step requested while the last one lingers waits for it.
   struct sigaction sa = {.sa_handler = on_usr1};
   if (sigaction(SIGUSR1, &sa, NULL)) die("sigaction");
   sigset_t set, waiting;
@@ -471,6 +509,8 @@ int main(int argc, char** argv) {
       s = check();
     } else if (!strcmp(name, "huge")) {
       s = huge();
+    } else if (!strcmp(name, "linger")) {
+      s = linger();
     } else if (!strcmp(name, "churn")) {
       s = gofer() + net() + pipes() + tmpfs(gen) + forks(gen) + execs() +
           dontneed(gen) + mremaps(gen) + mprotects(gen) + aio();
@@ -479,5 +519,6 @@ int main(int argc, char** argv) {
       return 2;
     }
     report("DONE %s %016llx\n", name, (unsigned long long)s);
+    if (!strcmp(name, "linger")) linger_after_report();
   }
 }
