@@ -349,13 +349,14 @@ func TestBackgroundBudgetParallelReads(t *testing.T) {
 	}
 }
 
-// TestBackgroundBudgetParallelReadsFaultLatency checks that an awaited read
-// issued while the reads that the pages file serves at once raise the budget
-// is slowed by them only if it takes aplQueueDelay longer than it would alone,
-// the latency of the quickest read plus its bytes at the rate of a full-size
-// read; that one that was drops the budget to the bandwidth-delay product; and
-// that those reads return once the backoff is over.
-func TestBackgroundBudgetParallelReadsFaultLatency(t *testing.T) {
+// TestBackgroundBudgetParallelReadsProbeFaultLatency checks that while a probe
+// raises the budget of a pages file that serves reads in parallel, an awaited
+// read is slowed by the reads in flight only if it takes aplQueueDelay longer
+// than it would alone, the latency of the quickest read plus its bytes at the
+// rate of a full-size read; that one that was drops the budget to the
+// bandwidth-delay product; and that the reads that the pages file serves at
+// once return once the backoff is over.
+func TestBackgroundBudgetParallelReadsProbeFaultLatency(t *testing.T) {
 	ms := int64(time.Millisecond)
 	var b aplBackgroundBudget
 	b.init(0, testBudgetRead, testBudgetMax, 8)
@@ -363,8 +364,8 @@ func TestBackgroundBudgetParallelReadsFaultLatency(t *testing.T) {
 	b.update(30 * ms)
 	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead)
 	b.update(50 * ms)
-	if !b.raised {
-		t.Fatalf("the 8 reads do not raise the budget above the bandwidth-delay product")
+	if !b.raised || b.probe == 0 {
+		t.Fatalf("raised %t, probe %d: want the budget raised by a probe above the 8 reads", b.raised, b.probe)
 	}
 	// A page read in 21 ms, mostly the store's latency to a first byte,
 	// against 0.47 ms at the rate of a full-size read: not slowed, since no
@@ -412,5 +413,233 @@ func TestBackgroundBudgetGapBytes(t *testing.T) {
 	b.readCompleted(9*ms, hostarch.PageSize, 9*ms-ms/3, aplReadAwaited, 0)
 	if got, want := b.gapBytes(), hostarch.PageRoundDown(uint64(testBudgetRead/24)); got != want {
 		t.Errorf("gapBytes() after a read of 1/3 ms = %d, want %d", got, want)
+	}
+}
+
+// startParallelReads returns a budget for a pages file that serves reads
+// reads at once, as many as loading may have in flight, so that no probe
+// raises the budget above them, whose slow start ended at a full-size read
+// issued with them in flight, 1.2 s after loading started: the pages file's
+// rate per read, about one read's bandwidth-delay product.
+func startParallelReads(t *testing.T, reads uint64) *aplBackgroundBudget {
+	t.Helper()
+	b := &aplBackgroundBudget{}
+	b.init(0, testBudgetRead, reads*testBudgetRead, reads)
+	// Far more is left to load than any drain delivers.
+	b.unloaded = 1 << 40
+	b.readCompleted(int64(time.Second), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead)
+	b.update(int64(time.Second))
+	b.readCompleted(int64(1200*time.Millisecond), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead)
+	b.update(int64(1200 * time.Millisecond))
+	if b.startup || b.floor != reads || b.bytes != reads*testBudgetRead {
+		t.Fatalf("after the slow start: slow start %t, floor %d, budget %d; want false, %d reads", b.startup, b.floor, b.bytes, reads)
+	}
+	return b
+}
+
+// testAwaited completes awaited reads of a page on b, the first issued at
+// *now, one after another, each taking the next of latencies in turn, with
+// inflight bytes of background reads in flight when it is issued, until done
+// returns true or n reads completed, and returns the number completed.
+func testAwaited(b *aplBackgroundBudget, now *int64, latencies []time.Duration, inflight func() uint64, n int, done func() bool) int {
+	for i := 0; i < n; i++ {
+		if done != nil && done() {
+			return i
+		}
+		issued, bg := *now, inflight()
+		*now += int64(latencies[i%len(latencies)])
+		b.readCompleted(*now, hostarch.PageSize, issued, aplReadAwaited, bg)
+		b.update(*now)
+	}
+	return n
+}
+
+// testJitter is the latency of awaited reads from an object store whose first
+// bytes vary by 200 ms, whatever is in flight: 150-350 ms.
+var testJitter = []time.Duration{
+	310 * time.Millisecond, 170 * time.Millisecond, 250 * time.Millisecond, 150 * time.Millisecond,
+	350 * time.Millisecond, 210 * time.Millisecond, 190 * time.Millisecond, 290 * time.Millisecond,
+	230 * time.Millisecond, 270 * time.Millisecond, 330 * time.Millisecond, 160 * time.Millisecond,
+}
+
+// TestBackgroundBudgetParallelReadsJitter checks that awaited reads whose
+// latency varies by far more than aplQueueDelay, as much with the floor's
+// reads in flight as without them, keep the floor: the first judgement drains
+// the reads in flight to measure awaited reads alone, after which the floor
+// returns and stays. One awaited read 2 ms slower than the quickest dropped it
+// for good before: restoring 3.25 GB from an S3-like store, loading then kept
+// one 16 MiB read in flight and took 35-48 s rather than ~17.
+func TestBackgroundBudgetParallelReadsJitter(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	// Background reads in flight: one read while the budget allows one,
+	// else the floor's.
+	inflight := func() uint64 { return min(b.bytes, reads*testBudgetRead) }
+	// The first judgement finds no awaited read alone, and drains.
+	testAwaited(b, &now, testJitter, inflight, aplAwaitedSamples, nil)
+	if !b.draining || b.floor != 0 || b.bytes != testBudgetRead || b.drops != 0 {
+		t.Fatalf("after %d awaited reads with the floor in flight: draining %t, floor %d, budget %d, %d drops; want a drain to one read", aplAwaitedSamples, b.draining, b.floor, b.bytes, b.drops)
+	}
+	// The drain ends once enough awaited reads were issued alone.
+	testAwaited(b, &now, testJitter, inflight, aplAwaitedSamples, nil)
+	if b.draining || b.floor != reads || b.bytes != reads*testBudgetRead {
+		t.Fatalf("after %d awaited reads alone: draining %t, floor %d, budget %d; want the floor of %d reads back", aplAwaitedSamples, b.draining, b.floor, b.bytes, reads)
+	}
+	// The floor stays through 100 more.
+	least := b.floor
+	testAwaited(b, &now, testJitter, inflight, 100, func() bool { least = min(least, b.floor); return false })
+	if least != reads || b.drops != 0 || b.drains != 1 {
+		t.Errorf("over 100 more awaited reads: floor as low as %d, %d drops, %d drains; want %d reads, none, one (%v)", least, b.drops, b.drains, reads, b)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsSlowAwaited checks that awaited reads that
+// the floor's reads slow by more than aplAwaitedSlowdown at the median halve
+// the floor at each judgement, down to one read; that the floor then grows by
+// one read at each judgement while too few awaited reads are issued with
+// background reads in flight to judge it by; and that it halves again once they
+// are slowed.
+func TestBackgroundBudgetParallelReadsSlowAwaited(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	// Measure awaited reads alone first: 200 ms each.
+	inflight := func() uint64 { return min(b.bytes, reads*testBudgetRead) }
+	alone := []time.Duration{200 * time.Millisecond}
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, nil)
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, func() bool { return !b.draining })
+	if b.draining || b.floor != reads {
+		t.Fatalf("after the drain: draining %t, floor %d; want the floor of %d reads back", b.draining, b.floor, reads)
+	}
+	// With more than one background read in flight, awaited reads take 30%
+	// longer than alone, beyond aplQueueDelay: 262 ms.
+	slowed := []time.Duration{262 * time.Millisecond}
+	inflight = func() uint64 {
+		if b.floor > 1 {
+			return b.floor * testBudgetRead
+		}
+		return testBudgetRead
+	}
+	for _, want := range []uint64{7, 3, 1} {
+		testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+		if b.floor != want || b.floorReads != want {
+			t.Fatalf("floor %d (%d allowed), want %d", b.floor, b.floorReads, want)
+		}
+	}
+	// One read alone: nothing to judge the floor by, which grows by one
+	// read; with two, awaited reads are slowed again, and it halves.
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, nil)
+	if b.floor != 2 {
+		t.Fatalf("floor %d after %d awaited reads alone, want 2", b.floor, aplAwaitedSamples)
+	}
+	testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+	if b.floor != 1 {
+		t.Fatalf("floor %d after %d awaited reads slowed by 2 reads in flight, want 1", b.floor, aplAwaitedSamples)
+	}
+	// Awaited reads 20% slower than alone, plus aplQueueDelay, let it grow
+	// by one read at each judgement.
+	within := []time.Duration{242 * time.Millisecond}
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, nil)
+	for want := uint64(3); want <= reads; want++ {
+		testAwaited(b, &now, within, inflight, aplAwaitedSamples, nil)
+		if b.floor != want {
+			t.Fatalf("floor %d, want %d", b.floor, want)
+		}
+	}
+	testAwaited(b, &now, within, inflight, aplAwaitedSamples, nil)
+	if b.floor != reads || b.drains != 1 {
+		t.Errorf("floor %d, %d drains; want %d reads and one drain", b.floor, b.drains, reads)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsQuiet checks that the floor that awaited
+// reads lowered grows by one read each time no awaited read completed for the
+// minimum latency of a background read.
+func TestBackgroundBudgetParallelReadsQuiet(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	b.alone = [aplAwaitedSamples]time.Duration{}
+	b.aloneCount = aplAwaitedSamples
+	for i := range b.alone {
+		b.alone[i] = 100 * time.Millisecond
+	}
+	testAwaited(b, &now, []time.Duration{500 * time.Millisecond}, func() uint64 { return b.floor * testBudgetRead }, aplAwaitedSamples, nil)
+	if b.floor != reads/2 {
+		t.Fatalf("floor %d after awaited reads 5 times slower than alone, want %d", b.floor, reads/2)
+	}
+	start := now
+	for ; now < start+int64(5*b.minLatency); now += int64(aplBandwidthWindow) {
+		b.update(now)
+	}
+	if want := uint64(reads/2 + 4); b.floor != want {
+		t.Errorf("floor %d after 5 minimum latencies (%v) without awaited reads, want %d", b.floor, b.minLatency, want)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsDrainTimeout checks that a drain during
+// which no awaited read was issued alone ends after twice the minimum latency
+// and the time the awaited reads of a judgement take, restoring the floor,
+// and that the next drain waits for a backoff, during which the floor is kept.
+func TestBackgroundBudgetParallelReadsDrainTimeout(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	loaded := func() uint64 { return reads * testBudgetRead }
+	latency := []time.Duration{100 * time.Millisecond}
+	testAwaited(b, &now, latency, loaded, aplAwaitedSamples, nil)
+	if !b.draining {
+		t.Fatalf("no drain after %d awaited reads with the floor in flight", aplAwaitedSamples)
+	}
+	// The awaited reads' latency, less their bytes at the rate of a full-size
+	// read, is at most theirs.
+	if least, most := now+int64(2*b.minLatency), now+int64(2*b.minLatency+aplAwaitedSamples*latency[0]); b.drainEnd < least || b.drainEnd > most {
+		t.Fatalf("drain ends at %v, want within [%v, %v]", time.Duration(b.drainEnd), time.Duration(least), time.Duration(most))
+	}
+	b.update(b.drainEnd - 1)
+	if !b.draining {
+		t.Fatalf("drain ended before its end")
+	}
+	now = b.drainEnd
+	b.update(now)
+	if b.draining || b.floor != reads || b.nextDrain <= now {
+		t.Fatalf("after the drain's end: draining %t, floor %d, next drain at %v (now %v); want the floor back and the next drain deferred", b.draining, b.floor, time.Duration(b.nextDrain), time.Duration(now))
+	}
+	testAwaited(b, &now, latency, loaded, aplAwaitedSamples, func() bool { return now >= b.nextDrain })
+	if b.draining || b.floor != reads {
+		t.Errorf("before the backoff is over: draining %t, floor %d; want no drain and %d reads", b.draining, b.floor, reads)
+	}
+	now = b.nextDrain
+	testAwaited(b, &now, latency, loaded, aplAwaitedSamples, nil)
+	if !b.draining || b.drains != 2 {
+		t.Errorf("after the backoff: draining %t, %d drains; want a second drain", b.draining, b.drains)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsNoDrainNearEnd checks that no drain starts
+// while less is left to load than the pages file delivers over the drain,
+// where loading would end within it at one read: the floor stays.
+func TestBackgroundBudgetParallelReadsNoDrainNearEnd(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	loaded := func() uint64 { return reads * testBudgetRead }
+	latency := []time.Duration{100 * time.Millisecond}
+	// A drain takes at least twice the minimum latency, 2 s, over which the
+	// pages file delivers twice its bandwidth's bytes, more than are left.
+	if b.bandwidth() == 0 {
+		t.Fatalf("no bandwidth measured after the slow start")
+	}
+	b.unloaded = uint64(b.bandwidth())
+	testAwaited(b, &now, latency, loaded, 3*aplAwaitedSamples, nil)
+	if b.draining || b.drains != 0 || b.floor != reads {
+		t.Fatalf("with %d bytes left at %.0f bytes/s: draining %t, %d drains, floor %d; want no drain and %d reads", b.unloaded, b.bandwidth(), b.draining, b.drains, b.floor, reads)
+	}
+	// With more left, the next judgement drains.
+	b.unloaded = 1 << 40
+	testAwaited(b, &now, latency, loaded, aplAwaitedSamples, nil)
+	if !b.draining || b.drains != 1 {
+		t.Errorf("with %d bytes left: draining %t, %d drains; want a drain", b.unloaded, b.draining, b.drains)
 	}
 }
