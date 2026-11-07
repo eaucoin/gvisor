@@ -3053,6 +3053,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		now := aplNanotime()
 		apfl.amflsMu.Lock()
 		apfl.mu.Lock()
+		apfl.bgBudget.unloaded = apfl.bytesTotal - apfl.bytesLoaded
 		failed := false
 		for _, c := range completions {
 			op := &apfl.ops[c.ID]
