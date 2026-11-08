@@ -82,6 +82,24 @@ func TestTakeRestoreAnnotations(t *testing.T) {
 			annotations: map[string]string{restorePausedAnnotation: "true"},
 			wantErr:     true,
 		},
+		{
+			name:        "standby",
+			annotations: map[string]string{other: "sandbox", restoreStandbyAnnotation: "/run/standby/pod.sock"},
+			want:        restoreAnnotations{standby: "/run/standby/pod.sock"},
+		},
+		{
+			name:        "standby on a relative path",
+			annotations: map[string]string{restoreStandbyAnnotation: "pod.sock"},
+			wantErr:     true,
+		},
+		{
+			name: "standby with an image path",
+			annotations: map[string]string{
+				restoreImagePathAnnotation: "/ckpt",
+				restoreStandbyAnnotation:   "/run/standby/pod.sock",
+			},
+			wantErr: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bundle := t.TempDir()
