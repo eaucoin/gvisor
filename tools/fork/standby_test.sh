@@ -55,8 +55,10 @@ readonly K3S="mirror.gcr.io/rancher/k3s:v1.37.1-k3s1@sha256:ca7f37d993d82ef0dcdc
 readonly IMAGE="mirror.gcr.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
 readonly NODE="standby-$$"
 readonly NS="standby"
+# The workload of pod_restore_test.sh: each count is renamed over /count, so
+# that no read of it lands between its truncation and the next count's write.
 # shellcheck disable=SC2016 # The container's shell expands it.
-readonly WORKLOAD='head -c 50331648 /dev/urandom >/dev/shm/data; start=$(md5sum </dev/shm/data | cut -c 1-16); i=0; while :; do i=$((i+1)); echo "$start $i" >/count; sleep 0.2; done'
+readonly WORKLOAD='head -c 50331648 /dev/urandom >/dev/shm/data; start=$(md5sum </dev/shm/data | cut -c 1-16); i=0; while :; do i=$((i+1)); echo "$start $i" >/count.new; mv /count.new /count; sleep 0.2; done'
 declare conf
 conf="$(dirname "$(realpath "$0")")/pod_restore"
 readonly CONF="${conf}"

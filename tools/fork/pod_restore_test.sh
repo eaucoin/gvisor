@@ -56,9 +56,12 @@ readonly IMAGE="mirror.gcr.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820
 readonly NODE="pod-restore-$$"
 readonly NS="pod-restore"
 # The workload: 48 MiB of random data in memory (/dev/shm), whose digest is its
-# start token, and a count, written to /count every 0.2 s.
+# start token, and a count, written to /count every 0.2 s. Each count is written
+# to /count.new and renamed over /count, so that a read of /count never lands
+# between the truncation of the file and the write of the next count, and
+# reads nothing.
 # shellcheck disable=SC2016 # The container's shell expands it.
-readonly WORKLOAD='head -c 50331648 /dev/urandom >/dev/shm/data; start=$(md5sum </dev/shm/data | cut -c 1-16); i=0; while :; do i=$((i+1)); echo "$start $i" >/count; sleep 0.2; done'
+readonly WORKLOAD='head -c 50331648 /dev/urandom >/dev/shm/data; start=$(md5sum </dev/shm/data | cut -c 1-16); i=0; while :; do i=$((i+1)); echo "$start $i" >/count.new; mv /count.new /count; sleep 0.2; done'
 declare conf
 conf="$(dirname "$(realpath "$0")")/pod_restore"
 readonly CONF="${conf}"
