@@ -16,6 +16,7 @@ package runsc
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -54,6 +55,13 @@ const (
 	// whole pod's sandbox runs nothing until one of its containers is resumed,
 	// so set it on all of them, and resume each.
 	restorePausedAnnotation = restoreAnnotationPrefix + "paused"
+
+	// restoreStandbyAnnotation makes the pod a standby: the host path of a
+	// Unix socket on which its shim takes one request to restore a checkpoint
+	// into it (standby.go). Its sandbox boots and its containers are created,
+	// and reported started, but run nothing until then. Set it on all of the
+	// pod's containers, without restoreImagePathAnnotation.
+	restoreStandbyAnnotation = restoreAnnotationPrefix + "standby"
 )
 
 // restoreAnnotations is the restore that a container's spec annotations
@@ -63,6 +71,7 @@ type restoreAnnotations struct {
 	direct     bool
 	background bool
 	paused     bool
+	standby    string
 }
 
 // takeRestoreAnnotations returns the restore that the annotations of the
@@ -89,6 +98,11 @@ func takeRestoreAnnotations(bundle string) (restoreAnnotations, error) {
 			r.background, err = strconv.ParseBool(value)
 		case restorePausedAnnotation:
 			r.paused, err = strconv.ParseBool(value)
+		case restoreStandbyAnnotation:
+			if !filepath.IsAbs(value) {
+				err = errdefs.ErrInvalidArgument
+			}
+			r.standby = value
 		default:
 			err = errdefs.ErrInvalidArgument
 		}
@@ -99,6 +113,9 @@ func takeRestoreAnnotations(bundle string) (restoreAnnotations, error) {
 	}
 	if !found {
 		return r, nil
+	}
+	if r.standby != "" && r.imagePath != "" {
+		return r, fmt.Errorf("restore annotations %s and %s together: %w", restoreStandbyAnnotation, restoreImagePathAnnotation, errdefs.ErrInvalidArgument)
 	}
 	if r.imagePath == "" && (r.direct || r.background || r.paused) {
 		return r, fmt.Errorf("restore annotations without %s: %w", restoreImagePathAnnotation, errdefs.ErrInvalidArgument)
