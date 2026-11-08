@@ -45,3 +45,5 @@ series/28-coalesced-page-loads on series/27-gofer-sync-errors
 series/29-parallel-reads on series/28-coalesced-page-loads
 # Pre-copy dirtying is limited for the whole sandbox, and the OOM killer kills a sandbox whole (kernel, runsc/cgroup).
 series/30-sandbox-fixes on series/29-parallel-reads
+# A standby sandbox boots with its containers created, and takes one restore over a socket its shim serves (shim).
+series/31-standby on series/30-sandbox-fixes
