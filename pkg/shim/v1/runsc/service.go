@@ -177,6 +177,11 @@ type runscService struct {
 	// +checklocks:mu
 	standbyNames map[string]string
 
+	// closeStandbyStdio, where set, stands for the function of that name as a
+	// standby's container's exit is reported (standby.go): for tests, set before
+	// the standby is served.
+	closeStandbyStdio func(*Container)
+
 	// versionCommand is the runsc executable configured for the sandbox.
 	// A nil pointer or empty command selects the default.
 	versionCommand atomic.Pointer[string]
@@ -438,6 +443,11 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 	c, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
+	}
+	// A standby's container deleted with no exit of it reported: its I/O, which
+	// runsc never took, closed first, as its deletion waits for its end.
+	if len(r.ExecID) == 0 && c.takeStandby() != nil {
+		closeStandbyStdio(c)
 	}
 	p, err := c.Delete(ctx, r)
 	if err != nil {
