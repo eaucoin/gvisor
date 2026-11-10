@@ -32,6 +32,26 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 )
 
+func init() {
+	// Set before any test runs, and never again: the watch of a test's
+	// standby may outlive it.
+	closeStandbyStdio = recordStandbyStdio
+}
+
+// stdioRecords are the records, by container, of the I/O closed of the
+// containers that closedStdio was asked to record it of.
+var stdioRecords sync.Map // *Container -> func(*Container)
+
+// recordStandbyStdio records the I/O of c closed where a test asked it to,
+// and closes it otherwise.
+func recordStandbyStdio(c *Container) {
+	if record, ok := stdioRecords.Load(c); ok {
+		record.(func(*Container))(c)
+		return
+	}
+	closeStdio(c)
+}
+
 // standbyContainer returns a container of a standby, which no restore has been
 // made into.
 func standbyContainer(id string) *Container {
@@ -54,9 +74,9 @@ func standbyService(containers ...*Container) *runscService {
 	}
 }
 
-// closedStdio has s record, for the test, the containers it is asked to close
-// the I/O of, and how many exits were reported, unread, as it was; it returns
-// the containers, in order, and those counts.
+// closedStdio records, for the test, the containers of s whose I/O is closed,
+// and how many exits were reported, unread, as it was; it returns the
+// containers, in order, and those counts.
 func closedStdio(t *testing.T, s *runscService) func() ([]string, []int) {
 	t.Helper()
 	var (
@@ -64,11 +84,15 @@ func closedStdio(t *testing.T, s *runscService) func() ([]string, []int) {
 		closed []string
 		queued []int
 	)
-	s.closeStandbyStdio = func(c *Container) {
+	record := func(c *Container) {
 		mu.Lock()
 		defer mu.Unlock()
 		closed = append(closed, c.ID)
 		queued = append(queued, len(s.ec))
+	}
+	for _, c := range s.createdContainers() {
+		stdioRecords.Store(c, record)
+		t.Cleanup(func() { stdioRecords.Delete(c) })
 	}
 	return func() ([]string, []int) {
 		mu.Lock()
