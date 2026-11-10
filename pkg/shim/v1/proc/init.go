@@ -616,12 +616,13 @@ func (p *Init) waitForIO(ctx context.Context) error {
 	}
 }
 
-// CloseStdio closes the I/O the shim holds for the process: the pipes it made
-// for it, and the files it copies them into, so that the copies end and
-// whoever reads those files sees their end. For a process that runsc never
-// took the pipes of, as a standby's container that never ran (the runsc
-// package's standby.go): nothing else ends them, and its stop, its deletion
-// and containerd's recovery after a restart wait on their end.
+// CloseStdio closes the I/O the shim holds for the process, as its deletion
+// does: every end it still holds of the pipes it made for it, and the FIFOs
+// and files it copies them to and from. The copies out of the pipes end then,
+// as they otherwise do only once nothing holds the pipes' write ends: for a
+// process that runsc was never given the pipes of, as a container that runsc
+// never started, the shim holds those ends itself, and its deletion would
+// wait on the copies (waitForIO) until it timed out.
 func (p *Init) CloseStdio() {
 	p.closeIO()
 }
