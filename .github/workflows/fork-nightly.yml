@@ -13,7 +13,8 @@
 # nested virtualization, together with the kvm platform's own tests and, on
 # systrap and kvm, a pod checkpointed and restored through the containerd shim
 # in a one-node Kubernetes cluster (tools/fork/pod_restore_test.sh) and
-# restored into standby sandboxes there (tools/fork/standby_test.sh), and the
+# restored into standby sandboxes there (tools/fork/standby_test.sh), standby
+# sandboxes through restarts of k3s (tools/fork/standby_restart_test.sh), and the
 # Sentry's own memory after live saves of a growing container against the same
 # growth without one (tools/fork/save_memory_test.sh); runsc is
 # built and smoke-tested on aarch64; and the tests of every direct dependent
@@ -508,6 +509,14 @@ jobs:
         run: |
           STANDBY_GROUPING=true fork/tools/fork/standby_test.sh "${RUNNER_TEMP}/release" "${RUNNER_TEMP}/standby-grouped.jsonl" --platform=${{ matrix.platform }}
           STANDBY_GROUPING=false fork/tools/fork/standby_test.sh "${RUNNER_TEMP}/release" "${RUNNER_TEMP}/standby-ungrouped.jsonl" --platform=${{ matrix.platform }}
+      - name: Standby sandboxes through restarts of k3s
+        # containerd started again with a standby on the node, idle, restored
+        # into, stopped and being deleted, as a restart of k3s starts it, its
+        # shims running on: grouped and ungrouped, as above.
+        if: ${{ !matrix.thp }}
+        run: |
+          STANDBY_GROUPING=true fork/tools/fork/standby_restart_test.sh "${RUNNER_TEMP}/release" --platform=${{ matrix.platform }}
+          STANDBY_GROUPING=false fork/tools/fork/standby_restart_test.sh "${RUNNER_TEMP}/release" --platform=${{ matrix.platform }}
       - name: A save's memory given back
         # The Sentry's own memory after live saves of a container whose memory
         # grows between them, against the same growth without a save.
