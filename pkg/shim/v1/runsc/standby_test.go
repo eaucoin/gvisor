@@ -21,7 +21,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +51,29 @@ func standbyService(containers ...*Container) *runscService {
 		containers: byID,
 		created:    created,
 		ec:         make(chan proc.Exit, len(containers)),
+	}
+}
+
+// closedStdio has s record, for the test, the containers it is asked to close
+// the I/O of, and how many exits were reported, unread, as it was; it returns
+// the containers, in order, and those counts.
+func closedStdio(t *testing.T, s *runscService) func() ([]string, []int) {
+	t.Helper()
+	var (
+		mu     sync.Mutex
+		closed []string
+		queued []int
+	)
+	s.closeStandbyStdio = func(c *Container) {
+		mu.Lock()
+		defer mu.Unlock()
+		closed = append(closed, c.ID)
+		queued = append(queued, len(s.ec))
+	}
+	return func() ([]string, []int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(closed), slices.Clone(queued)
 	}
 }
 
@@ -206,6 +231,7 @@ func TestStandbySocketServesOnlyItsRequest(t *testing.T) {
 
 func TestStandbyFailedRestoreStopsSandbox(t *testing.T) {
 	s := standbyService(standbyContainer("pause"), standbyContainer("app"))
+	closed := closedStdio(t, s)
 	pid := sandboxProcess(t)
 	socket := filepath.Join(t.TempDir(), "pod.sock")
 	if err := s.serveStandby(pid, socket); err != nil {
@@ -224,6 +250,9 @@ func TestStandbyFailedRestoreStopsSandbox(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Errorf("exits reported: %v, want one per container", got)
+	}
+	if got, _ := closed(); !slices.Equal(got, []string{"pause", "app"}) {
+		t.Errorf("the I/O closed of %v, want of pause and app", got)
 	}
 	// The sandbox's stand-in was killed.
 	deadline := time.Now().Add(5 * time.Second)
@@ -283,6 +312,7 @@ func TestStandbyExitReportedOnceSandboxGone(t *testing.T) {
 	restored := standbyContainer("restored")
 	restored.takeStandby()
 	s := standbyService(standbyContainer("pause"), restored, standbyContainer("app"))
+	closed := closedStdio(t, s)
 	pid := sandboxProcess(t)
 	socket := filepath.Join(t.TempDir(), "pod.sock")
 	if err := s.serveStandby(pid, socket); err != nil {
@@ -299,6 +329,9 @@ func TestStandbyExitReportedOnceSandboxGone(t *testing.T) {
 	if len(got) != len(want) || got["pause"] != want["pause"] || got["app"] != want["app"] {
 		t.Errorf("exits reported: %v, want %v (none of a container restored)", got, want)
 	}
+	if got, _ := closed(); !slices.Equal(got, []string{"pause", "app"}) {
+		t.Errorf("the I/O closed of %v, want of pause and app (not of the container restored)", got)
+	}
 	waitRemoved(t, socket)
 }
 
@@ -306,7 +339,9 @@ func TestKillStandbyContainer(t *testing.T) {
 	c := standbyContainer("app")
 	c.task = &proc.Init{}
 	s := standbyService(c)
-	// Not the sandbox's own container: its exit is reported at once.
+	closed := closedStdio(t, s)
+	// Not the sandbox's own container: its exit is reported at once, its I/O,
+	// which runsc never took, closed first, as CRI waits for its end to stop it.
 	s.killStandby(c, uint32(unix.SIGTERM))
 	got := exits(s, 1)
 	if status, ok := got["app"]; !ok || status != 128+int(unix.SIGTERM) {
@@ -314,6 +349,18 @@ func TestKillStandbyContainer(t *testing.T) {
 	}
 	if c.isStandby() {
 		t.Errorf("a killed container is a standby's still")
+	}
+	// Closed before its exit was reported.
+	if got, queued := closed(); !slices.Equal(got, []string{"app"}) || !slices.Equal(queued, []int{0}) {
+		t.Errorf("the I/O closed of %v, with %v exits reported already; want of app, with none", got, queued)
+	}
+	// Killed again, as kubelet may: nothing more.
+	s.killStandby(c, uint32(unix.SIGKILL))
+	if got := exits(s, 0); len(got) != 0 {
+		t.Errorf("exits reported of a second kill: %v", got)
+	}
+	if got, _ := closed(); len(got) != 1 {
+		t.Errorf("the I/O closed of %v, once more", got)
 	}
 }
 
