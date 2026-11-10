@@ -16,7 +16,6 @@ package runsc
 
 import (
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -58,9 +57,10 @@ const (
 
 	// restoreStandbyAnnotation makes the pod a standby: the host path of a
 	// Unix socket on which its shim takes one request to restore a checkpoint
-	// into it (standby.go). Its sandbox boots and its containers are created,
-	// and reported started, but run nothing until then. Set it on all of the
-	// pod's containers, without restoreImagePathAnnotation.
+	// into it (standby.go), standbySocketDir/<name>.sock. Its sandbox boots
+	// and its containers are created, and reported started, but run nothing
+	// until then. Set it on all of the pod's containers, without
+	// restoreImagePathAnnotation.
 	restoreStandbyAnnotation = restoreAnnotationPrefix + "standby"
 )
 
@@ -99,8 +99,8 @@ func takeRestoreAnnotations(bundle string) (restoreAnnotations, error) {
 		case restorePausedAnnotation:
 			r.paused, err = strconv.ParseBool(value)
 		case restoreStandbyAnnotation:
-			if !filepath.IsAbs(value) {
-				err = errdefs.ErrInvalidArgument
+			if verr := validStandbySocket(value); verr != nil {
+				err = fmt.Errorf("%v: %w", verr, errdefs.ErrInvalidArgument)
 			}
 			r.standby = value
 		default:
