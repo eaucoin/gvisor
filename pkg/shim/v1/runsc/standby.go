@@ -95,6 +95,34 @@ type standbyServer struct {
 	closed bool
 }
 
+// closeStandbyStdio closes the I/O the shim holds for c, a standby's container
+// that no restore was made into, as its exit is reported: runsc never took its
+// pipes, as it never started it, so nothing else ends the copies into its
+// FIFOs, which whoever reads them waits on the end of, as CRI does to stop and
+// delete the container, and to recover it as containerd starts again.
+func closeStandbyStdio(c *Container) {
+	if p, err := c.runscInit(); err == nil {
+		p.CloseStdio()
+	}
+}
+
+// standbyExited reports the exit of c, a standby's container that no restore
+// was made into, at status, its I/O closed first (closeStandbyStdio); nothing
+// where it is not a standby's container, or no more.
+//
+// +checklocksexclude:s.mu
+func (s *runscService) standbyExited(c *Container, status int) {
+	if c.takeStandby() == nil {
+		return
+	}
+	if s.closeStandbyStdio != nil {
+		s.closeStandbyStdio(c)
+	} else {
+		closeStandbyStdio(c)
+	}
+	s.ec <- proc.Exit{Timestamp: time.Now(), ID: c.ID, Status: status}
+}
+
 // containerStandbySocket is the socket of the standby's container named name,
 // served by the shim of that container alone, as each container has a shim of
 // its own where shim grouping is off: the sandbox's socket, socket, with the
@@ -247,12 +275,11 @@ func (srv *standbyServer) fail(failed *Container) {
 		log.L.Warningf("Killing standby sandbox (PID %d): %v", srv.pid, err)
 	}
 	if failed != nil {
+		// Its failed restore stopped it, its I/O closed (createdState.Start).
 		srv.s.ec <- proc.Exit{Timestamp: time.Now(), ID: failed.ID, Status: proc.InternalErrorCode}
 	}
 	for _, c := range srv.s.createdContainers() {
-		if c.takeStandby() != nil {
-			srv.s.ec <- proc.Exit{Timestamp: time.Now(), ID: c.ID, Status: proc.InternalErrorCode}
-		}
+		srv.s.standbyExited(c, proc.InternalErrorCode)
 	}
 }
 
@@ -275,12 +302,12 @@ func (srv *standbyServer) watch() {
 		}
 		fds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 100 /* ms */)
-		if err != nil && !errors.Is(err, unix.EINTR) {
+		if errors.Is(err, unix.EINTR) || (err == nil && n == 0) {
+			continue
+		}
+		if err != nil {
 			log.L.Warningf("Watching standby sandbox (PID %d): %v", srv.pid, err)
 			return
-		}
-		if n == 0 {
-			continue
 		}
 		state, alive := processState(srv.pid)
 		if alive {
@@ -293,9 +320,7 @@ func (srv *standbyServer) watch() {
 		log.L.Infof("Standby sandbox (PID %d) exited before a restore into it (events %#x, %s)", srv.pid, fds[0].Revents, state)
 		srv.close()
 		for _, c := range srv.s.createdContainers() {
-			if c.takeStandby() != nil {
-				srv.s.ec <- proc.Exit{Timestamp: time.Now(), ID: c.ID, Status: 128 + int(unix.SIGKILL)}
-			}
+			srv.s.standbyExited(c, 128+int(unix.SIGKILL))
 		}
 		return
 	}
@@ -334,9 +359,7 @@ func (s *runscService) killStandby(c *Container, signal uint32) {
 		}
 		return
 	}
-	if c.takeStandby() != nil {
-		s.ec <- proc.Exit{Timestamp: time.Now(), ID: c.ID, Status: 128 + int(signal)}
-	}
+	s.standbyExited(c, 128+int(signal))
 }
 
 // createdContainers returns the containers, in the order they were created.
