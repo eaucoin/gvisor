@@ -90,6 +90,11 @@ type Container struct {
 	//
 	// +checklocks:mu
 	standby *extension.RestoreConfig
+
+	// standbySandbox is the process of the container's sandbox where the
+	// container was created as a standby's, which the standby watches and
+	// kills it through; nil otherwise.
+	standbySandbox *standbySandbox
 }
 
 // ContainerConfig contains configuration for creating a container.
@@ -296,6 +301,14 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 	if err := process.Create(ctx, config); err != nil {
 		return nil, err
 	}
+	var sandbox *standbySandbox
+	if conf.Standby {
+		// Pinned as soon as runsc create named its PID, so that the PID cannot
+		// have gone to another process in between unless it exited already.
+		if sandbox, err = openStandbySandbox(process.Pid()); err != nil {
+			return nil, err
+		}
+	}
 	// Set up cgroup mode.
 	cgroupMode := CgroupMode(cgroups.Legacy)
 	if opts.RunscConfig["systemd-cgroup"] == "true" {
@@ -322,13 +335,14 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		}
 	}
 	c := Container{
-		ID:          conf.ID,
-		Bundle:      conf.Bundle,
-		task:        process,
-		cgroup:      cgroupMode,
-		processes:   make(map[string]extension.Process),
-		restoreConf: restoreConf,
-		standby:     standby,
+		ID:             conf.ID,
+		Bundle:         conf.Bundle,
+		task:           process,
+		cgroup:         cgroupMode,
+		processes:      make(map[string]extension.Process),
+		restoreConf:    restoreConf,
+		standby:        standby,
+		standbySandbox: sandbox,
 	}
 	return &c, nil
 }
