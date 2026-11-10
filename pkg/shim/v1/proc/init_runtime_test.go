@@ -1156,3 +1156,58 @@ func TestDeleteTimeoutAfterSuccessfulKill(t *testing.T) {
 		})
 	}
 }
+
+// A process that runsc never took the pipes of, as a standby's container that
+// never ran: nothing but CloseStdio ends the copies into its FIFOs, which a
+// reader of them waits on the end of.
+func TestCloseStdioEndsTheCopiesOfAProcessThatNeverRan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	pipes, err := runc.NewPipeIO(os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New("standby", nil, stdio.Stdio{})
+	p.io = pipes
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := copyPipes(ctx, p.io, "", path, os.DevNull, &p.wg, &p.closers); err != nil {
+		t.Fatalf("copyPipes: %v", err)
+	}
+	ended := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, reader)
+		ended <- err
+	}()
+	select {
+	case err := <-ended:
+		t.Fatalf("the FIFO ended before the process's I/O was closed: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	p.CloseStdio()
+	select {
+	case err := <-ended:
+		if err != nil {
+			t.Errorf("reading the FIFO to its end: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the FIFO has not ended 5 seconds after the process's I/O was closed")
+	}
+	copied := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(copied)
+	}()
+	select {
+	case <-copied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the copies have not ended 5 seconds after the process's I/O was closed")
+	}
+}
