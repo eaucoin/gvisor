@@ -84,8 +84,8 @@ func TestTakeRestoreAnnotations(t *testing.T) {
 		},
 		{
 			name:        "standby",
-			annotations: map[string]string{other: "sandbox", restoreStandbyAnnotation: "/run/standby/pod.sock"},
-			want:        restoreAnnotations{standby: "/run/standby/pod.sock"},
+			annotations: map[string]string{other: "sandbox", restoreStandbyAnnotation: standbySocketDir + "/pod.sock"},
+			want:        restoreAnnotations{standby: standbySocketDir + "/pod.sock"},
 		},
 		{
 			name:        "standby on a relative path",
@@ -93,10 +93,20 @@ func TestTakeRestoreAnnotations(t *testing.T) {
 			wantErr:     true,
 		},
 		{
+			name:        "standby outside the standby socket directory",
+			annotations: map[string]string{restoreStandbyAnnotation: "/run/standby/pod.sock"},
+			wantErr:     true,
+		},
+		{
+			name:        "standby out of the standby socket directory",
+			annotations: map[string]string{restoreStandbyAnnotation: standbySocketDir + "/../pod.sock"},
+			wantErr:     true,
+		},
+		{
 			name: "standby with an image path",
 			annotations: map[string]string{
 				restoreImagePathAnnotation: "/ckpt",
-				restoreStandbyAnnotation:   "/run/standby/pod.sock",
+				restoreStandbyAnnotation:   standbySocketDir + "/pod.sock",
 			},
 			wantErr: true,
 		},
