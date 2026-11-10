@@ -392,23 +392,32 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	if err != nil {
 		return nil, err
 	}
+	if len(r.ExecID) == 0 && c.isStandby() && s.standbyOver(ctx, c) {
+		log.L.Infof("Container %q of a standby sandbox was created as no restore would be made into it, and starts", r.ID)
+		c.takeStandby()
+	}
 	p, err := c.Start(ctx, r)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	var standby *standbyServer
 	if initProcess, ok := p.(*proc.Init); ok && len(r.ExecID) == 0 && c.isStandby() {
 		s.mu.Lock()
 		served, socket, name := s.standby != nil, s.standbySocket, s.standbyNames[r.ID]
 		s.mu.Unlock()
 		switch {
 		case initProcess.Sandbox:
-			if err := s.serveStandby(initProcess.Pid(), socket); err != nil {
+			if standby, err = s.serveStandby(c, socket); err != nil {
 				return nil, errgrpc.ToGRPC(err)
 			}
 		case !served && name != "":
 			// This shim holds no root container to restore this one with:
 			// shim grouping is off, and the sandbox's shim is another.
-			if err := s.serveStandby(initProcess.Pid(), containerStandbySocket(socket, name)); err != nil {
+			containerSocket, err := containerStandbySocket(socket, name)
+			if err != nil {
+				return nil, errgrpc.ToGRPC(err)
+			}
+			if standby, err = s.serveStandby(c, containerSocket); err != nil {
 				return nil, errgrpc.ToGRPC(err)
 			}
 		}
@@ -418,6 +427,9 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 			ContainerID: r.ID,
 			Pid:         uint32(p.Pid()),
 		})
+		if standby != nil {
+			standby.run()
+		}
 	} else {
 		s.send(&events.TaskExecStarted{
 			ContainerID: r.ID,
@@ -451,6 +463,7 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 
 	// ExecID will be empty for init container process.
 	if len(r.ExecID) == 0 {
+		c.standbySandbox.close()
 		s.mu.Lock()
 		delete(s.containers, r.ID)
 		s.created = slices.DeleteFunc(s.created, func(id string) bool { return id == r.ID })
@@ -604,8 +617,7 @@ func (s *runscService) Kill(ctx context.Context, r *task.KillRequest) (*types.Em
 	if err != nil {
 		return nil, err
 	}
-	if len(r.ExecID) == 0 && c.isStandby() {
-		s.killStandby(c, r.Signal)
+	if len(r.ExecID) == 0 && s.killStandby(c, r.Signal) {
 		return empty, nil
 	}
 	if err := c.Kill(ctx, r); err != nil {
