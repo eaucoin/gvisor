@@ -95,12 +95,20 @@ type standbyServer struct {
 	closed bool
 }
 
-// closeStandbyStdio closes the I/O the shim holds for c, a standby's container
-// that no restore was made into, as its exit is reported: runsc never took its
-// pipes, as it never started it, so nothing else ends the copies into its
-// FIFOs, which whoever reads them waits on the end of, as CRI does to stop and
-// delete the container, and to recover it as containerd starts again.
-func closeStandbyStdio(c *Container) {
+// closeStandbyStdio is the function that standbyExited and Delete close the
+// I/O of a standby's container with: closeStdio, which the package's tests
+// replace, before any of them runs, to record the containers whose I/O is
+// closed.
+var closeStandbyStdio = closeStdio
+
+// closeStdio closes the I/O the shim holds for c's init process
+// (proc.Init.CloseStdio). A standby's container that is not its sandbox's
+// own was never started, which would have given runsc the pipes the shim made
+// for it: the shim holds both ends of each, and its copies from them into the
+// container's FIFOs end only as they are closed. The sandbox's own container
+// gave its pipes to runsc create, and their copies end as the sandbox exits;
+// closing them ends them at once.
+func closeStdio(c *Container) {
 	if p, err := c.runscInit(); err == nil {
 		p.CloseStdio()
 	}
@@ -115,11 +123,7 @@ func (s *runscService) standbyExited(c *Container, status int) {
 	if c.takeStandby() == nil {
 		return
 	}
-	if s.closeStandbyStdio != nil {
-		s.closeStandbyStdio(c)
-	} else {
-		closeStandbyStdio(c)
-	}
+	closeStandbyStdio(c)
 	s.ec <- proc.Exit{Timestamp: time.Now(), ID: c.ID, Status: status}
 }
 
