@@ -177,11 +177,6 @@ type runscService struct {
 	// +checklocks:mu
 	standbyNames map[string]string
 
-	// closeStandbyStdio, where set, stands for the function of that name as a
-	// standby's container's exit is reported (standby.go): for tests, set before
-	// the standby is served.
-	closeStandbyStdio func(*Container)
-
 	// versionCommand is the runsc executable configured for the sandbox.
 	// A nil pointer or empty command selects the default.
 	versionCommand atomic.Pointer[string]
