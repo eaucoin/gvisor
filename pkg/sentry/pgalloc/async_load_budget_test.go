@@ -38,21 +38,21 @@ func TestBackgroundBudgetSlowStart(t *testing.T) {
 	// Two reads complete after 1 ms, without queueing; the loader sees them
 	// at 4 ms, which ends the first window: 128 MiB/s.
 	ms := int64(time.Millisecond)
-	b.readCompleted(1*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
-	b.readCompleted(1*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(1*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
+	b.readCompleted(1*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	b.update(4 * ms)
 	if want := uint64((aplInitialReads + 2) * testBudgetRead); b.bytes != want {
 		t.Fatalf("budget after two reads without queueing = %d, want %d", b.bytes, want)
 	}
 	// Other reads do not grow it.
-	b.readCompleted(5*ms, testBudgetRead, 4*ms, aplReadBackground, testBudgetRead)
+	b.readCompleted(5*ms, testBudgetRead, 4*ms, aplReadBackground, testBudgetRead, 0)
 	b.update(5 * ms)
 	if want := uint64((aplInitialReads + 2) * testBudgetRead); b.bytes != want {
 		t.Fatalf("budget after a read that is not a full-size background read = %d, want %d", b.bytes, want)
 	}
 	// A read that queued for more than aplSlowStartMinDelay ends the slow
 	// start.
-	b.readCompleted(10*ms, testBudgetRead, 1*ms, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(10*ms, testBudgetRead, 1*ms, aplReadFullBackground, testBudgetRead, 0)
 	if b.startup {
 		t.Fatalf("slow start continues after a read took 9ms, with a minimum latency of 1ms")
 	}
@@ -85,9 +85,9 @@ func TestBackgroundBudgetSlowStartDelay(t *testing.T) {
 		var b aplBackgroundBudget
 		b.init(0, testBudgetRead, testBudgetMax, 0)
 		now := int64(tc.minLatency)
-		b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+		b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 		b.update(now)
-		b.readCompleted(now, testBudgetRead, now-int64(tc.minLatency+tc.queued), aplReadFullBackground, testBudgetRead)
+		b.readCompleted(now, testBudgetRead, now-int64(tc.minLatency+tc.queued), aplReadFullBackground, testBudgetRead, 0)
 		if b.startup == tc.exits {
 			t.Errorf("minimum latency %v, a read queued for %v: slow start continues = %t, want %t", tc.minLatency, tc.queued, b.startup, !tc.exits)
 		}
@@ -143,13 +143,13 @@ func TestBackgroundBudgetBandwidthDelayProduct(t *testing.T) {
 			// The first read measures the latency and ends the first window;
 			// a read that queued ends the slow start.
 			now := int64(tc.latency)
-			b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+			b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 			b.update(now)
-			b.readCompleted(now, testBudgetRead, now-2*int64(tc.latency)-int64(aplSlowStartMaxDelay), aplReadFullBackground, testBudgetRead)
+			b.readCompleted(now, testBudgetRead, now-2*int64(tc.latency)-int64(aplSlowStartMaxDelay), aplReadFullBackground, testBudgetRead, 0)
 			// Reads deliver tc.delivered bytes in each of the next windows.
 			for range max(tc.windows, 1) {
 				now += int64(max(window, tc.latency))
-				b.readCompleted(now, tc.delivered, now-int64(tc.latency), aplReadBackground, testBudgetRead)
+				b.readCompleted(now, tc.delivered, now-int64(tc.latency), aplReadBackground, testBudgetRead, 0)
 				b.update(now)
 			}
 
@@ -198,15 +198,15 @@ func TestBackgroundBudgetTokenBucket(t *testing.T) {
 	// The first read measures the latency and ends the first window; a read
 	// that queued ends the slow start.
 	now := int64(latency)
-	b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(now, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	b.update(now)
-	b.readCompleted(now, testBudgetRead, now-2*int64(latency)-int64(aplSlowStartMaxDelay), aplReadFullBackground, testBudgetRead)
+	b.readCompleted(now, testBudgetRead, now-2*int64(latency)-int64(aplSlowStartMaxDelay), aplReadFullBackground, testBudgetRead, 0)
 	// Windows alternate between a burst of 8 MiB (400 MiB/s) and nothing:
 	// 200 MiB/s sustained, with the read that queued in the first window.
 	for i := range aplBandwidthWindows {
 		now += int64(aplBandwidthWindow)
 		if i%2 == 0 {
-			b.readCompleted(now, 8<<20, now-int64(latency), aplReadBackground, testBudgetRead)
+			b.readCompleted(now, 8<<20, now-int64(latency), aplReadBackground, testBudgetRead, 0)
 		}
 		b.update(now)
 	}
@@ -223,10 +223,10 @@ func startParallel(exitLatency time.Duration) *aplBackgroundBudget {
 	b := &aplBackgroundBudget{}
 	b.init(0, testBudgetRead, testBudgetMax, 0)
 	ms := int64(time.Millisecond)
-	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadAwaited, 0)
-	b.readCompleted(10*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadAwaited, 0, 0)
+	b.readCompleted(10*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	b.update(10 * ms)
-	b.readCompleted(15*ms, testBudgetRead, 15*ms-int64(exitLatency), aplReadFullBackground, 2*testBudgetRead)
+	b.readCompleted(15*ms, testBudgetRead, 15*ms-int64(exitLatency), aplReadFullBackground, 2*testBudgetRead, 0)
 	b.update(15 * ms)
 	return b
 }
@@ -268,7 +268,7 @@ func TestBackgroundBudgetProbe(t *testing.T) {
 	// took latency, at now + latency.
 	complete := func(reads uint64, latency time.Duration) {
 		now += int64(latency)
-		b.readCompleted(now, testBudgetRead, now-int64(latency), aplReadFullBackground, reads*testBudgetRead)
+		b.readCompleted(now, testBudgetRead, now-int64(latency), aplReadFullBackground, reads*testBudgetRead, 0)
 		b.update(now)
 	}
 	// Two in 12 ms deliver 67% more than one in 10 ms: kept, and a probe
@@ -309,12 +309,12 @@ func TestBackgroundBudgetProbeFaultLatency(t *testing.T) {
 	// of a full-size read (256 KiB in 10 ms), more than the awaited read
 	// before probing took. While probing, an awaited read of a page takes
 	// 3 ms: still fine.
-	b.readCompleted(25*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead)
+	b.readCompleted(25*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead, 0)
 	if b.probe != 2 {
 		t.Fatalf("an awaited read taking 3 ms ended the probe")
 	}
 	// One that takes 4 ms ends it.
-	b.readCompleted(26*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead)
+	b.readCompleted(26*ms, hostarch.PageSize, 22*ms, aplReadAwaited, 2*testBudgetRead, 0)
 	if b.probe != 0 || b.floor != 0 || b.bytes != b.bdpBytes || b.nextProbe <= 26*ms {
 		t.Errorf("after an awaited read 3 ms slower: probe %d, floor %d, budget %d (bandwidth-delay product %d), next probe at %v; want the bandwidth-delay product and probing deferred", b.probe, b.floor, b.bytes, b.bdpBytes, time.Duration(b.nextProbe))
 	}
@@ -333,9 +333,9 @@ func TestBackgroundBudgetParallelReads(t *testing.T) {
 	// A read alone takes 30 ms; one issued with the 8 in flight takes 50 ms,
 	// which ends the slow start with a bandwidth-delay product of one read.
 	ms := int64(time.Millisecond)
-	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	b.update(30 * ms)
-	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead)
+	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead, 0)
 	if b.startup || !b.parallel {
 		t.Fatalf("slow start %t, parallel %t; want false, true", b.startup, b.parallel)
 	}
@@ -360,9 +360,9 @@ func TestBackgroundBudgetParallelReadsProbeFaultLatency(t *testing.T) {
 	ms := int64(time.Millisecond)
 	var b aplBackgroundBudget
 	b.init(0, testBudgetRead, testBudgetMax, 8)
-	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(30*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	b.update(30 * ms)
-	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead)
+	b.readCompleted(50*ms, testBudgetRead, 0, aplReadFullBackground, 8*testBudgetRead, 0)
 	b.update(50 * ms)
 	if !b.raised || b.probe == 0 {
 		t.Fatalf("raised %t, probe %d: want the budget raised by a probe above the 8 reads", b.raised, b.probe)
@@ -370,14 +370,14 @@ func TestBackgroundBudgetParallelReadsProbeFaultLatency(t *testing.T) {
 	// A page read in 21 ms, mostly the store's latency to a first byte,
 	// against 0.47 ms at the rate of a full-size read: not slowed, since no
 	// read was quicker. Another in 23 ms is within aplQueueDelay of it.
-	b.readCompleted(71*ms, hostarch.PageSize, 50*ms, aplReadAwaited, 8*testBudgetRead)
-	b.readCompleted(95*ms, hostarch.PageSize, 72*ms, aplReadAwaited, 8*testBudgetRead)
+	b.readCompleted(71*ms, hostarch.PageSize, 50*ms, aplReadAwaited, 8*testBudgetRead, 0)
+	b.readCompleted(95*ms, hostarch.PageSize, 72*ms, aplReadAwaited, 8*testBudgetRead, 0)
 	if b.drops != 0 || b.floor != 8 {
 		t.Fatalf("awaited reads of 21 and 23 ms, the quickest read 21 ms: %d drops, floor %d; want none and 8", b.drops, b.floor)
 	}
 	// One in 24 ms was slowed.
 	now := 120 * ms
-	b.readCompleted(now, hostarch.PageSize, now-24*ms, aplReadAwaited, 8*testBudgetRead)
+	b.readCompleted(now, hostarch.PageSize, now-24*ms, aplReadAwaited, 8*testBudgetRead, 0)
 	if b.drops != 1 || b.floor != 0 || b.bytes != b.bdpBytes {
 		t.Fatalf("after an awaited read of 24 ms: %d drops, floor %d, budget %d (bandwidth-delay product %d); want the bandwidth-delay product", b.drops, b.floor, b.bytes, b.bdpBytes)
 	}
@@ -399,18 +399,18 @@ func TestBackgroundBudgetGapBytes(t *testing.T) {
 	b.init(0, testBudgetRead, testBudgetMax, 0)
 	ms := int64(time.Millisecond)
 	// A short read completes first, in 1 ms.
-	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadBackground, hostarch.PageSize)
+	b.readCompleted(1*ms, hostarch.PageSize, 0, aplReadBackground, hostarch.PageSize, 0)
 	if got := b.gapBytes(); got != testBudgetRead {
 		t.Errorf("gapBytes() before a full-size read completed = %d, want %d", got, testBudgetRead)
 	}
 	// A full-size read takes 8 ms: it delivers an eighth of its bytes in the
 	// 1 ms that the short read took.
-	b.readCompleted(8*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead)
+	b.readCompleted(8*ms, testBudgetRead, 0, aplReadFullBackground, testBudgetRead, 0)
 	if got, want := b.gapBytes(), uint64(testBudgetRead/8); got != want {
 		t.Errorf("gapBytes() = %d, want %d", got, want)
 	}
 	// A quicker awaited read lowers it, to whole pages.
-	b.readCompleted(9*ms, hostarch.PageSize, 9*ms-ms/3, aplReadAwaited, 0)
+	b.readCompleted(9*ms, hostarch.PageSize, 9*ms-ms/3, aplReadAwaited, 0, 0)
 	if got, want := b.gapBytes(), hostarch.PageRoundDown(uint64(testBudgetRead/24)); got != want {
 		t.Errorf("gapBytes() after a read of 1/3 ms = %d, want %d", got, want)
 	}
@@ -427,9 +427,9 @@ func startParallelReads(t *testing.T, reads uint64) *aplBackgroundBudget {
 	b.init(0, testBudgetRead, reads*testBudgetRead, reads)
 	// Far more is left to load than any drain delivers.
 	b.unloaded = 1 << 40
-	b.readCompleted(int64(time.Second), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead)
+	b.readCompleted(int64(time.Second), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead, 0)
 	b.update(int64(time.Second))
-	b.readCompleted(int64(1200*time.Millisecond), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead)
+	b.readCompleted(int64(1200*time.Millisecond), testBudgetRead, 0, aplReadFullBackground, reads*testBudgetRead, 0)
 	b.update(int64(1200 * time.Millisecond))
 	if b.startup || b.floor != reads || b.bytes != reads*testBudgetRead {
 		t.Fatalf("after the slow start: slow start %t, floor %d, budget %d; want false, %d reads", b.startup, b.floor, b.bytes, reads)
@@ -442,13 +442,19 @@ func startParallelReads(t *testing.T, reads uint64) *aplBackgroundBudget {
 // inflight bytes of background reads in flight when it is issued, until done
 // returns true or n reads completed, and returns the number completed.
 func testAwaited(b *aplBackgroundBudget, now *int64, latencies []time.Duration, inflight func() uint64, n int, done func() bool) int {
+	return testAwaitedBeside(b, now, latencies, inflight, 0, n, done)
+}
+
+// testAwaitedBeside is testAwaited with others other awaited reads in flight
+// when each is issued.
+func testAwaitedBeside(b *aplBackgroundBudget, now *int64, latencies []time.Duration, inflight func() uint64, others int, n int, done func() bool) int {
 	for i := 0; i < n; i++ {
 		if done != nil && done() {
 			return i
 		}
 		issued, bg := *now, inflight()
 		*now += int64(latencies[i%len(latencies)])
-		b.readCompleted(*now, hostarch.PageSize, issued, aplReadAwaited, bg)
+		b.readCompleted(*now, hostarch.PageSize, issued, aplReadAwaited, bg, others)
 		b.update(*now)
 	}
 	return n
@@ -537,6 +543,13 @@ func TestBackgroundBudgetParallelReadsSlowAwaited(t *testing.T) {
 	if b.floor != 1 {
 		t.Fatalf("floor %d after %d awaited reads slowed by 2 reads in flight, want 1", b.floor, aplAwaitedSamples)
 	}
+	// Until the hold that cut ends, judgements of awaited reads alone keep it
+	// at one read.
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, nil)
+	if b.floor != 1 || now >= b.heldUntil {
+		t.Fatalf("floor %d during the hold (until %v, now %v), want 1", b.floor, time.Duration(b.heldUntil), time.Duration(now))
+	}
+	now = b.heldUntil
 	// Awaited reads 20% slower than alone, plus aplQueueDelay, let it grow
 	// by one read at each judgement.
 	within := []time.Duration{242 * time.Millisecond}
@@ -554,27 +567,198 @@ func TestBackgroundBudgetParallelReadsSlowAwaited(t *testing.T) {
 }
 
 // TestBackgroundBudgetParallelReadsQuiet checks that the floor that awaited
-// reads lowered grows by one read each time no awaited read completed for the
-// minimum latency of a background read.
+// reads lowered grows for want of awaited reads only once none completed for
+// aplAwaitedSamples minimum latencies of a background read, and by one read
+// each minimum latency from then on.
 func TestBackgroundBudgetParallelReadsQuiet(t *testing.T) {
 	const reads = 15
 	b := startParallelReads(t, reads)
 	now := b.windowStart
-	b.alone = [aplAwaitedSamples]time.Duration{}
-	b.aloneCount = aplAwaitedSamples
-	for i := range b.alone {
-		b.alone[i] = 100 * time.Millisecond
+	b.solo = [aplAwaitedSamples]time.Duration{}
+	b.soloCount = aplAwaitedSamples
+	for i := range b.solo {
+		b.solo[i] = 100 * time.Millisecond
 	}
 	testAwaited(b, &now, []time.Duration{500 * time.Millisecond}, func() uint64 { return b.floor * testBudgetRead }, aplAwaitedSamples, nil)
-	if b.floor != reads/2 {
-		t.Fatalf("floor %d after awaited reads 5 times slower than alone, want %d", b.floor, reads/2)
+	if b.floor != 1 {
+		t.Fatalf("floor %d after awaited reads 5 times slower than alone, want 1", b.floor)
 	}
 	start := now
-	for ; now < start+int64(5*b.minLatency); now += int64(aplBandwidthWindow) {
+	for ; now < start+int64((aplAwaitedSamples-1)*b.minLatency); now += int64(aplBandwidthWindow) {
 		b.update(now)
 	}
-	if want := uint64(reads/2 + 4); b.floor != want {
-		t.Errorf("floor %d after 5 minimum latencies (%v) without awaited reads, want %d", b.floor, b.minLatency, want)
+	if b.floor != 1 {
+		t.Fatalf("floor %d after %d minimum latencies (%v) without awaited reads, want 1", b.floor, aplAwaitedSamples-1, b.minLatency)
+	}
+	for ; now < start+int64((aplAwaitedSamples+3)*b.minLatency+b.minLatency/2); now += int64(aplBandwidthWindow) {
+		b.update(now)
+	}
+	if want := uint64(1 + 4); b.floor != want {
+		t.Errorf("floor %d after %d.5 minimum latencies (%v) without awaited reads, want %d", b.floor, aplAwaitedSamples+3, b.minLatency, want)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsBetweenRequests checks that awaited reads
+// that come a few minimum latencies apart, as an application's requests'
+// page faults do, keep the floor that they halved: no quiet period between
+// them raises it.
+func TestBackgroundBudgetParallelReadsBetweenRequests(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	b.soloCount = aplAwaitedSamples
+	for i := range b.solo {
+		b.solo[i] = 30 * time.Millisecond
+	}
+	inflight := func() uint64 { return max(b.floor, 1) * testBudgetRead }
+	// Awaited reads with the floor's reads in flight take 120 ms, four times
+	// as long as alone: the floor falls to two reads, then one.
+	slowed := []time.Duration{120 * time.Millisecond}
+	for _, want := range []uint64{2, 1} {
+		testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+		if b.floor != want {
+			t.Fatalf("floor %d, want %d", b.floor, want)
+		}
+	}
+	// Requests' awaited reads, each after a pause of three minimum latencies:
+	// the floor stays within two reads, judged up and halved again.
+	most := b.floor
+	for i := 0; i < 10*aplAwaitedSamples; i++ {
+		for end := now + int64(3*b.minLatency); now < end; now += int64(aplBandwidthWindow) {
+			b.update(now)
+		}
+		latency := []time.Duration{30 * time.Millisecond}
+		if b.floor > 1 {
+			latency = slowed
+		}
+		testAwaited(b, &now, latency, inflight, 1, nil)
+		most = max(most, b.floor)
+	}
+	if most > 2 {
+		t.Errorf("floor as high as %d between requests' awaited reads, want at most 2 (%v)", most, b)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsBurst checks that awaited reads alone
+// measured during a burst of page faults, beside other awaited reads and slowed
+// by them, are measured again once an awaited read issued with no other in
+// flight is quicker than they were by more than aplAwaitedSlowdown, after the
+// backoff of the drain that measured them; and that the floor is then judged
+// by awaited reads issued one at a time, which its reads slowed.
+func TestBackgroundBudgetParallelReadsBurst(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	inflight := func() uint64 { return min(b.bytes, reads*testBudgetRead) }
+	// A burst: each awaited read beside two others, 150 ms with the floor's
+	// reads in flight or not. The first judgement drains, and the drain
+	// ends with the burst's awaited reads alone, beside others.
+	burst := []time.Duration{150 * time.Millisecond}
+	testAwaitedBeside(b, &now, burst, inflight, 2, aplAwaitedSamples, nil)
+	if !b.draining {
+		t.Fatalf("no drain after %d awaited reads with the floor in flight", aplAwaitedSamples)
+	}
+	testAwaitedBeside(b, &now, burst, inflight, 2, aplAwaitedSamples, func() bool { return !b.draining })
+	if b.draining || b.floor != reads || b.nextDrain <= now {
+		t.Fatalf("after the burst's drain: draining %t, floor %d, next drain at %v (now %v); want the floor back and the next drain deferred", b.draining, b.floor, time.Duration(b.nextDrain), time.Duration(now))
+	}
+	// The burst goes on, judged against itself: the floor stays.
+	testAwaitedBeside(b, &now, burst, inflight, 2, 2*aplAwaitedSamples, nil)
+	if b.draining || b.floor != reads || b.drops != 0 {
+		t.Fatalf("during the burst: draining %t, floor %d, %d drops; want no drain, %d reads, none", b.draining, b.floor, b.drops, reads)
+	}
+	// Then awaited reads one at a time, 120 ms with the floor's reads in
+	// flight: once the backoff is over, a judgement drains again.
+	slowed := []time.Duration{120 * time.Millisecond}
+	testAwaited(b, &now, slowed, inflight, 100, func() bool { return b.draining })
+	if !b.draining || b.drains != 2 || now < b.nextDrain {
+		t.Fatalf("awaited reads one at a time: draining %t, %d drains at %v (backoff until %v); want a second drain after the backoff", b.draining, b.drains, time.Duration(now), time.Duration(b.nextDrain))
+	}
+	// Alone, 30 ms: the drain ends, and the floor's reads, slowing them four
+	// times, cut it to one read.
+	testAwaited(b, &now, []time.Duration{30 * time.Millisecond}, inflight, aplAwaitedSamples, func() bool { return !b.draining })
+	if b.draining || b.floor != reads {
+		t.Fatalf("after awaited reads one at a time alone: draining %t, floor %d; want the floor of %d reads back", b.draining, b.floor, reads)
+	}
+	testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+	if b.floor != 1 {
+		t.Errorf("floor %d after awaited reads one at a time four times as slow as alone, want 1 (%v)", b.floor, b)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsCut checks that a judgement cuts the floor
+// in proportion to how much its reads slowed awaited reads, beyond halving it,
+// and holds it below the reads it was cut from, a hold that doubles at each
+// cut and ends once a judgement keeps it there.
+func TestBackgroundBudgetParallelReadsCut(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	// Awaited reads of a page are judged less a page at the rate of a
+	// full-size read: 15 ms here, with 40 ms the quickest read.
+	b.quickest = 40 * time.Millisecond
+	b.soloCount = aplAwaitedSamples
+	for i := range b.solo {
+		b.solo[i] = 25 * time.Millisecond
+	}
+	inflight := func() uint64 { return max(b.floor, 1) * testBudgetRead }
+	// 15 reads in flight slow awaited reads to 120 ms, 105 ms judged: to
+	// 1 + 0.25 * 14 / 3.1 reads.
+	testAwaited(b, &now, []time.Duration{120 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+	if b.floor != 2 || b.heldReads != reads {
+		t.Fatalf("floor %d, held at %d, after awaited reads three times as slow as alone with %d reads in flight; want 2, %d", b.floor, b.heldReads, reads, reads)
+	}
+	// Two slow them to 64 ms, 49 ms judged: one read, held below two.
+	testAwaited(b, &now, []time.Duration{64 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+	if b.floor != 1 || b.heldReads != 2 {
+		t.Fatalf("floor %d, held at %d, after awaited reads twice as slow with 2 reads in flight; want 1, 2", b.floor, b.heldReads)
+	}
+	first := time.Duration(b.heldUntil - now)
+	alone := []time.Duration{40 * time.Millisecond}
+	testAwaited(b, &now, alone, inflight, 1000, func() bool { return b.floor != 1 })
+	if now < b.heldUntil {
+		t.Fatalf("floor %d at %v, before the hold's end at %v", b.floor, time.Duration(now), time.Duration(b.heldUntil))
+	}
+	// Two again, as slow: one read, held twice as long.
+	testAwaited(b, &now, []time.Duration{64 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+	if second := time.Duration(b.heldUntil - now); b.floor != 1 || second != 2*first {
+		t.Fatalf("floor %d, held for %v after a hold of %v; want 1, twice as long", b.floor, second, first)
+	}
+	// After the hold, reads that slow awaited reads to 44 ms, 29 ms judged,
+	// within 25% of alone, are kept, and the hold is no more: the floor
+	// grows at each judgement.
+	now = b.heldUntil
+	testAwaited(b, &now, alone, inflight, aplAwaitedSamples, nil)
+	testAwaited(b, &now, []time.Duration{44 * time.Millisecond}, inflight, 3*aplAwaitedSamples, nil)
+	if b.floor != 5 || b.heldReads != 0 {
+		t.Errorf("floor %d, held at %d, after judgements that kept it; want 5, none (%v)", b.floor, b.heldReads, b)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsBesideStands checks that awaited reads alone
+// measured beside other awaited reads stand where awaited reads issued one at
+// a time are no quicker than they are by more than aplAwaitedSlowdown, as
+// from a store whose first byte takes most of an awaited read: no drain
+// follows the first.
+func TestBackgroundBudgetParallelReadsBesideStands(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	inflight := func() uint64 { return min(b.bytes, reads*testBudgetRead) }
+	beside := []time.Duration{179 * time.Millisecond}
+	testAwaitedBeside(b, &now, beside, inflight, 2, aplAwaitedSamples, nil)
+	testAwaitedBeside(b, &now, beside, inflight, 2, aplAwaitedSamples, func() bool { return !b.draining })
+	if b.draining || b.drains != 1 {
+		t.Fatalf("after the first drain: draining %t, %d drains", b.draining, b.drains)
+	}
+	// One at a time with the floor's reads in flight, 173-190 ms, and beside
+	// others, 179 ms, for long past the backoff: no drain, no drop.
+	for i := 0; i < 20; i++ {
+		testAwaited(b, &now, []time.Duration{173 * time.Millisecond, 190 * time.Millisecond}, inflight, 2, nil)
+		testAwaitedBeside(b, &now, beside, inflight, 2, 6, nil)
+	}
+	if b.drains != 1 || b.drops != 0 || b.floor != reads {
+		t.Errorf("%d drains, %d drops, floor %d; want one, none, %d reads (%v)", b.drains, b.drops, b.floor, reads, b)
 	}
 }
 
