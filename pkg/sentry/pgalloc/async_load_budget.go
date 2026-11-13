@@ -125,25 +125,105 @@ import (
 // one 16 MiB read stayed in flight and loading took 35-48 s rather than ~17.
 //
 // Instead, every aplAwaitedSamples awaited reads, the median latency of those
-// issued with more than one background read in flight is compared with the
-// median latency of the last awaited reads issued with at most one ("alone"),
+// issued with two full-size background reads in flight or more is compared
+// with the median latency of the last awaited reads issued with fewer
+// ("alone": one full-size read and a short one may be in flight beside them),
 // each less its bytes at the rate of a full-size read. If it exceeds it by
-// more than aplAwaitedSlowdown, plus aplQueueDelay, the floor halves (to one
-// read at least); otherwise, or if too few of them were issued with background
-// reads in flight to tell, it grows by one read, back to the reads the pages
-// file serves at once, as it also does each time no awaited read completed for
-// a bandwidth window or the minimum latency: a multiplicative decrease and an
-// additive increase, as TCP's congestion avoidance, around the most reads in
-// flight that keep awaited reads at most aplAwaitedSlowdown slower at the
-// median. Until awaited reads alone were measured, the floor holds the reads in
+// more than aplAwaitedSlowdown, plus aplQueueDelay, the floor is cut (below);
+// otherwise, or if too few of them were issued with background reads in
+// flight to tell, it grows by one read, up to the reads the pages file's
+// bandwidth needs (below): a multiplicative decrease and an additive
+// increase, as TCP's congestion avoidance, around the most reads in flight
+// that keep awaited reads at most aplAwaitedSlowdown slower at the median.
+// Until awaited reads alone were measured, the floor holds the reads in
 // flight above one, so the first judgement holds the budget at one read until
 // aplAwaitedSamples awaited reads were issued alone, as BBR's ProbeRTT drains
 // its queue to measure the round trip, and then returns to the floor; a drain
 // that ends, after twice the minimum latency and the time the awaited reads
-// took, with fewer than half of them is retried after a backoff that doubles.
-// No drain starts while less is left to load than the pages file delivers
-// over one: loading would end within it, at one read rather than the floor's,
-// and the floor's reads, and what they do to awaited reads, with it.
+// took, with fewer than half of them issued one at a time is retried after a
+// backoff that doubles. No drain starts while less is left to load than the
+// pages file delivers over one: loading would end within it, at one read
+// rather than the floor's, and the floor's reads, and what they do to awaited
+// reads, with it.
+//
+// Awaited reads alone are compared with as they were issued one at a time, with
+// no other awaited read in flight, where aplAwaitedSamples/2 of the last were.
+// A restored application faults in bursts, its threads waiting for pages at
+// once as it resumes, and awaited reads in flight together slow each other:
+// from an S3 Express-like store, awaited reads alone took 39 ms at the median
+// one at a time and 65 ms beside others, and the first drain, during such a
+// burst, measured 91 ms (39-223 ms by restore). Against that, the floor's
+// reads, which slowed awaited reads to 139 ms at the median with nine or more
+// in flight, were kept through the application's next requests.
+// Where awaited reads alone were only measured beside others, and an awaited
+// read issued with no other in flight, background reads in flight or not, was
+// quicker than they were by more than the floor may slow them, a drain
+// measures them again, after the backoff of a drain that measured too few. From
+// an S3-like store, whose awaited reads mostly overlap but take its first
+// byte's 150 ms either way (178 ms one at a time, 176 ms beside others), the
+// reads measured beside others stand.
+//
+// Awaited reads alone measured over aplBandwidthWindows minimum latencies ago
+// are judged by only where awaited reads issued with background reads in
+// flight took within aplAwaitedSlowdown of them, either way; otherwise a drain
+// measures awaited reads alone anew, as when there were none. With the floor
+// at two reads or more none is issued alone, and a store's latency drifts as
+// a restored application's faults come and go: from an S3-like store awaited
+// reads took 175 ms alone as an application resumed and 210-310 ms seconds
+// later with one read in flight, so that, judged against the resume's, one
+// read slowed them and the floor stayed at it, 40 MB/s, for the rest of a
+// 3.25 GB restore; from an S3 Express-like store the first drain, in the
+// resume's burst, measured them alone at 100 ms or more, against which three
+// or four reads in flight passed through the first request, slowing awaited
+// reads from 41 ms alone to 75-100.
+//
+// A judgement that finds awaited reads slowed too much cuts the floor in
+// proportion: awaited reads slow about in proportion to the background reads
+// in flight beyond one, by 20-40% a read from an S3 Express-like store and
+// 5-8% from an S3-like one, so the floor falls to as many reads as slow them by
+// aplAwaitedSlowdown at most, or halves if that is more; and it grows back to
+// the reads it was cut from, whether for want of awaited reads with
+// background reads in flight to judge it by or for a judgement that kept it
+// lower, only after a hold of aplBandwidthWindows quiet periods, doubled at
+// each cut until a judgement keeps it there. Where awaited reads issued one at
+// a time were slowed by more than twice aplAwaitedSlowdown against awaited
+// reads alone issued one at a time, the hold lasts until no awaited read
+// completed for aplAwaitedSamples quiet periods: from an S3 Express-like
+// store, two background reads in flight slow awaited reads by 50-100% (41 to
+// 60-72 ms at the median), and each end of a hold grew the floor back to two
+// reads for a judgement, until a third of a restored application's first
+// request's awaited reads went out beside two to four. Awaited reads issued
+// beside others, as in a restored application's burst of page faults, hold
+// it only for a while: from an S3-like store, held for good by such a
+// judgement as an application resumed, the floor stayed at one read through
+// its first request, a 3.25 GB load taking 40-52 s rather than 26-30. A floor
+// of one read is not cut, nor held.
+//
+// The floor grows by a read for want of awaited reads to judge it by only once
+// none completed for aplAwaitedSamples quiet periods, and by one each period
+// from then on: between two of an application's requests, or between two of
+// its threads' page faults, each period without awaited reads raised it by a
+// read, back to the reads the pages file serves at once, and the next
+// awaited reads waited behind them until judgements halved it again.
+//
+// The floor grows, and probes raise the budget, only up to the reads that the
+// pages file's bandwidth needs in flight (kneeReads): the most bandwidth
+// measured over aplBandwidthWindows windows so far, times the minimum latency
+// of a full-size read, rounded up, and a read more, as BBR bounds its data in
+// flight by its bottleneck bandwidth times its minimum round trip. More reads
+// in flight deliver no more; they only queue, and awaited reads with them:
+// from an S3 Express-like store (a 16 MiB read alone in 225 ms, up to 150-200
+// MB/s) and a local one (16 MiB in 55-60 ms, up to 180-250 MB/s), 3-4 and 12
+// reads in flight loaded the same 110-130 MiB/s as a restored application
+// resumed, while a probe, once the floor was cut, raised the budget to the
+// most reads the pages file serves between two page faults. Once a drain
+// issued reads alone, the bound also cuts the floor: 2 reads from the local
+// store, 3-4 from the S3 Express-like one and 5-6 from an S3-like one (16 MiB
+// in 370 ms, up to 150-185 MB/s), whose awaited reads, 6-21% slower with two
+// to eight reads in flight, keep it. Before, it only stops growth: the
+// bandwidth's first windows, before the first reads are all delivered,
+// measure less than the pages file delivers, and the minimum latency is that
+// of reads issued together.
 var (
 	// aplQueueDelay is the time an awaited read may wait behind the
 	// background reads in flight, beyond their own latency.
@@ -257,6 +337,10 @@ type aplBackgroundBudget struct {
 	nextWindow    int
 	windows       int
 
+	// maxBandwidth is the most bandwidth measured over the last
+	// aplBandwidthWindows windows as each ended, in bytes per second.
+	maxBandwidth float64
+
 	// parallel is true if the read that ended the slow start found more reads
 	// in flight to deliver more bandwidth; probing is only done then.
 	parallel bool
@@ -284,11 +368,25 @@ type aplBackgroundBudget struct {
 	floorRaisedAt int64
 
 	// alone holds the latencies, each less its bytes at the rate of a
-	// full-size read, of the last awaited reads issued with at most one
-	// background read in flight, aloneCount of them in all, in a ring indexed
-	// by aloneCount.
+	// full-size read, of the last awaited reads issued with less than two
+	// full-size reads' bytes of background reads in flight, aloneCount of
+	// them in all, in a ring indexed by aloneCount.
 	alone      [aplAwaitedSamples]time.Duration
 	aloneCount int
+
+	// aloneAt is the time at which the last awaited read issued alone
+	// completed.
+	aloneAt int64
+
+	// solo holds those of them issued with no other awaited read in flight
+	// either, soloCount of them in all, in a ring indexed by soloCount.
+	// soloQuickest is the least latency, so reduced, of the awaited reads
+	// issued with no other awaited read in flight, whatever background reads
+	// were, if soloQuickestKnown is true.
+	solo              [aplAwaitedSamples]time.Duration
+	soloCount         int
+	soloQuickest      time.Duration
+	soloQuickestKnown bool
 
 	// loaded holds those of the awaited reads issued with more background
 	// reads in flight since the floor was last judged, loadedCount of them,
@@ -296,6 +394,22 @@ type aplBackgroundBudget struct {
 	loaded       [aplAwaitedSamples]time.Duration
 	loadedCount  int
 	awaitedSince int
+
+	// loadedReads holds the full-size background reads in flight when each
+	// of loaded was issued, and loadedSolo is true for those of loaded issued
+	// with no other awaited read in flight.
+	loadedReads [aplAwaitedSamples]uint64
+	loadedSolo  [aplAwaitedSamples]bool
+
+	// heldReads is the reads at which a judgement last found awaited reads
+	// slowed too much, until a judgement keeps the floor at as many (0 if
+	// none), and heldUntil the time until which the floor grows to them for
+	// want of awaited reads with background reads in flight to judge it by,
+	// or for a judgement that kept it lower. holdBackoff is the time that the
+	// next hold lasts: aplBandwidthWindows quiet periods, doubled at each.
+	heldReads   uint64
+	heldUntil   int64
+	holdBackoff time.Duration
 
 	// draining is true while the floor is held at none and the budget at one
 	// read, until drainEnd, so that awaited reads are issued alone. A drain
@@ -305,6 +419,11 @@ type aplBackgroundBudget struct {
 	drainEnd     int64
 	nextDrain    int64
 	drainBackoff time.Duration
+
+	// aloneAtDrain and soloAtDrain are aloneCount and soloCount when the drain
+	// in progress started.
+	aloneAtDrain int
+	soloAtDrain  int
 
 	// unloaded is the number of bytes left to load from the pages file, as
 	// the loader last said.
@@ -380,13 +499,14 @@ func (b *aplBackgroundBudget) init(now int64, readBytes, maxBytes, parallelReads
 
 // readCompleted records the completion at now of a read of n bytes of the
 // given kind, issued at issued with inflight bytes of background reads in
-// flight, itself included if it is a background read.
-func (b *aplBackgroundBudget) readCompleted(now int64, n uint64, issued int64, kind aplReadKind, inflight uint64) {
+// flight, itself included if it is a background read, and, if it is an
+// awaited read, others other awaited reads.
+func (b *aplBackgroundBudget) readCompleted(now int64, n uint64, issued int64, kind aplReadKind, inflight uint64, others int) {
 	b.windowBytes += n
 	latency := time.Duration(now - issued)
 	// An awaited read is judged against the quickest read before it.
 	if kind == aplReadAwaited {
-		b.awaitedReadCompleted(now, n, latency, issued, inflight)
+		b.awaitedReadCompleted(now, n, latency, issued, inflight, others)
 	}
 	if !b.quickestKnown || latency < b.quickest {
 		b.quickest, b.quickestKnown = latency, true
@@ -470,18 +590,18 @@ func (b *aplBackgroundBudget) bandwidthAtMost(reads uint64) (float64, bool) {
 }
 
 // awaitedReadCompleted records the completion at now of an awaited read of n
-// bytes issued at issued, with inflight bytes of background reads in flight,
-// which took latency. On a pages file that serves reads in parallel, outside a
+// bytes issued at issued, with inflight bytes of background reads and others
+// other awaited reads in flight, which took latency. On a pages file that serves reads in parallel, outside a
 // probe, it judges the floor every aplAwaitedSamples awaited reads (see
 // judgeFloor). Otherwise, it drops the floor if the read was issued while the
 // budget was raised and took more than aplQueueDelay longer than an awaited
 // read did while it was not, or than it would take alone: the latency of the
 // quickest read, which is mostly the pages file's latency to a first byte,
 // plus n bytes at the rate of one full-size read.
-func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency time.Duration, issued int64, inflight uint64) {
+func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency time.Duration, issued int64, inflight uint64, others int) {
 	b.lastAwaited = now
 	if b.parallelReads != 0 && b.probe == 0 {
-		b.parallelAwaitedReadCompleted(now, n, latency, inflight)
+		b.parallelAwaitedReadCompleted(now, n, latency, inflight, others)
 		return
 	}
 	if !b.raised || issued < b.raisedAt {
@@ -508,10 +628,11 @@ func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency 
 
 // parallelAwaitedReadCompleted records the completion at now of an awaited
 // read of n bytes from a pages file that serves reads in parallel, issued with
-// inflight bytes of background reads in flight, which took latency, and
-// judges the floor once aplAwaitedSamples awaited reads completed since it was
-// last judged, or ends a drain once enough awaited reads were issued alone.
-func (b *aplBackgroundBudget) parallelAwaitedReadCompleted(now int64, n uint64, latency time.Duration, inflight uint64) {
+// inflight bytes of background reads and others other awaited reads in flight,
+// which took latency, and judges the floor once aplAwaitedSamples awaited
+// reads completed since it was last judged, or ends a drain once enough
+// awaited reads were issued alone.
+func (b *aplBackgroundBudget) parallelAwaitedReadCompleted(now int64, n uint64, latency time.Duration, inflight uint64, others int) {
 	if b.startup {
 		// The slow start grows the budget from the floor; the floor is
 		// judged after it.
@@ -522,15 +643,27 @@ func (b *aplBackgroundBudget) parallelAwaitedReadCompleted(now int64, n uint64, 
 	if b.latencyKnown && b.minLatency > b.quickest {
 		latency = max(latency-time.Duration(float64(b.minLatency-b.quickest)*float64(n)/float64(b.minBytes)), 0)
 	}
-	if inflight <= b.minBytes {
+	if others == 0 && (!b.soloQuickestKnown || latency < b.soloQuickest) {
+		b.soloQuickest, b.soloQuickestKnown = latency, true
+	}
+	if inflight < 2*b.minBytes {
+		// Alone, beside one full-size read at most: with the floor at one
+		// read, a short read beside it is in flight more often than not.
 		b.alone[b.aloneCount%len(b.alone)] = latency
 		b.aloneCount++
+		b.aloneAt = now
+		if others == 0 {
+			b.solo[b.soloCount%len(b.solo)] = latency
+			b.soloCount++
+		}
 	} else if b.loadedCount < len(b.loaded) {
 		b.loaded[b.loadedCount] = latency
+		b.loadedReads[b.loadedCount] = (inflight + b.minBytes - 1) / b.minBytes
+		b.loadedSolo[b.loadedCount] = others == 0
 		b.loadedCount++
 	}
 	if b.draining {
-		if b.aloneCount >= len(b.alone) {
+		if b.aloneCount-b.aloneAtDrain >= len(b.alone) {
 			b.endDrain(now)
 		}
 		return
@@ -541,38 +674,151 @@ func (b *aplBackgroundBudget) parallelAwaitedReadCompleted(now int64, n uint64, 
 }
 
 // judgeFloor judges at now the floor of a pages file that serves reads in
-// parallel by the awaited reads completed since it was last judged: it halves
-// floorReads if those issued with more than one background read in flight
-// took more than aplAwaitedSlowdown longer, plus aplQueueDelay, than awaited
-// reads issued alone did at the median, and grows it by one read if they did
-// not or if too few of them were issued with background reads in flight to
-// tell. Without enough awaited reads issued alone to compare with, it starts a
-// drain to measure them instead, unless a drain that measured too few defers
-// it or less is left to load than the pages file delivers over the drain.
+// parallel by the awaited reads completed since it was last judged: it cuts
+// floorReads, and holds it below the reads it was cut from, if those issued
+// with two full-size background reads in flight or more took more than
+// aplAwaitedSlowdown longer, plus aplQueueDelay, than awaited reads issued
+// alone did at the median, and grows it by one read if they did not or if too
+// few of them were issued with background reads in flight to tell. Without
+// enough awaited reads issued alone to compare with, or with only those issued
+// beside other awaited reads, and slower than one issued with no other in
+// flight by more than aplAwaitedSlowdown, or with only those measured too long
+// ago to cut the floor by, it starts a drain to measure them instead, unless a
+// drain that measured too few defers it or less is left to load than the
+// pages file delivers over the drain.
 func (b *aplBackgroundBudget) judgeFloor(now int64) {
-	loaded := b.loaded[:b.loadedCount]
+	loaded, loadedReads := b.loaded[:b.loadedCount], b.loadedReads[:b.loadedCount]
+	// Those of loaded issued one at a time, before loaded is reordered.
+	var soloLoaded []time.Duration
+	for i, l := range loaded {
+		if b.loadedSolo[i] {
+			soloLoaded = append(soloLoaded, l)
+		}
+	}
 	b.awaitedSince, b.loadedCount = 0, 0
 	if len(loaded) < aplAwaitedSamples/2 {
-		b.setFloorReads(now, min(b.floorReads+1, b.parallelReads))
+		b.raiseFloorReads(now)
 		return
 	}
-	alone := b.alone[:min(b.aloneCount, len(b.alone))]
-	if len(alone) < aplAwaitedSamples/2 {
+	alone, beside, ok := b.aloneMedian()
+	if !ok || (beside && b.soloQuickestKnown && alone > aplSlowed(b.soloQuickest)) {
 		// Twice the minimum latency, which the background reads in flight
 		// take to complete, plus what the awaited reads of a judgement take
 		// one after another.
 		drain := 2*b.minLatency + aplAwaitedSamples*aplMedian(loaded)
 		if now >= b.nextDrain && float64(b.unloaded) > b.bandwidth()*drain.Seconds() {
 			b.startDrain(now, drain)
+			return
+		}
+		if !ok {
+			return
+		}
+	}
+	// Awaited reads alone measured long ago are judged by only where
+	// awaited reads with background reads in flight took within
+	// aplAwaitedSlowdown of them, either way (see the comment atop this
+	// file); otherwise they are measured anew.
+	stale := now-b.aloneAt > int64(aplBandwidthWindows*max(aplBandwidthWindow, b.minLatency))
+	median := aplMedian(loaded)
+	if stale && (aplSlowed(median) < alone || median > aplSlowed(alone)) {
+		// Measure awaited reads alone anew, as when there were none, to
+		// judge by.
+		drain := 2*b.minLatency + aplAwaitedSamples*median
+		if now >= b.nextDrain && float64(b.unloaded) > b.bandwidth()*drain.Seconds() {
+			b.startDrain(now, drain)
 		}
 		return
 	}
-	if aplMedian(loaded) > time.Duration(float64(aplMedian(alone))*(1+aplAwaitedSlowdown))+aplQueueDelay {
-		b.drops++
-		b.setFloorReads(now, max(b.floorReads/2, 1))
-	} else {
-		b.setFloorReads(now, min(b.floorReads+1, b.parallelReads))
+	if median <= aplSlowed(alone) {
+		if b.floorReads >= b.heldReads {
+			// Kept where it was found too slow: no hold any more.
+			b.heldReads, b.holdBackoff = 0, 0
+		}
+		b.raiseFloorReads(now)
+		return
 	}
+	if b.floorReads <= 1 {
+		// Nothing to cut.
+		return
+	}
+	// Awaited reads slow about in proportion to the background reads in
+	// flight beyond one: the floor halves, or falls to as many reads as
+	// slow them by aplAwaitedSlowdown at most if that is fewer, and grows
+	// back to the reads it was at only after a hold.
+	slices.Sort(loadedReads)
+	reads := max(loadedReads[len(loadedReads)/2], 2)
+	target := uint64(1)
+	slowdown := float64(median-aplQueueDelay)/float64(max(alone, 1)) - 1
+	if slowdown > 0 {
+		target = 1 + uint64(aplAwaitedSlowdown*float64(reads-1)/slowdown)
+	}
+	b.drops++
+	if b.holdBackoff == 0 {
+		b.holdBackoff = aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
+	}
+	b.heldReads, b.heldUntil = b.floorReads, now+int64(b.holdBackoff)
+	if !beside && len(soloLoaded) >= aplAwaitedSamples/2 && aplMedian(soloLoaded) > time.Duration(float64(alone)*(1+2*aplAwaitedSlowdown))+aplQueueDelay {
+		// Awaited reads issued one at a time slowed twice as much as
+		// allowed: judgements do not grow the floor back to as many reads
+		// again; only a pause in awaited reads does.
+		b.heldUntil = math.MaxInt64
+	}
+	b.holdBackoff *= 2
+	b.setFloorReads(now, max(min(b.floorReads/2, target), 1))
+}
+
+// raiseFloorReads grows floorReads by one read at now, up to the reads the
+// pages file serves at once or those its bandwidth needs in flight if fewer
+// (maxFloorReads), unless a hold keeps it below heldReads.
+func (b *aplBackgroundBudget) raiseFloorReads(now int64) {
+	if reads := b.floorReads + 1; reads <= b.maxFloorReads() && (reads < b.heldReads || now >= b.heldUntil) {
+		b.setFloorReads(now, reads)
+	}
+}
+
+// maxFloorReads returns the most reads that floorReads may be: the reads that
+// the pages file serves at once, or those its bandwidth needs in flight if
+// fewer.
+func (b *aplBackgroundBudget) maxFloorReads() uint64 {
+	return min(b.parallelReads, b.kneeReads())
+}
+
+// kneeReads returns the full-size reads that the pages file's bandwidth needs
+// in flight: the most bandwidth measured so far times the minimum latency of a
+// full-size read, rounded up, and one read more, within one read and the most
+// reads the budget allows; the most, before either was measured.
+func (b *aplBackgroundBudget) kneeReads() uint64 {
+	maxReads := b.maxBytes / b.minBytes
+	if !b.latencyKnown || b.maxBandwidth == 0 {
+		return maxReads
+	}
+	// Less a millionth of a read, so that a product of whole reads, in
+	// floating point, is not rounded up past them.
+	reads := uint64(math.Ceil(b.maxBandwidth*b.minLatency.Seconds()/float64(b.minBytes)-1e-6)) + 1
+	return min(max(reads, 1), maxReads)
+}
+
+// aloneMedian returns the median latency of the awaited reads issued alone that
+// judgements compare with: of the last issued with no other awaited read in
+// flight either, if aplAwaitedSamples/2 were, else of the last issued alone,
+// beside other awaited reads or not, with beside true; and false if fewer than
+// aplAwaitedSamples/2 were.
+func (b *aplBackgroundBudget) aloneMedian() (median time.Duration, beside bool, ok bool) {
+	if n := min(b.soloCount, len(b.solo)); n >= aplAwaitedSamples/2 {
+		solo := b.solo
+		return aplMedian(solo[:n]), false, true
+	}
+	if n := min(b.aloneCount, len(b.alone)); n >= aplAwaitedSamples/2 {
+		alone := b.alone
+		return aplMedian(alone[:n]), true, true
+	}
+	return 0, false, false
+}
+
+// aplSlowed returns the most that an awaited read issued with the floor's reads
+// in flight may take at the median, where awaited reads alone take latency.
+func aplSlowed(latency time.Duration) time.Duration {
+	return time.Duration(float64(latency)*(1+aplAwaitedSlowdown)) + aplQueueDelay
 }
 
 // setFloorReads sets floorReads to reads at now, and the floor with it unless
@@ -598,20 +844,21 @@ func (b *aplBackgroundBudget) setFloorReads(now int64, reads uint64) {
 func (b *aplBackgroundBudget) startDrain(now int64, drain time.Duration) {
 	b.draining = true
 	b.drains++
+	b.aloneAtDrain, b.soloAtDrain = b.aloneCount, b.soloCount
 	b.floor = 0
 	b.drainEnd = now + int64(drain)
 	b.setBandwidthDelayProduct(now)
 }
 
 // endDrain ends the drain in progress at now, restoring the floor, and defers
-// the next one if too few awaited reads were issued alone to judge the floor
-// by.
+// the next one if too few awaited reads were issued alone, with no other
+// awaited read in flight, to judge the floor by.
 func (b *aplBackgroundBudget) endDrain(now int64) {
 	b.draining = false
 	// Awaited reads issued while the floor's reads were still in flight
 	// are not judged.
 	b.loadedCount, b.awaitedSince = 0, 0
-	if b.aloneCount < aplAwaitedSamples/2 {
+	if b.soloCount-b.soloAtDrain < aplAwaitedSamples/2 {
 		if b.drainBackoff == 0 {
 			b.drainBackoff = aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
 		}
@@ -648,6 +895,7 @@ func (b *aplBackgroundBudget) update(now int64) {
 		b.nextWindow = (b.nextWindow + 1) % aplBandwidthWindows
 		b.windows++
 		b.windowStart, b.windowBytes = now, 0
+		b.maxBandwidth = max(b.maxBandwidth, b.bandwidth())
 		if !b.startup {
 			b.setBandwidthDelayProduct(now)
 		}
@@ -662,12 +910,23 @@ func (b *aplBackgroundBudget) update(now int64) {
 	}
 	quietFor := int64(max(aplBandwidthWindow, b.minLatency))
 	quiet := now-b.lastAwaited >= quietFor
-	if quiet && !b.draining && b.floorReads < b.parallelReads && now-max(b.lastAwaited, b.floorRaisedAt) >= quietFor {
-		// No awaited read to slow: the floor grows by a read each time.
+	if b.drains > 0 && !b.draining && b.floorReads > b.maxFloorReads() {
+		// Once a drain had reads issued alone measure the minimum latency,
+		// the floor keeps no more reads than the bandwidth needs.
+		b.setFloorReads(now, b.maxFloorReads())
+	}
+	if !b.draining && b.floorReads < b.maxFloorReads() && now-b.lastAwaited >= aplAwaitedSamples*quietFor && now-b.floorRaisedAt >= quietFor {
+		// No awaited read to slow for aplAwaitedSamples quiet periods: the
+		// floor grows by a read each period from then on.
 		b.floorRaisedAt = now
 		b.setFloorReads(now, b.floorReads+1)
 	}
-	if maxReads := b.maxBytes / b.minBytes; b.parallel && quiet && !b.draining && b.probe == 0 && now >= b.nextProbe && b.reads < maxReads {
+	maxReads := b.maxBytes / b.minBytes
+	if b.parallelReads != 0 {
+		// Reads past those the bandwidth needs deliver no more.
+		maxReads = min(maxReads, b.kneeReads())
+	}
+	if b.parallel && quiet && !b.draining && b.probe == 0 && now >= b.nextProbe && b.reads < maxReads {
 		if _, ok := b.bandwidthAtMost(b.reads); ok {
 			b.probeFrom = b.reads
 			b.probe = min(b.reads+max(b.step, 1), maxReads)
@@ -740,5 +999,5 @@ func (b *aplBackgroundBudget) bandwidth() float64 {
 
 // String implements fmt.Stringer.String.
 func (b *aplBackgroundBudget) String() string {
-	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, quickest read %v, parallel %t (%d reads said), floor %d reads; probes kept %d, failed %d; dropped for awaited reads %d times; raised %d times, drained %d times, %d awaited reads alone; gaps read through up to %d bytes", b.startup, b.bandwidth()*1e-6, b.minLatency, b.quickest, b.parallel, b.parallelReads, b.floor, b.probesKept, b.probesFailed, b.drops, b.raises, b.drains, b.aloneCount, b.gapBytes())
+	return fmt.Sprintf("slow start %t, bandwidth %.3f MB/s, minimum latency %v, quickest read %v, parallel %t (%d reads said), floor %d reads, %d at most (most bandwidth %.3f MB/s); probes kept %d, failed %d; dropped for awaited reads %d times; raised %d times, drained %d times, %d awaited reads alone (%d one at a time); gaps read through up to %d bytes", b.startup, b.bandwidth()*1e-6, b.minLatency, b.quickest, b.parallel, b.parallelReads, b.floor, b.maxFloorReads(), b.maxBandwidth*1e-6, b.probesKept, b.probesFailed, b.drops, b.raises, b.drains, b.aloneCount, b.soloCount, b.gapBytes())
 }
