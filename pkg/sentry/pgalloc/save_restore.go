@@ -1629,6 +1629,10 @@ type AsyncPagesFileLoad struct {
 	bgInflight uint64
 	bgBudget   aplBackgroundBudget
 
+	// awaitedInflight is the number of awaited reads (reads of pages that had
+	// waiters when they were enqueued) in flight.
+	awaitedInflight int
+
 	// prefetch is true once the loader decided to read the working sets of
 	// the MemoryFiles first (see decidePrefetch), and prefetched is the
 	// number of bytes of background reads of working sets.
@@ -2108,11 +2112,13 @@ type aplOp struct {
 	// reference on the pages in frs that it loads, dropped after completion.
 	background bool
 
-	// issued is the value of aplNanotime() when the read was enqueued, and
+	// issued is the value of aplNanotime() when the read was enqueued,
 	// bgInflight the number of bytes of background reads in flight then, the
-	// read's own included if it is a background read.
-	issued     int64
-	bgInflight uint64
+	// read's own included if it is a background read, and awaitedInflight the
+	// number of awaited reads in flight then, the read's own excluded.
+	issued          int64
+	bgInflight      uint64
+	awaitedInflight int
 
 	// firstRound is true if the read is one of the first round (see
 	// AsyncPagesFileLoad.firstRoundReads).
@@ -2704,6 +2710,10 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 		apfl.bgInflight += op.total
 	}
 	op.bgInflight = apfl.bgInflight
+	op.awaitedInflight = apfl.awaitedInflight
+	if !op.background {
+		apfl.awaitedInflight++
+	}
 	op.firstRound = op.background && !apfl.firstRoundClosed
 	if op.firstRound {
 		if apfl.firstRoundReads == 0 {
@@ -2773,9 +2783,9 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 		}
 		if op.background != background {
 			// Awaited and background reads are accounted apart (bgInflight,
-			// the background reads' budget), and it's very unlikely that an
-			// awaited load will happen to be followed by an unawaited load at
-			// the correct offset.
+			// awaitedInflight, the floor's measures), and it's very unlikely
+			// that an awaited load will happen to be followed by an
+			// unawaited load at the correct offset.
 			return 0
 		}
 		if op.end != off {
@@ -3231,7 +3241,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 					kind = aplReadFullBackground
 				}
 			}
-			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight)
+			if !op.background {
+				apfl.awaitedInflight--
+			}
+			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight, op.awaitedInflight)
 			if op.firstRound {
 				apfl.firstRoundClosed = true
 				apfl.firstRoundDone++
