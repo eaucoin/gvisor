@@ -66,10 +66,11 @@ readonly CONF="${conf}"
 declare tmp
 tmp="$(mktemp -d)"
 readonly tmp
-# The node's /run/standby, where the standbys' shims listen, which this
-# script asks for restores through.
+# The node's /run/gvisor/standby, where the standbys' shims listen, which this
+# script asks for restores through: root's, as the shims are, and writable by
+# root alone, as they require.
 readonly SOCKETS="${tmp}/standby"
-mkdir -p "${SOCKETS}"
+sudo mkdir -m 0700 "${SOCKETS}"
 
 for f in runsc gvisor-bin containerd-shim-runsc-v1; do
   if [[ ! -e "${DIR}/${f}" ]]; then
@@ -119,7 +120,7 @@ sed "s/^grouping = .*/grouping = ${GROUPING}/" "${CONF}/config.toml" >"${tmp}/co
 
 sudo docker run --detach --name "${NODE}" --hostname "${NODE}" --privileged \
   --memory 1536m --memory-swap 1536m --tmpfs /run --tmpfs /var/run \
-  --volume "${SOCKETS}:/run/standby" \
+  --volume "${SOCKETS}:/run/gvisor/standby" \
   --volume "${CONF}/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" \
   --volume "${CONF}/config-v3.toml.tmpl:/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl:ro" \
   --volume "${tmp}/config.toml:/etc/containerd/runsc/config.toml:ro" \
@@ -319,7 +320,7 @@ for (( run = 1; run <= RUNS; run++ )); do
 
   # A standby, restored into once it runs.
   made="$(now_ms)"
-  pod "standby-${run}" "dev.gvisor.internal.restore.standby=/run/standby/standby-${run}.sock"
+  pod "standby-${run}" "dev.gvisor.internal.restore.standby=/run/gvisor/standby/standby-${run}.sock"
   running "standby-${run}"
   socket "standby-${run}"
   start="$(now_ms)"
@@ -340,7 +341,7 @@ for (( run = 1; run <= RUNS; run++ )); do
 done
 
 # Restored paused: it counts nothing until resumed.
-pod paused "dev.gvisor.internal.restore.standby=/run/standby/paused.sock"
+pod paused "dev.gvisor.internal.restore.standby=/run/gvisor/standby/paused.sock"
 running paused
 socket paused
 restore_standby paused '{"imagePath": "/checkpoints/exit", "paused": true}' >/dev/null
@@ -360,7 +361,7 @@ echo "A standby restored paused counts once resumed."
 gone paused
 
 # A standby deleted before any restore goes, its containers' exits reported.
-pod unused "dev.gvisor.internal.restore.standby=/run/standby/unused.sock"
+pod unused "dev.gvisor.internal.restore.standby=/run/gvisor/standby/unused.sock"
 running unused
 socket unused
 start="$(now_ms)"

@@ -63,8 +63,9 @@ readonly CONF="${conf}"
 declare tmp
 tmp="$(mktemp -d)"
 readonly tmp
+# The node's /run/gvisor/standby, as standby_test.sh makes it.
 readonly SOCKETS="${tmp}/standby"
-mkdir -p "${SOCKETS}"
+sudo mkdir -m 0700 "${SOCKETS}"
 
 for f in runsc gvisor-bin containerd-shim-runsc-v1; do
   if [[ ! -e "${DIR}/${f}" ]]; then
@@ -139,7 +140,7 @@ sed "s/^grouping = .*/grouping = ${GROUPING}/" "${CONF}/config.toml" >"${tmp}/co
 
 sudo docker run --detach --name "${NODE}" --hostname "${NODE}" --privileged \
   --memory 2g --memory-swap 2g --tmpfs /run --tmpfs /var/run \
-  --volume "${SOCKETS}:/run/standby" \
+  --volume "${SOCKETS}:/run/gvisor/standby" \
   --volume "${tmp}/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" \
   --volume "${CONF}/config-v3.toml.tmpl:/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl:ro" \
   --volume "${tmp}/config.toml:/etc/containerd/runsc/config.toml:ro" \
@@ -300,7 +301,7 @@ restore_standby() {
 }
 
 standby() {
-  pod "$1" "dev.gvisor.internal.restore.standby=/run/standby/$1.sock"
+  pod "$1" "dev.gvisor.internal.restore.standby=/run/gvisor/standby/$1.sock"
   running "$1"
   socket "$1"
 }
