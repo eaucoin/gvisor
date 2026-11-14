@@ -88,16 +88,16 @@ import (
 // requires of a doubling (25%, prorated for other ratios: aplFullPipeGain),
 // and probes again; otherwise it probes for half as many reads more, or,
 // after a probe for one read more failed, waits for a backoff that doubles at
-// each failure. Background bandwidth matters most while nothing waits for
-// pages, and more reads in flight may slow awaited ones on such a store, so a
-// probe only starts once no awaited read completed for a bandwidth window or
-// the minimum latency, whichever is longer, and the floor drops back to the
-// bandwidth-delay product, and probing backs off, as soon as an awaited read
-// issued while the budget was raised took aplQueueDelay longer than the
-// shortest awaited read issued while it was not, or than it would take alone
-// (the latency of the quickest read, plus its bytes at the rate of one
-// full-size read): probing must not cost page faults what the bandwidth-delay
-// product spares them.
+// each failure, up to aplMaxBackoff. Background bandwidth matters most while
+// nothing waits for pages, and more reads in flight may slow awaited ones on
+// such a store, so a probe only starts once no awaited read completed for a
+// bandwidth window or the minimum latency, whichever is longer, and the floor
+// drops back to the bandwidth-delay product, and probing backs off, as soon
+// as an awaited read issued while the budget was raised took aplQueueDelay
+// longer than the shortest awaited read issued while it was not, or than it
+// would take alone (the latency of the quickest read, plus its bytes at the
+// rate of one full-size read): probing must not cost page faults what the
+// bandwidth-delay product spares them.
 //
 // A pages file may say how many reads it serves at once, each at the rate of
 // one alone (stateio.ParallelAsyncReader), as an object store does that serves
@@ -141,7 +141,9 @@ import (
 // its queue to measure the round trip, and then returns to the floor; a drain
 // that ends, after twice the minimum latency and the time the awaited reads
 // took, with fewer than half of them issued one at a time is retried after a
-// backoff that doubles. No drain starts while less is left to load than the
+// backoff that doubles at each such drain, up to aplMaxBackoff, and starts
+// over from aplBandwidthWindows quiet periods once a drain issued enough of
+// them one at a time. No drain starts while less is left to load than the
 // pages file delivers over one: loading would end within it, at one read
 // rather than the floor's, and the floor's reads, and what they do to awaited
 // reads, with it.
@@ -185,7 +187,8 @@ import (
 // the reads it was cut from, whether for want of awaited reads with
 // background reads in flight to judge it by or for a judgement that kept it
 // lower, only after a hold of aplBandwidthWindows quiet periods, doubled at
-// each cut until a judgement keeps it there. Where awaited reads issued one at
+// each cut, up to aplMaxBackoff, until a judgement keeps it there, or at the
+// most reads it may be (below) if fewer. Where awaited reads issued one at
 // a time were slowed by more than twice aplAwaitedSlowdown against awaited
 // reads alone issued one at a time, the hold lasts until no awaited read
 // completed for aplAwaitedSamples quiet periods: from an S3 Express-like
@@ -253,6 +256,13 @@ const aplInitialReads = 4
 // aplBandwidthWindows is the number of windows over which bandwidth is
 // measured.
 const aplBandwidthWindows = 10
+
+// aplMaxBackoff is the most times its first, aplBandwidthWindows quiet periods,
+// that a backoff that doubles grows to: a pages file whose awaited reads are
+// rarely issued alone, or whose floor's reads mostly slow them, still has a
+// drain, a probe or the floor's growth tried again over a long load, and a
+// backoff doubled past the range of time.Duration does not turn negative.
+const aplMaxBackoff = 16
 
 // aplAwaitedSamples is the number of awaited reads between two judgements of
 // the floor of a pages file that serves reads in parallel, and the number of
@@ -337,8 +347,9 @@ type aplBackgroundBudget struct {
 	nextWindow    int
 	windows       int
 
-	// maxBandwidth is the most bandwidth measured over the last
-	// aplBandwidthWindows windows as each ended, in bytes per second.
+	// maxBandwidth is the most bandwidth measured over aplBandwidthWindows
+	// windows, as each window ended, since loading started, in bytes per
+	// second.
 	maxBandwidth float64
 
 	// parallel is true if the read that ended the slow start found more reads
@@ -406,7 +417,8 @@ type aplBackgroundBudget struct {
 	// none), and heldUntil the time until which the floor grows to them for
 	// want of awaited reads with background reads in flight to judge it by,
 	// or for a judgement that kept it lower. holdBackoff is the time that the
-	// next hold lasts: aplBandwidthWindows quiet periods, doubled at each.
+	// next hold lasts: aplBandwidthWindows quiet periods, doubled at each, up
+	// to aplMaxBackoff (0 for the first).
 	heldReads   uint64
 	heldUntil   int64
 	holdBackoff time.Duration
@@ -414,7 +426,8 @@ type aplBackgroundBudget struct {
 	// draining is true while the floor is held at none and the budget at one
 	// read, until drainEnd, so that awaited reads are issued alone. A drain
 	// that ends with too few of them defers the next one until nextDrain, by
-	// drainBackoff, which doubles each time.
+	// drainBackoff, which doubles each time, up to aplMaxBackoff, until a drain
+	// issues enough of them (0 for the first).
 	draining     bool
 	drainEnd     int64
 	nextDrain    int64
@@ -451,7 +464,7 @@ type aplBackgroundBudget struct {
 
 	// nextProbe is the time at or after which the next probe may start, and
 	// backoff the time that the next failure of a probe for one read more
-	// defers probing by.
+	// defers probing by, doubled at each, up to aplMaxBackoff.
 	nextProbe int64
 	backoff   time.Duration
 
@@ -550,7 +563,7 @@ func (b *aplBackgroundBudget) endStartup(now int64, latency time.Duration, reads
 	if b.parallel {
 		b.step = b.reads
 		b.nextProbe = now
-		b.backoff = aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
+		b.backoff = b.firstBackoff()
 	}
 }
 
@@ -570,7 +583,7 @@ func (b *aplBackgroundBudget) endProbe(now int64) {
 		b.nextProbe = now
 	} else {
 		b.nextProbe = now + int64(b.backoff)
-		b.backoff *= 2
+		b.backoff = b.doubled(b.backoff)
 	}
 	b.probe, b.probeFrom, b.probeSamples, b.probeBandwidth = 0, 0, 0, 0
 	b.setBandwidthDelayProduct(now)
@@ -622,7 +635,7 @@ func (b *aplBackgroundBudget) awaitedReadCompleted(now int64, n uint64, latency 
 	b.probe, b.probeFrom, b.probeSamples, b.probeBandwidth = 0, 0, 0, 0
 	b.step = 1
 	b.nextProbe = now + int64(b.backoff)
-	b.backoff *= 2
+	b.backoff = b.doubled(b.backoff)
 	b.setBandwidthDelayProduct(now)
 }
 
@@ -733,6 +746,10 @@ func (b *aplBackgroundBudget) judgeFloor(now int64) {
 		if b.floorReads >= b.heldReads {
 			// Kept where it was found too slow: no hold any more.
 			b.heldReads, b.holdBackoff = 0, 0
+		} else if b.floorReads >= b.maxFloorReads() {
+			// Kept at the most reads it may be, short of them: the next
+			// cut holds it as the first did.
+			b.holdBackoff = 0
 		}
 		b.raiseFloorReads(now)
 		return
@@ -754,7 +771,7 @@ func (b *aplBackgroundBudget) judgeFloor(now int64) {
 	}
 	b.drops++
 	if b.holdBackoff == 0 {
-		b.holdBackoff = aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
+		b.holdBackoff = b.firstBackoff()
 	}
 	b.heldReads, b.heldUntil = b.floorReads, now+int64(b.holdBackoff)
 	if !beside && len(soloLoaded) >= aplAwaitedSamples/2 && aplMedian(soloLoaded) > time.Duration(float64(alone)*(1+2*aplAwaitedSlowdown))+aplQueueDelay {
@@ -763,7 +780,7 @@ func (b *aplBackgroundBudget) judgeFloor(now int64) {
 		// again; only a pause in awaited reads does.
 		b.heldUntil = math.MaxInt64
 	}
-	b.holdBackoff *= 2
+	b.holdBackoff = b.doubled(b.holdBackoff)
 	b.setFloorReads(now, max(min(b.floorReads/2, target), 1))
 }
 
@@ -860,13 +877,29 @@ func (b *aplBackgroundBudget) endDrain(now int64) {
 	b.loadedCount, b.awaitedSince = 0, 0
 	if b.soloCount-b.soloAtDrain < aplAwaitedSamples/2 {
 		if b.drainBackoff == 0 {
-			b.drainBackoff = aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
+			b.drainBackoff = b.firstBackoff()
 		}
 		b.nextDrain = now + int64(b.drainBackoff)
-		b.drainBackoff *= 2
+		b.drainBackoff = b.doubled(b.drainBackoff)
+	} else {
+		// Enough: the next drain that measures too few defers the one
+		// after it as the first did.
+		b.drainBackoff = 0
 	}
 	b.floor = b.floorReads
 	b.setBandwidthDelayProduct(now)
+}
+
+// firstBackoff returns the first backoff of a probe that failed, a hold or a
+// drain that measured too few awaited reads alone: aplBandwidthWindows quiet
+// periods.
+func (b *aplBackgroundBudget) firstBackoff() time.Duration {
+	return aplBandwidthWindows * max(aplBandwidthWindow, b.minLatency)
+}
+
+// doubled returns backoff doubled, up to aplMaxBackoff times the first.
+func (b *aplBackgroundBudget) doubled(backoff time.Duration) time.Duration {
+	return min(2*backoff, aplMaxBackoff*b.firstBackoff())
 }
 
 // aplMedian returns the median of latencies, which it reorders; latencies
