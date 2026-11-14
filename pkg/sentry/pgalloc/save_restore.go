@@ -1732,7 +1732,7 @@ type asyncMemoryFileLoad struct {
 	done bool
 
 	// prefetch holds the ranges of the MemoryFile's working set whose pages
-	// are in this pages file, in first-touch order. The async page loader
+	// are in this pages file, in pages file order. The async page loader
 	// reads their pages that are not awaited before the other pages of the
 	// sweep. prefetch is set at most once, by MemoryFile.LoadFrom() before
 	// it sets sweep; it is protected by pf.mu.
@@ -1989,9 +1989,24 @@ func (amfl *asyncMemoryFileLoad) startSweep(extents []*pgallocpb.ExtentProto) {
 
 // setPrefetch makes the async page loader of each layer read the pages of the
 // working set ws that the layer holds, per the MemoryFile's extents, before
-// its other pages that no one waits for.
+// its other pages that no one waits for, in the order of the layer's pages
+// file.
+//
+// A working set is recorded in units of 64 KiB, in the order the application
+// first touched them, scattered across the MemoryFile. Read in that order,
+// each unit is a read of its own, which on an object store takes the store's
+// latency to a first byte: from an S3-like store, the loader read 65 MB of a
+// working set in 8 s, at 15 such reads in flight and 8 MB/s, while the rest
+// of the pages file waited. In the pages file's order, background reads read
+// on through the short gaps between them (see combine), as the sweep does, at
+// full-size reads; first-touch order matters less once the whole working set
+// loads within seconds.
 func (loads *asyncMemoryFileLoads) setPrefetch(ws *pgallocpb.WorkingSetProto, extents []*pgallocpb.ExtentProto) {
-	prefetch := make([][]memmap.FileRange, len(loads.amfls))
+	type ranged struct {
+		memmap.FileRange
+		off uint64
+	}
+	byLayer := make([][]ranged, len(loads.amfls))
 	var bytes uint64
 	for _, r := range ws.GetExtents() {
 		fr := memmap.FileRange{Start: r.GetStart(), End: r.GetEnd()}
@@ -2000,12 +2015,21 @@ func (loads *asyncMemoryFileLoads) setPrefetch(ws *pgallocpb.WorkingSetProto, ex
 		for ; i < len(extents) && extents[i].Start < fr.End; i++ {
 			e := extents[i]
 			pfr := fr.Intersect(memmap.FileRange{Start: e.Start, End: e.End})
-			if n := len(prefetch[e.Layer]); n != 0 && prefetch[e.Layer][n-1].End == pfr.Start {
-				prefetch[e.Layer][n-1].End = pfr.End
-			} else {
-				prefetch[e.Layer] = append(prefetch[e.Layer], pfr)
-			}
+			byLayer[e.Layer] = append(byLayer[e.Layer], ranged{pfr, e.Offset + (pfr.Start - e.Start)})
 			bytes += pfr.Length()
+		}
+	}
+	prefetch := make([][]memmap.FileRange, len(loads.amfls))
+	for layer, rs := range byLayer {
+		sort.Slice(rs, func(i, j int) bool { return rs[i].off < rs[j].off })
+		for j, r := range rs {
+			// Merge ranges contiguous in both the MemoryFile and the pages
+			// file, as amfl.unloaded merges their segments.
+			if n := len(prefetch[layer]); n != 0 && prefetch[layer][n-1].End == r.Start && rs[j-1].off+rs[j-1].Length() == r.off {
+				prefetch[layer][n-1].End = r.End
+				continue
+			}
+			prefetch[layer] = append(prefetch[layer], r.FileRange)
 		}
 	}
 	for i, amfl := range loads.amfls {
@@ -3203,7 +3227,7 @@ func (apfl *AsyncPagesFileLoad) decidePrefetch(bandwidth float64) {
 }
 
 // enqueuePrefetchLocked enqueues background reads of the pages of amfl's
-// working set that are not being loaded, in first-touch order, and returns
+// working set that are not being loaded, in pages file order, and returns
 // true if it could not enqueue all of them.
 //
 // Preconditions:

@@ -191,9 +191,10 @@ var testSlowDisk = testPagesFileOpts{
 }
 
 // TestAsyncLoadPrefetch checks the order in which a background restore reads
-// a MemoryFile whose image holds a working set: the set first, in its order,
-// then the rest of the pages file, unless prefetching is off or the pages file
-// loads whole too quickly for it to matter.
+// a MemoryFile whose image holds a working set: the set first, in the pages
+// file's order rather than the set's, then the rest of the pages file, unless
+// prefetching is off or the pages file loads whole too quickly for it to
+// matter.
 func TestAsyncLoadPrefetch(t *testing.T) {
 	const size = 16 << 20
 	for _, tc := range []struct {
@@ -240,13 +241,54 @@ func TestAsyncLoadPrefetch(t *testing.T) {
 			ws0, ws1 := read(set[0].Start), read(set[1].Start)
 			before := read(fr.Start + 4<<20)
 			if tc.first {
-				if ws0.submitted > ws1.submitted || ws1.submitted > before.submitted {
-					t.Errorf("reads submitted at %v (working set, at 15 MiB), %v (working set, at 12 MiB), %v (at 4 MiB): want the working set first, in its order", ws0.submitted, ws1.submitted, before.submitted)
+				if ws1.submitted > ws0.submitted || ws0.submitted > before.submitted {
+					t.Errorf("reads submitted at %v (working set, at 15 MiB), %v (working set, at 12 MiB), %v (at 4 MiB): want the working set first, in pages file order", ws0.submitted, ws1.submitted, before.submitted)
 				}
 			} else if ws0.submitted < before.submitted || ws1.submitted < before.submitted {
 				t.Errorf("reads submitted at %v (working set, at 15 MiB), %v (working set, at 12 MiB), %v (at 4 MiB): want pages file order", ws0.submitted, ws1.submitted, before.submitted)
 			}
 		})
+	}
+}
+
+// TestAsyncLoadPrefetchCoalesced checks that a working set recorded out of the
+// pages file's order is read first in full-size reads of the pages file's
+// order, not a read per unit of the set.
+func TestAsyncLoadPrefetchCoalesced(t *testing.T) {
+	const size = 16 << 20
+	fr, gens, img := loaderTestImage(t, size)
+	// The working set: 2 MiB at 8 MiB, touched from its end to its start, a
+	// unit of 64 KiB at a time.
+	const setStart, setEnd = 8 << 20, 10 << 20
+	var set []memmap.FileRange
+	for off := uint64(setEnd - 64*kib); ; off -= 64 * kib {
+		set = append(set, memmap.FileRange{fr.Start + off, fr.Start + off + 64*kib})
+		if off == setStart {
+			break
+		}
+	}
+	img.img.Proto = proto.Clone(img.img.Proto).(*pgallocpb.ImageProto)
+	img.img.Proto.WorkingSet = workingSetOf(64*kib, set...)
+	r := newTestPagesFile(t, img.pages, testSlowDisk)
+	r.useClock()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoadWithPrefetch(t, img, r, PrefetchAuto, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+	if l.apfl.prefetched != setEnd-setStart {
+		t.Fatalf("loading read %d bytes of the working set first, want all %d", l.apfl.prefetched, setEnd-setStart)
+	}
+	reads := 0
+	for _, rd := range r.readsSnapshot() {
+		if rd.off < setEnd && rd.off+int64(rd.len) > setStart {
+			reads++
+		}
+	}
+	if want := (setEnd - setStart) / testSlowDisk.maxReadBytes; reads > int(want) {
+		t.Errorf("the working set's %d units were read in %d reads, want at most %d, of %d bytes each", len(set), reads, want, testSlowDisk.maxReadBytes)
 	}
 }
 
