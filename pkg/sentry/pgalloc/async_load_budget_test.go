@@ -1003,6 +1003,130 @@ func TestBackgroundBudgetParallelReadsDrainTimeout(t *testing.T) {
 	}
 }
 
+// TestBackgroundBudgetParallelReadsDrainBackoff checks that the backoff after
+// drains that issued too few awaited reads alone doubles at each up to
+// aplMaxBackoff times the first, and starts over from the first once a drain
+// issued enough of them.
+func TestBackgroundBudgetParallelReadsDrainBackoff(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	first := aplBandwidthWindows * b.minLatency
+	loaded := func() uint64 { return reads * testBudgetRead }
+	latency := []time.Duration{100 * time.Millisecond}
+	// failDrain has a judgement of awaited reads taking latency drain once
+	// the backoff is over, and the drain end with no awaited read issued
+	// alone, and returns the backoff after it.
+	failDrain := func(latency []time.Duration) time.Duration {
+		t.Helper()
+		testAwaited(b, &now, latency, loaded, 10000, func() bool { return b.draining })
+		if !b.draining {
+			t.Fatalf("no drain at %v (next drain at %v)", time.Duration(now), time.Duration(b.nextDrain))
+		}
+		now = b.drainEnd
+		b.update(now)
+		if b.draining {
+			t.Fatalf("drain goes on past its end")
+		}
+		return time.Duration(b.nextDrain - now)
+	}
+	for i, want := range []time.Duration{1, 2, 4, 8, 16, 16, 16} {
+		if backoff := failDrain(latency); backoff != want*first {
+			t.Fatalf("backoff after %d drains that issued no awaited read alone = %v, want %v", i+1, backoff, want*first)
+		}
+	}
+	// A drain that issues enough awaited reads alone.
+	testAwaited(b, &now, latency, loaded, 10000, func() bool { return b.draining })
+	testAwaited(b, &now, latency, func() uint64 { return testBudgetRead }, aplAwaitedSamples, func() bool { return !b.draining })
+	if b.draining || b.soloCount < aplAwaitedSamples {
+		t.Fatalf("after awaited reads alone: draining %t, %d one at a time; want the drain ended by %d", b.draining, b.soloCount, aplAwaitedSamples)
+	}
+	// Long after, awaited reads three times as slow with the floor's reads in
+	// flight drain to measure them alone anew; a drain that issues none backs
+	// off as the first did.
+	now += int64(first) + 1
+	if backoff := failDrain([]time.Duration{300 * time.Millisecond}); backoff != first {
+		t.Errorf("backoff after a drain that issued no awaited read alone, following one that issued enough = %v, want %v", backoff, first)
+	}
+}
+
+// TestBackgroundBudgetParallelReadsHoldBackoff checks that the hold of a floor
+// cut again and again doubles at each cut up to aplMaxBackoff times the first.
+func TestBackgroundBudgetParallelReadsHoldBackoff(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	first := aplBandwidthWindows * b.minLatency
+	b.quickest = 40 * time.Millisecond
+	b.soloCount = aplAwaitedSamples
+	for i := range b.solo {
+		b.solo[i] = 25 * time.Millisecond
+	}
+	inflight := func() uint64 { return max(b.floor, 1) * testBudgetRead }
+	// As in TestBackgroundBudgetParallelReadsCut: 15 reads cut to 2, then 2
+	// to one, and, once each hold is over and the floor grows back to 2, to
+	// one again.
+	testAwaited(b, &now, []time.Duration{120 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+	alone := []time.Duration{40 * time.Millisecond}
+	for i, want := range []time.Duration{2, 4, 8, 16, 16, 16} {
+		testAwaited(b, &now, []time.Duration{51 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+		if hold := time.Duration(b.heldUntil - now); b.floor != 1 || hold != want*first {
+			t.Fatalf("cut %d: floor %d, held for %v; want 1, %v", i+2, b.floor, hold, want*first)
+		}
+		now = b.heldUntil
+		testAwaited(b, &now, alone, inflight, 1000, func() bool { return b.floor != 1 })
+		if b.floor != 2 {
+			t.Fatalf("floor %d after the hold, want 2", b.floor)
+		}
+	}
+}
+
+// TestBackgroundBudgetParallelReadsHoldBackoffKnee checks that a judgement
+// that keeps the floor at or above the reads that the pages file's bandwidth
+// needs in flight, fewer than those it was cut from, ends the hold's backoff:
+// the next cut holds it as the first did.
+func TestBackgroundBudgetParallelReadsHoldBackoffKnee(t *testing.T) {
+	const reads = 15
+	b := startParallelReads(t, reads)
+	now := b.windowStart
+	// As in TestBackgroundBudgetParallelReadsKnee: 4 reads deliver what 15
+	// do, which, before a drain, does not cut the floor.
+	now += int64(200 * time.Millisecond)
+	b.readCompleted(now, testBudgetRead, now-int64(200*time.Millisecond), aplReadFullBackground, testBudgetRead, 0)
+	b.update(now)
+	first := aplBandwidthWindows * b.minLatency
+	// Awaited reads of a page are judged less a page at the rate of a
+	// full-size read: 2.5 ms here, with 40 ms the quickest read. Awaited reads
+	// alone take 25 ms, measured just now.
+	b.quickest = 40 * time.Millisecond
+	b.soloCount = aplAwaitedSamples
+	for i := range b.solo {
+		b.solo[i] = 25 * time.Millisecond
+	}
+	b.aloneAt = now
+	inflight := func() uint64 { return max(b.floor, 1) * testBudgetRead }
+	// The floor's reads slow them to 38 ms, 35.5 ms judged, 34% slower beyond
+	// aplQueueDelay: it halves, held below 15 reads for a while.
+	slowed := []time.Duration{38 * time.Millisecond}
+	testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+	if b.floor != 7 || b.heldReads != reads || b.heldUntil == math.MaxInt64 || b.maxFloorReads() != 4 {
+		t.Fatalf("floor %d, held at %d until %v, %d at most; want 7, %d for a while, 4", b.floor, b.heldReads, time.Duration(b.heldUntil), b.maxFloorReads(), reads)
+	}
+	// Awaited reads within 25% of alone, 34 ms, 31.5 ms judged, keep it,
+	// above the most it may grow to.
+	b.aloneAt = now
+	testAwaited(b, &now, []time.Duration{34 * time.Millisecond}, inflight, aplAwaitedSamples, nil)
+	if b.floor != 7 || b.heldReads != reads {
+		t.Fatalf("floor %d, held at %d, after a judgement that kept it; want 7, %d", b.floor, b.heldReads, reads)
+	}
+	// Slowed again: cut, held as the first cut was.
+	b.aloneAt = now
+	testAwaited(b, &now, slowed, inflight, aplAwaitedSamples, nil)
+	if hold := time.Duration(b.heldUntil - now); b.floor >= 7 || hold != first {
+		t.Errorf("floor %d, held for %v, after a judgement kept it at the most reads it may be or more; want fewer than 7, %v", b.floor, hold, first)
+	}
+}
+
 // TestBackgroundBudgetParallelReadsNoDrainNearEnd checks that no drain starts
 // while less is left to load than the pages file delivers over the drain,
 // where loading would end within it at one read: the floor stays.
