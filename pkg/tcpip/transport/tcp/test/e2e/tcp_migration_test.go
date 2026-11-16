@@ -242,6 +242,11 @@ func TestRestoreListenWithPreexistingConnection(t *testing.T) {
 				b := c.GetPacket()
 				b.Release()
 
+				// The ACK is sent as the FIN is handled, before the endpoint
+				// moves to StateCloseWait.
+				for deadline := time.Now().Add(5 * time.Second); tcp.EndpointState(acceptedEP.State()) != tcp.StateCloseWait && time.Now().Before(deadline); {
+					time.Sleep(time.Millisecond)
+				}
 				if got, want := tcp.EndpointState(acceptedEP.State()), tcp.StateCloseWait; got != want {
 					t.Fatalf("Unexpected probe endpoint state: want %v, got %v", want, got)
 				}
@@ -355,9 +360,13 @@ func TestRestoreListenWithPreexistingConnection(t *testing.T) {
 						defer probe.Close()
 					}
 
-					// Save the stack.
+					// Save the stack, paused as the kernel pauses it to save
+					// it: the goroutine that sent the last segment the probes
+					// read may still be counting it in the stack's statistics.
 					var buf bytes.Buffer
+					c.Stack().Pause()
 					saveStats, err := state.Save(context.Background(), &buf, c.Stack())
+					c.Stack().Resume()
 					if err != nil {
 						t.Fatalf("Save failed: %v", err)
 					}
