@@ -975,8 +975,17 @@ func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 	if err := c.requireStatus("signal", Running, Paused, Stopped); err != nil {
 		return err
 	}
-	if err := c.CheckSandboxRunning(); err != nil {
-		return err
+	running, err := c.IsSandboxRunning()
+	if err != nil {
+		return fmt.Errorf("checking if sandbox is running: %w", err)
+	}
+	if !running {
+		// Every process of a Stopped container whose sandbox is gone has
+		// ended, so SIGKILL has nothing left to do.
+		if c.Status == Stopped && sig == unix.SIGKILL {
+			return nil
+		}
+		return fmt.Errorf("sandbox is not running")
 	}
 	if c.Sandbox.NoRootContainer && c.Sandbox.IsRootContainer(c.ID) {
 		return fmt.Errorf("cannot signal sandbox %q: it was booted without a root container process; use `runsc delete` to stop it", c.ID)
@@ -992,7 +1001,8 @@ func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 // container of the sandbox that is Paused is then Running, as it is once the
 // sandbox is resumed with Resume, until it is found Stopped. The root
 // container of a sandbox that cannot kill its processes itself, as one whose
-// restore is not done, is killed by destroying its sandbox.
+// restore is not done, is killed by destroying its sandbox. A container whose
+// sandbox died while it was Paused has nothing left to kill, and is Stopped.
 func (c *Container) killPaused(all bool) error {
 	resumed := false
 	// modify reloads the status, which may be stale.
@@ -1018,8 +1028,14 @@ func (c *Container) killPaused(all bool) error {
 //
 // Precondition: c's lock is held, within modify, and c is Paused.
 func (c *Container) killPausedLocked(all bool) (bool, error) {
-	if err := c.CheckSandboxRunning(); err != nil {
-		return false, err
+	running, err := c.IsSandboxRunning()
+	if err != nil {
+		return false, fmt.Errorf("checking if sandbox is running: %w", err)
+	}
+	if !running {
+		log.Warningf("Sandbox of paused container %q isn't running anymore, marking it stopped", c.ID)
+		c.changeStatus(Stopped)
+		return false, nil
 	}
 	if err := c.Sandbox.KillPaused(c.ID, all); err != nil {
 		if !c.IsSandboxRoot() {

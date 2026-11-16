@@ -2967,6 +2967,63 @@ func TestMultiContainerCheckpointRestorePausedAbandonedKill(t *testing.T) {
 	}
 }
 
+// TestMultiContainerCheckpointRestorePausedSandboxDied checks that the
+// containers of a sandbox restored paused, whose sandbox process then died,
+// are Stopped once loaded, and that SIGKILL to each of them, and destroying
+// it, succeed: for a copy loaded after the death, and for the copy that
+// restored it, still Paused.
+func TestMultiContainerCheckpointRestorePausedSandboxDied(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		loaded bool
+	}{
+		{name: "loaded", loaded: true},
+		{name: "restored"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := restorePausedSandbox(t)
+			root := ps.containers[0]
+			if err := unix.Kill(root.Sandbox.Getpid(), unix.SIGKILL); err != nil {
+				t.Fatalf("error killing the sandbox process: %v", err)
+			}
+			if err := testutil.Poll(func() error {
+				running, err := root.IsSandboxRunning()
+				if err != nil {
+					return &backoff.PermanentError{Err: err}
+				}
+				if running {
+					return fmt.Errorf("sandbox still running")
+				}
+				return nil
+			}, 10*time.Second); err != nil {
+				t.Fatalf("the killed sandbox process runs on: %v", err)
+			}
+			ps.checkStatuses(t, Stopped, Stopped, Stopped)
+
+			for i, cont := range ps.containers {
+				if tc.loaded {
+					var err error
+					cont, err = Load(ps.conf.RootDir, FullID{SandboxID: root.Sandbox.ID, ContainerID: cont.ID}, LoadOpts{Exact: true})
+					if err != nil {
+						t.Fatalf("error loading container %d: %v", i, err)
+					}
+				} else if got, want := cont.Status, Paused; got != want {
+					t.Fatalf("container %d's status as restored: got %v, want %v", i, got, want)
+				}
+				if err := cont.SignalContainer(unix.SIGKILL, false); err != nil {
+					t.Errorf("error killing container %d of a dead sandbox: %v", i, err)
+				}
+				if got, want := cont.Status, Stopped; got != want {
+					t.Errorf("container %d's status after SIGKILL: got %v, want %v", i, got, want)
+				}
+				if err := cont.Destroy(); err != nil {
+					t.Errorf("error destroying container %d of a dead sandbox: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
 // sandboxExits waits for the sandbox process pid to exit, for at most timeout.
 func sandboxExits(pid int, timeout time.Duration) error {
 	exited := make(chan error, 1)

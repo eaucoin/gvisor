@@ -93,14 +93,25 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 	}
 
 	if !opts.SkipCheck {
-		// If the status is "Running" or "Created", check that the sandbox/container
-		// is still running, setting it to Stopped if not.
+		// If the status is "Running", "Created" or "Paused", check that the
+		// sandbox/container is still running, setting it to Stopped if not.
 		//
 		// This is inherently racy.
 		switch c.Status {
 		case Created, Running:
 			if err := c.CheckStopped(); err != nil {
 				return nil, fmt.Errorf("checking if container is stopped: %w", err)
+			}
+		case Paused:
+			// A Paused container's processes run nothing, and so end only
+			// with its sandbox.
+			running, err := c.IsSandboxRunning()
+			if err != nil {
+				return nil, fmt.Errorf("checking if sandbox %v is running: %w", c.Sandbox.ID, err)
+			}
+			if !running {
+				log.Warningf("Sandbox isn't running anymore, marking paused container %v as stopped", c.ID)
+				c.changeStatus(Stopped)
 			}
 		}
 	}
