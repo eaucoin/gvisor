@@ -2423,6 +2423,46 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 	return waited, err
 }
 
+// IsLoaded returns true if no page of fr remains to be loaded asynchronously,
+// so that accessing fr through MapInternal or DataFD waits for no load. Pages
+// whose loading has failed permanently are never loaded.
+func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
+	loads := f.asyncPageLoad.Load()
+	if loads == nil {
+		return true
+	}
+	fr.Start = hostarch.PageRoundDown(fr.Start)
+	fr.End = hostarch.MustPageRoundUp(fr.End)
+	for _, amfl := range loads.amfls {
+		// Lockless fast path:
+		if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		loaded := amfl.unloaded.IsEmptyRange(fr)
+		amfl.pf.mu.Unlock()
+		if !loaded {
+			return false
+		}
+	}
+	return true
+}
+
+// AwaitLoad blocks until every page of fr has been loaded, or until the await
+// of the calling goroutine is cut short (CancelAwaits), in which case it
+// returns linuxerr.EINTR. It returns an error if pages of fr will never be
+// loaded. A caller that must not wait for pages while holding its own locks
+// waits for them with AwaitLoad first, then accesses them without waiting.
+//
+// Preconditions: The caller must hold a reference on every page of fr that
+// remains to be loaded, for as long as AwaitLoad waits.
+func (f *MemoryFile) AwaitLoad(fr memmap.FileRange) error {
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		return loads.awaitLoad(fr)
+	}
+	return nil
+}
+
 // awaitLoad blocks until data has been loaded for all pages in fr, or until
 // the await of the calling goroutine is cut short (CancelAwaits), in which case
 // it returns linuxerr.EINTR.
