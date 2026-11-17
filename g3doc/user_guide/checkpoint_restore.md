@@ -159,7 +159,9 @@ instead.
 If the application accesses a memory page that has not yet been restored, gVisor
 prioritizes loading that page immediately to unblock the application thread.
 This can dramatically reduce the "Time to First Instruction" for large
-applications.
+applications. The thread's page fault waits for the page without holding the
+locks of the application's memory, as Linux's does, so the application's other
+threads go on running and faulting on pages of their own meanwhile.
 
 A page the application touches waits for its own read, not for the background
 reads already under way. gVisor maps memory that is still loading 64 KiB at a
