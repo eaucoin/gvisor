@@ -60,21 +60,13 @@ const asyncLoadMapUnit = 32 << 20
 // moderate.
 const asyncLoadingMapUnit = 64 << 10
 
-// mapASLocked maps addresses in ar into mm.as.
+// mapRangeLocked returns the range that mapASLocked maps to map ar, of which
+// it maps the part that pmas from pseg up to ar.End hold.
 //
-// Preconditions:
-//   - ar.Length() != 0.
-//   - ar must be page-aligned.
-//   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
+// Preconditions: As for mapASLocked.
 //
 // +checklocksread:mm.activeMu
-func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
-	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
-		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
-		// via platform.AddressSpace.MapFile() for now, since holding locks
-		// while doing so causes problems.
-		platformEffect = memmap.PlatformEffectPopulate
-	}
+func (mm *MemoryManager) mapRangeLocked(pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) hostarch.AddrRange {
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
 	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
@@ -122,6 +114,25 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			panic(fmt.Sprintf("mapAR %#v is not a superset of ar %#v", mapAR, ar))
 		}
 	}
+	return mapAR
+}
+
+// mapASLocked maps addresses in ar into mm.as.
+//
+// Preconditions:
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
+//   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
+		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
+		// via platform.AddressSpace.MapFile() for now, since holding locks
+		// while doing so causes problems.
+		platformEffect = memmap.PlatformEffectPopulate
+	}
+	mapAR := mm.mapRangeLocked(pseg, ar, platformEffect)
 
 	// Since this checks ar.End and not mapAR.End, we will never map a pma that
 	// is not required.
@@ -164,6 +175,46 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		pseg = pseg.NextSegment()
 	}
 	return nil
+}
+
+// unloadedFaultRangeLocked returns the MemoryFile and the range of it that
+// mapASLocked would wait to be loaded, asynchronously from a checkpoint,
+// before it maps the faulting page ar on an application fault; or a nil
+// MemoryFile if mapASLocked would wait for no page. It takes a reference on
+// the range returned for the caller, which must drop it with DecRef, so that
+// the caller may wait for the range to be loaded once it has unlocked
+// mm.activeMu: the mm's other tasks may then unmap the pages or copy them
+// away, but the pages are not freed until the caller's wait has ended (the
+// precondition of pgalloc.MemoryFile.AwaitLoad).
+//
+// Preconditions:
+//   - ar is the page of an application fault.
+//   - pseg == mm.pmas.LowerBoundSegment(ar.Start), and its pma holds ar.
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) unloadedFaultRangeLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange) (*pgalloc.MemoryFile, memmap.FileRange) {
+	pma := pseg.ValuePtr()
+	mf, ok := pma.file.(*pgalloc.MemoryFile)
+	if !ok || !mf.IsAsyncLoading() {
+		return nil, memmap.FileRange{}
+	}
+	perms := pma.effectivePerms
+	if pma.needCOW {
+		perms.Write = false
+	}
+	if !perms.Any() {
+		// mapASLocked maps nothing.
+		return nil, memmap.FileRange{}
+	}
+	fr := pseg.fileRangeOf(pseg.Range().Intersect(mm.mapRangeLocked(pseg, ar, memmap.PlatformEffectDefault)))
+	if mf.IsLoaded(fr) {
+		return nil, memmap.FileRange{}
+	}
+	// Record the touch as mapASLocked would have before waiting, so that the
+	// working set keeps the order in which the application first touched it.
+	mf.RecordTouch(fr)
+	mf.IncRef(fr, pgalloc.MemoryCgroupIDFromContext(ctx))
+	return mf, fr
 }
 
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
