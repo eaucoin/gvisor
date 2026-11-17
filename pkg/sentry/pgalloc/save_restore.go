@@ -2058,10 +2058,10 @@ type aplOp struct {
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
 
-	// If tempRef is true, a temporary reference is held on pages in frs that
-	// should be dropped after completion. This is the case for background
-	// reads, of pages that had no waiters when the read was enqueued.
-	tempRef bool
+	// background is true for background reads, of pages that had no waiters
+	// when the read was enqueued, and false for awaited reads. Either holds a
+	// reference on the pages in frs that it loads, dropped after completion.
+	background bool
 
 	// issued is the value of aplNanotime() when the read was enqueued, and
 	// bgInflight the number of bytes of background reads in flight then, the
@@ -2461,11 +2461,11 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	apfl.qavail--
 	apfl.curOp = nil
 	op.issued = aplNanotime()
-	if op.tempRef {
+	if op.background {
 		apfl.bgInflight += op.total
 	}
 	op.bgInflight = apfl.bgInflight
-	op.firstRound = op.tempRef && !apfl.firstRoundClosed
+	op.firstRound = op.background && !apfl.firstRoundClosed
 	if op.firstRound {
 		if apfl.firstRoundReads == 0 {
 			apfl.firstRoundStart = op.issued
@@ -2479,7 +2479,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
 	}
-	if logAwaitedLoads && !op.tempRef {
+	if logAwaitedLoads && !op.background {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}
 }
@@ -2488,10 +2488,10 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, background bool) uint64 {
 	for {
 		if apfl.curOp == nil {
-			if tempRef && !apfl.mayStartBackgroundRead() {
+			if background && !apfl.mayStartBackgroundRead() {
 				return 0
 			}
 			id, err := apfl.opsBusy.FirstZero(0)
@@ -2506,7 +2506,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
-		n := apfl.combine(amfl, fr, off, tempRef)
+		n := apfl.combine(amfl, fr, off, background)
 		if n > 0 {
 			return n
 		}
@@ -2524,7 +2524,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 // Preconditions:
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, background bool) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
 		if op.end != off {
@@ -2540,11 +2540,11 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			// FileRanges.
 			return 0
 		}
-		if op.tempRef != tempRef {
-			// Incompatible reference-counting semantics. We could handle this
-			// by making tempRef per-FileRange, but it's very unlikely that an
-			// awaited load (tempRef=false) will happen to be followed by an
-			// unawaited load (tempRef=true) at the correct offset.
+		if op.background != background {
+			// Awaited and background reads are accounted apart (bgInflight,
+			// the background reads' budget), and it's very unlikely that an
+			// awaited load will happen to be followed by an unawaited load at
+			// the correct offset.
 			return 0
 		}
 	}
@@ -2590,7 +2590,7 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	}
 	op.end += n
 	op.total += n
-	op.tempRef = tempRef
+	op.background = background
 	if len(op.frs) > 0 && op.frs[len(op.frs)-1].End == fr.Start {
 		op.frs[len(op.frs)-1].End = fr.End
 	} else {
@@ -2712,51 +2712,71 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
 		}
-		// Prioritize reading pages with waiters.
-		apfl.mu.Lock()
-		for apfl.canEnqueue() && !apfl.priority.Empty() {
-			fr := apfl.priority.PopFront()
-			// All pages in apfl.priority have non-zero waiters and were split
-			// around fr by fr.amfl.awaitLoad(), and fr.amfl.unloaded never
-			// merges segments with waiters. Thus, we don't need to split
-			// around fr again, and fr.Intersect(ulseg.Range()) ==
-			// ulseg.Range(). Pages decommitted since were removed from
-			// fr.amfl.unloaded (cancelDecommittedLoad).
-			ulseg := fr.amfl.unloaded.LowerBoundSegment(fr.Start)
-			for ulseg.Ok() && ulseg.Start() < fr.End {
-				ul := ulseg.ValuePtr()
-				ulFR := ulseg.Range()
-				if ul.started {
-					fr.Start = ulFR.End
-					ulseg = ulseg.NextSegment()
-					continue
-				}
-				// Awaited pages are guaranteed to have a reference held (by
-				// fr.amfl.awaitLoad() precondition), so they can't become
-				// waste (which would allow them to be racily released or
-				// recycled).
-				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */)
-				if n == 0 {
-					// Try again in the next iteration of the main loop, when
-					// we have space in the queue again.
-					apfl.priority.PushFront(fr)
-					break
-				}
-				ulFR.End = ulFR.Start + n
-				ulseg = fr.amfl.unloaded.SplitAfter(ulseg, ulFR.End)
-				ulseg.ValuePtr().started = true
-				fr.Start = ulFR.End
-				if fr.Length() > 0 {
-					// Cycle the rest of fr to the end of apl.priority. This
-					// prevents large awaited reads from starving other
-					// waiters.
-					apfl.priority.PushBack(fr)
-					break
-				}
-				ulseg = ulseg.NextSegment()
+		// Prioritize reading pages with waiters. As for pages without waiters
+		// below, a reference is taken on the pages each read loads, and
+		// dropped once it completes: a waiter holds a reference on the pages
+		// it awaits only until it stops waiting, which it may do before they
+		// are loaded, cut short (CancelAwaits), and the pages must not become
+		// waste while they are read into (which would allow them to be racily
+		// released or recycled). This takes f.mu of the MemoryFile that the
+		// pages at the front of apfl.priority belong to before apfl.mu, as
+		// lock order requires, for as long as the front's pages are its.
+		for apfl.canEnqueue() {
+			apfl.mu.Lock()
+			if apfl.priority.Empty() {
+				apfl.mu.Unlock()
+				break
 			}
+			amfl := apfl.priority.PeekFront().amfl
+			apfl.mu.Unlock()
+			amfl.f.mu.Lock()
+			apfl.mu.Lock()
+			for apfl.canEnqueue() && !apfl.priority.Empty() && apfl.priority.PeekFront().amfl == amfl {
+				fr := apfl.priority.PopFront()
+				// All pages in apfl.priority had non-zero waiters when they
+				// were added, and were split around fr by
+				// fr.amfl.awaitLoad(), and fr.amfl.unloaded never merges
+				// segments with waiters. Thus, we don't need to split around
+				// fr again, and fr.Intersect(ulseg.Range()) ==
+				// ulseg.Range(). Pages whose waiters were cut short since may
+				// have become waste, and pages may have been decommitted,
+				// either of which removed them from fr.amfl.unloaded; those
+				// that remain there have references, since amfl.f.mu is
+				// locked.
+				ulseg := fr.amfl.unloaded.LowerBoundSegment(fr.Start)
+				for ulseg.Ok() && ulseg.Start() < fr.End {
+					ul := ulseg.ValuePtr()
+					ulFR := ulseg.Range()
+					if ul.started {
+						fr.Start = ulFR.End
+						ulseg = ulseg.NextSegment()
+						continue
+					}
+					n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* background */)
+					if n == 0 {
+						// Try again in the next iteration of the main loop,
+						// when we have space in the queue again.
+						apfl.priority.PushFront(fr)
+						break
+					}
+					ulFR.End = ulFR.Start + n
+					ulseg = fr.amfl.unloaded.SplitAfter(ulseg, ulFR.End)
+					ulseg.ValuePtr().started = true
+					amfl.f.incRefLocked(ulFR)
+					fr.Start = ulFR.End
+					if fr.Length() > 0 {
+						// Cycle the rest of fr to the end of apl.priority.
+						// This prevents large awaited reads from starving
+						// other waiters.
+						apfl.priority.PushBack(fr)
+						break
+					}
+					ulseg = ulseg.NextSegment()
+				}
+			}
+			apfl.mu.Unlock()
+			amfl.f.mu.Unlock()
 		}
-		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
 		throttled := apfl.throttled.Load()
 		if apfl.canEnqueue() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
@@ -2792,9 +2812,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 						var n uint64
 						if throttled && apfl.curOp != nil {
 							// Only extend the single throttled read.
-							n = apfl.combine(amfl, ulFR, ul.off, true /* tempRef */)
+							n = apfl.combine(amfl, ulFR, ul.off, true /* background */)
 						} else {
-							n = apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+							n = apfl.enqueueRange(amfl, ulFR, ul.off, true /* background */)
 						}
 						if n == 0 {
 							full = true
@@ -2882,7 +2902,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
 			kind := aplReadAwaited
-			if op.tempRef {
+			if op.background {
 				kind = aplReadBackground
 				if op.total == apfl.maxReadBytes {
 					kind = aplReadFullBackground
@@ -2894,15 +2914,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 				apfl.firstRoundDone++
 				apfl.firstRoundBytes += c.N
 			}
-			if op.tempRef {
+			if op.background {
 				apfl.bgInflight -= op.total
-				// Delay f.DecRef(fr) until after dropping locks. This is
-				// required to avoid lock recursion via dropping the last
-				// reference => asyncMemoryFileLoad.cancelWasteLoad() =>
-				// apfl.mu.Lock().
-				for _, fr := range op.frs {
-					decRefs = append(decRefs, aplFileRange{op.amfl, fr})
-				}
+			}
+			// Delay f.DecRef(fr) until after dropping locks. This is required
+			// to avoid lock recursion via dropping the last reference =>
+			// asyncMemoryFileLoad.cancelWasteLoad() => apfl.mu.Lock().
+			for _, fr := range op.frs {
+				decRefs = append(decRefs, aplFileRange{op.amfl, fr})
 			}
 			if failed {
 				continue
@@ -3031,7 +3050,7 @@ func (apfl *AsyncPagesFileLoad) enqueuePrefetchLocked(amfl *asyncMemoryFileLoad)
 			ulFR := ulseg.Range().Intersect(pfr)
 			ulseg = amfl.unloaded.Isolate(ulseg, ulFR)
 			// As in the sweep, take page references during reading.
-			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* tempRef */)
+			n := apfl.enqueueRange(amfl, ulFR, ulseg.ValuePtr().off, true /* background */)
 			if n == 0 {
 				return true
 			}
