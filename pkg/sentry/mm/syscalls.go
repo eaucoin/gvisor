@@ -28,8 +28,22 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
+// maxFaultLoadWaits is the number of times HandleUserFault waits for the
+// pages of a fault to be loaded without holding mm's locks before it handles
+// the fault again. A fault that would wait once more waits holding activeMu
+// for reading, as other accesses to pages being loaded do, so that it ends
+// even if its pages are replaced by others not loaded yet each time it waits.
+const maxFaultLoadWaits = 3
+
 // HandleUserFault handles an application page fault. sp is the faulting
 // application thread's stack pointer.
+//
+// While mm's memory is loaded asynchronously from a checkpoint, a fault whose
+// pages are not loaded yet waits for them without holding mm's locks, so that
+// mm's other tasks can fault and access memory meanwhile, and then handles
+// the fault again from the start, as Linux retries a fault that waited for a
+// page's I/O without holding the mmap lock (VM_FAULT_RETRY). Like that wait,
+// it ends early only when the task is killed.
 //
 // Preconditions: mm.as != nil.
 //
@@ -42,36 +56,60 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		return linuxerr.EFAULT
 	}
 
-	// Don't bother trying existingPMAsLocked; in most cases, if we did have
-	// existing pmas, we wouldn't have faulted.
+	for waits := 0; ; waits++ {
+		// Don't bother trying existingPMAsLocked; in most cases, if we did
+		// have existing pmas, we wouldn't have faulted.
 
-	// Ensure that we have a usable vma. Here and below, since we are only
-	// asking for a single page, there is no possibility of partial success,
-	// and any error is immediately fatal.
-	mm.mappingMu.RLock()
-	vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
-	if err != nil {
+		// Ensure that we have a usable vma. Here and below, since we are only
+		// asking for a single page, there is no possibility of partial
+		// success, and any error is immediately fatal.
+		mm.mappingMu.RLock()
+		vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
+		if err != nil {
+			mm.mappingMu.RUnlock()
+			return err
+		}
+
+		// Ensure that we have a usable pma.
+		mm.activeMu.Lock()
+		pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
 		mm.mappingMu.RUnlock()
+		if err != nil {
+			mm.activeMu.Unlock()
+			return err
+		}
+
+		// Downgrade to a read-lock on activeMu since we don't need to mutate
+		// pmas anymore.
+		mm.activeMu.DowngradeLock()
+
+		if waits < maxFaultLoadWaits {
+			if mf, fr := mm.unloadedFaultRangeLocked(ctx, pseg, ar); mf != nil {
+				// Wait for the pages to be loaded unlocked, holding the
+				// reference unloadedFaultRangeLocked took on them. pseg and
+				// vseg are invalid once activeMu is unlocked: the fault is
+				// handled again from the start.
+				mm.activeMu.RUnlock()
+				err := mf.AwaitLoad(fr)
+				mf.DecRef(fr)
+				if err == linuxerr.EINTR {
+					// The task was killed.
+					return err
+				}
+				if err != nil {
+					// Some of the pages will never be loaded: let mapASLocked
+					// fail as it does for them, if the fault still maps them.
+					waits = maxFaultLoadWaits
+				}
+				continue
+			}
+		}
+
+		// Map the faulted page into the active AddressSpace.
+		err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+		mm.activeMu.RUnlock()
 		return err
 	}
-
-	// Ensure that we have a usable pma.
-	mm.activeMu.Lock()
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
-	mm.mappingMu.RUnlock()
-	if err != nil {
-		mm.activeMu.Unlock()
-		return err
-	}
-
-	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
-	// anymore.
-	mm.activeMu.DowngradeLock()
-
-	// Map the faulted page into the active AddressSpace.
-	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
-	mm.activeMu.RUnlock()
-	return err
 }
 
 // MMap establishes a memory mapping.

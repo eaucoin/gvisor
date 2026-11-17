@@ -186,6 +186,7 @@ go_test(
     srcs = [
         "address_space_test.go",
         "dirty_test.go",
+        "fault_test.go",
         "mm_test.go",
     ],
     embed = [":mm"],
@@ -193,6 +194,7 @@ go_test(
         "//pkg/context",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
+        "//pkg/goid",
         "//pkg/hostarch",
         "//pkg/memutil",
         "//pkg/safemem",
