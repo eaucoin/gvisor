@@ -1088,7 +1088,9 @@ func tryPopulate(b safemem.Block) bool {
 	return tryPopulateMlock(b)
 }
 
-// Decommit uncommits the given pages, causing them to become zeroed.
+// Decommit uncommits the given pages, causing them to become zeroed. Pages
+// that a background restore has not loaded yet are not loaded anymore, so that
+// they stay zeroed.
 //
 // Preconditions:
 //   - fr.Start and fr.End must be page-aligned.
@@ -1099,6 +1101,9 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		loads.cancelDecommittedLoad(fr)
+	}
 	f.decommitOrManuallyZero(fr)
 
 	f.mu.Lock()
@@ -1148,6 +1153,12 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
+	f.zeroFile(fr)
+}
+
+// zeroFile zeroes the pages of fr, decommitting them if it can. It takes no
+// lock.
+func (f *MemoryFile) zeroFile(fr memmap.FileRange) {
 	if err := f.decommitFile(fr); err != nil {
 		log.Warningf("Failed to decommit %v: %v", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
