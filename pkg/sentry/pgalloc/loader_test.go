@@ -704,6 +704,113 @@ func TestAsyncLoadAwaitCanceledPagesFreed(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// checkReleased checks that no page of f is used: every reference taken on its
+// pages has been dropped.
+func checkReleased(t *testing.T, f *MemoryFile) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for seg := f.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		if !seg.ValuePtr().wasteOrReleasing {
+			t.Errorf("pages %v are still used", seg.Range())
+		}
+	}
+}
+
+// TestAsyncLoadAwaitCanceledPagesFreedReadFails checks that the read of pages
+// whose await was cut short, and which their process freed, may fail: loading
+// ends with the error, and the pages are released once the read's reference on
+// them is dropped, as pages that will never be loaded, rather than while they
+// are still recorded as being read into, which panicked ("becoming waste during
+// inflight read").
+func TestAsyncLoadAwaitCanceledPagesFreedReadFails(t *testing.T) {
+	f := newTestMemoryFile(t, testMemoryFileOpts{})
+	kept := allocate(t, f, 8*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	freed := allocate(t, f, 8*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	t.Cleanup(func() {
+		f.DecRef(kept)
+		f.DecRef(freed)
+	})
+	gens := make(pageGens)
+	gens.write(t, f, kept, 1)
+	gens.write(t, f, freed, 1)
+	img := saveImage(t, SaveOpts{}, f)
+
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	// The read of the awaited page fails.
+	awaited := memmap.FileRange{Start: freed.Start + 4*hostarch.PageSize, End: freed.Start + 5*hostarch.PageSize}
+	r.failAt(int64(awaited.Start - kept.Start))
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	// A background read of the first page, and the slot left to awaited
+	// reads.
+	r.waitInflight(1)
+
+	// A goroutine awaits a page of freed; its read is in flight when its
+	// await is cut short.
+	gid := make(chan int64, 1)
+	result := make(chan error, 1)
+	go func() {
+		gid <- goid.Get()
+		_, err := restored.MapInternal(awaited, hostarch.Read)
+		result <- err
+	}()
+	g := <-gid
+	waitForWaiters(t, l.apfl, 1)
+	r.waitInflight(2)
+	CancelAwaits(g)
+	defer ForgetCanceledAwaits(g)
+	if err := receive(t, result, "the await cut short"); err != linuxerr.EINTR {
+		t.Errorf("await cut short: got %v, want EINTR", err)
+	}
+
+	// Its process frees the pages, their read still in flight; then the
+	// reads complete, the awaited one failing.
+	restored.DecRef(freed)
+	r.finish()
+	if err := l.wait(t); err != linuxerr.EIO {
+		t.Fatalf("async page loading: got %v, want EIO", err)
+	}
+	restored.DecRef(kept)
+	checkInvariants(t, restored)
+	checkReleased(t, restored)
+}
+
+// TestAsyncLoadWaitErrorDropsReadReferences checks that when waiting for reads
+// fails, which ends loading with the reads in flight stopped, the references
+// those reads hold on their pages are dropped, so that pages freed while they
+// were read into are released.
+func TestAsyncLoadWaitErrorDropsReadReferences(t *testing.T) {
+	fr, _, img := loaderTestImage(t, 16*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	// A background read of the first page is in flight when the application
+	// frees all of its pages.
+	r.waitInflight(1)
+	restored.DecRef(fr)
+
+	// Closing the pages file fails the loader's wait for its read.
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := l.wait(t); err != linuxerr.EIO {
+		t.Fatalf("async page loading: got %v, want EIO", err)
+	}
+	checkInvariants(t, restored)
+	checkReleased(t, restored)
+}
+
 // TestAsyncLoadErrorWakesLoadedWaiters checks that when a read fails, the
 // waiters for pages loaded by reads completed in the same batch are woken.
 func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
