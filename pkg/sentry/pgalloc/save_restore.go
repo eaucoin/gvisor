@@ -2777,6 +2777,20 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 }
 
 func (apfl *AsyncPagesFileLoad) main() {
+	// Storage reused between main loop iterations:
+	var completions []stateio.Completion
+	var wakeups []*aplWaiter
+	var decRefs []aplFileRange
+
+	dropDelayedDecRefs := func() {
+		if len(decRefs) != 0 {
+			for _, fr := range decRefs {
+				fr.amfl.f.DecRef(fr.FileRange)
+			}
+			decRefs = decRefs[:0]
+		}
+	}
+
 	defer func() {
 		// Close ar first since this synchronously stops inflight I/O.
 		if err := apfl.ar.Close(); err != nil {
@@ -2823,6 +2837,19 @@ func (apfl *AsyncPagesFileLoad) main() {
 		asyncLoadWaitNanoseconds.IncrementBy(uint64(apfl.durWaitedTotal.Nanoseconds()))
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
+		// Drop the references of the reads that loading ends with: those of
+		// the completions processed last, among them a failed read's, and
+		// those of the reads that ar.Close() stopped in flight. Only now that
+		// their pages are no longer started may they become waste, as
+		// dropping the last reference on them makes them (cancelWasteLoad).
+		apfl.opsBusy.ForEach(0, uint32(len(apfl.ops)), func(id uint32) bool {
+			op := &apfl.ops[id]
+			for _, fr := range op.frs {
+				decRefs = append(decRefs, aplFileRange{op.amfl, fr})
+			}
+			return true
+		})
+		dropDelayedDecRefs()
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
@@ -2831,20 +2858,6 @@ func (apfl *AsyncPagesFileLoad) main() {
 	maxParallel := apfl.ar.MaxParallel()
 	// prefetchDecided is true once decidePrefetch was called.
 	prefetchDecided := false
-	// Storage reused between main loop iterations:
-	var completions []stateio.Completion
-	var wakeups []*aplWaiter
-	var decRefs []aplFileRange
-
-	dropDelayedDecRefs := func() {
-		if len(decRefs) != 0 {
-			for _, fr := range decRefs {
-				fr.amfl.f.DecRef(fr.FileRange)
-			}
-			decRefs = decRefs[:0]
-		}
-	}
-	defer dropDelayedDecRefs()
 
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
@@ -3118,10 +3131,12 @@ func (apfl *AsyncPagesFileLoad) main() {
 			if c.N != op.total {
 				log.Warningf("Async page loading failed: read for MemoryFile(%p) pages %v (total %d bytes) returned %d bytes, error: %v", op.amfl.f, op.frs, op.total, c.N, c.Err)
 				apfl.errVal.Store(linuxerr.EIO)
-				// Still release the references of the other completions,
-				// and wake the waiters of those already processed: their
-				// pages are loaded and no longer in unloaded, where the
-				// deferred cleanup finds the waiters to wake.
+				// Still release the references of the other completions
+				// (the deferred cleanup drops them, once their pages are
+				// no longer started), and wake the waiters of those already
+				// processed: their pages are loaded and no longer in
+				// unloaded, where the deferred cleanup finds the waiters to
+				// wake.
 				failed = true
 				continue
 			}
