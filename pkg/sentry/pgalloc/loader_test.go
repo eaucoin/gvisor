@@ -699,6 +699,67 @@ func TestAsyncLoadAwaitCanceled(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// TestAsyncLoadAwaitCanceledPagesFreed checks that the pages a goroutine
+// awaits can be freed once its await is cut short while their read is in
+// flight, as a killed task's process frees its memory as it exits: the read
+// holds its own reference on them until it completes, so that they do not
+// become waste while they are read into.
+func TestAsyncLoadAwaitCanceledPagesFreed(t *testing.T) {
+	f := newTestMemoryFile(t, testMemoryFileOpts{})
+	kept := allocate(t, f, 8*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	freed := allocate(t, f, 8*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	t.Cleanup(func() {
+		f.DecRef(kept)
+		f.DecRef(freed)
+	})
+	gens := make(pageGens)
+	gens.write(t, f, kept, 1)
+	gens.write(t, f, freed, 1)
+	img := saveImage(t, SaveOpts{}, f)
+
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  2,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	// A background read of the first page, and the slot left to awaited
+	// reads.
+	r.waitInflight(1)
+
+	// A goroutine awaits a page of freed; its read is in flight when its
+	// await is cut short.
+	awaited := memmap.FileRange{Start: freed.Start + 4*hostarch.PageSize, End: freed.Start + 5*hostarch.PageSize}
+	gid := make(chan int64, 1)
+	result := make(chan error, 1)
+	go func() {
+		gid <- goid.Get()
+		_, err := restored.MapInternal(awaited, hostarch.Read)
+		result <- err
+	}()
+	g := <-gid
+	waitForWaiters(t, l.apfl, 1)
+	r.waitInflight(2)
+	CancelAwaits(g)
+	defer ForgetCanceledAwaits(g)
+	if err := receive(t, result, "the await cut short"); err != linuxerr.EINTR {
+		t.Errorf("await cut short: got %v, want EINTR", err)
+	}
+
+	// Its process frees the pages, their read still in flight; then the
+	// reads complete.
+	restored.DecRef(freed)
+	r.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	gens.checkPages(t, restored, kept)
+	restored.DecRef(kept)
+	checkInvariants(t, restored)
+}
+
 // TestAsyncLoadErrorWakesLoadedWaiters checks that when a read fails, the
 // waiters for pages loaded by reads completed in the same batch are woken.
 func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
