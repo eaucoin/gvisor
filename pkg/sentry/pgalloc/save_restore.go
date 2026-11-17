@@ -1754,6 +1754,11 @@ type aplUnloadedInfo struct {
 	// started is true if a read has been enqueued for these pages.
 	started bool
 
+	// decommitted is true if the pages were decommitted while their read was
+	// in flight (see cancelDecommittedLoad): the loader decommits them again
+	// once the read has written them, before it reports them loaded.
+	decommitted bool
+
 	// waiters queues goroutines waiting for these pages to be loaded.
 	waiters []*aplWaiter
 }
@@ -2306,7 +2311,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// around fr by fr.amfl.awaitLoad(), and fr.amfl.unloaded never
 			// merges segments with waiters. Thus, we don't need to split
 			// around fr again, and fr.Intersect(ulseg.Range()) ==
-			// ulseg.Range().
+			// ulseg.Range(). Pages decommitted since were removed from
+			// fr.amfl.unloaded (cancelDecommittedLoad).
 			ulseg := fr.amfl.unloaded.LowerBoundSegment(fr.Start)
 			for ulseg.Ok() && ulseg.Start() < fr.End {
 				ul := ulseg.ValuePtr()
@@ -2508,6 +2514,12 @@ func (apfl *AsyncPagesFileLoad) main() {
 					if !ul.started {
 						panic(fmt.Sprintf("MemoryFile(%p): completion of %v includes pages %v that were never started", amfl.f, fr, ulseg.Range()))
 					}
+					if ul.decommitted {
+						// The read wrote pages decommitted while it was in
+						// flight; they must read as zeros, as they did after
+						// the decommit, before anyone can find them loaded.
+						amfl.f.zeroFile(ulseg.Range())
+					}
 					for _, w := range ul.waiters {
 						haveWaiters = true
 						w.pending -= ullen
@@ -2593,6 +2605,66 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 	})
 }
 
+// cancelDecommittedLoad cancels loading of the pages of fr, which are being
+// decommitted (MemoryFile.Decommit), so that they read as zeros from then on
+// rather than as the data that loading would write over them: pages whose
+// read has not started are no longer loaded, their waiters woken as their
+// read's completion would wake them, and pages whose read is in flight are
+// decommitted again by the loader as the read completes.
+//
+// Preconditions:
+// - At least one reference must be held on all pages in fr.
+// - fr must be page-aligned.
+func (loads *asyncMemoryFileLoads) cancelDecommittedLoad(fr memmap.FileRange) {
+	for _, amfl := range loads.amfls {
+		if amfl != nil {
+			amfl.cancelDecommittedLoad(fr)
+		}
+	}
+}
+
+// Preconditions: As for asyncMemoryFileLoads.cancelDecommittedLoad.
+func (amfl *asyncMemoryFileLoad) cancelDecommittedLoad(fr memmap.FileRange) {
+	// Lockless fast path:
+	if fr.End <= amfl.minUnloaded.Load() {
+		return
+	}
+
+	apfl := amfl.pf
+	var wakeups []*aplWaiter
+	apfl.mu.Lock()
+	now := aplNanotime()
+	for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; {
+		ulseg = amfl.unloaded.Isolate(ulseg, fr)
+		ul := ulseg.ValuePtr()
+		if ul.started {
+			// The completion of the read finds every segment of the
+			// ranges it reads, whether or not they were split since.
+			ul.decommitted = true
+			ulseg = ulseg.NextSegment()
+			continue
+		}
+		ullen := ulseg.Range().Length()
+		for _, w := range ul.waiters {
+			w.pending -= ullen
+			if w.pending == 0 {
+				wakeups = append(wakeups, w)
+				apfl.durWaitedTotal += time.Duration(now - w.timeStart)
+				apfl.numWaiters--
+				if apfl.numWaiters == 0 {
+					apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
+					apfl.timeStartWaiters = math.MaxInt64
+				}
+			}
+		}
+		ulseg = amfl.unloaded.Remove(ulseg).NextSegment()
+	}
+	apfl.mu.Unlock()
+	for _, w := range wakeups {
+		w.wakeup.Notify(1)
+	}
+}
+
 type aplUnloadedSetFunctions struct{}
 
 func (aplUnloadedSetFunctions) MinKey() uint64 {
@@ -2622,8 +2694,9 @@ func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, 
 
 func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, splitAt uint64) (aplUnloadedInfo, aplUnloadedInfo) {
 	ul2 := aplUnloadedInfo{
-		off:     ul.off + (splitAt - fr.Start),
-		started: ul.started,
+		off:         ul.off + (splitAt - fr.Start),
+		started:     ul.started,
+		decommitted: ul.decommitted,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be

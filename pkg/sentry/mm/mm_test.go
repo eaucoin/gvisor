@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -1223,5 +1224,141 @@ func TestIODuringAsyncPageLoad(t *testing.T) {
 	}
 	if want := bytes.Repeat([]byte{1}, len(b)); !bytes.Equal(b, want) {
 		t.Errorf("CopyIn got %v want %v", b, want)
+	}
+}
+
+// startedReaderAt is a gatedReaderAt that sends the offset of each read on
+// started as the read begins.
+type startedReaderAt struct {
+	gatedReaderAt
+	started chan int64
+}
+
+// ReadAt implements `io.ReaderAt.ReadAt`.
+func (r *startedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	r.started <- off
+	return r.gatedReaderAt.ReadAt(p, off)
+}
+
+// TestDecommitDuringAsyncPageLoad checks that MADV_DONTNEED of part of a huge
+// page of a private anonymous mapping, which decommits the pages in place,
+// leaves them reading as zeros while their MemoryFile is being loaded by a
+// background restore, whether their read was in flight or had not started,
+// rather than as the data that loading wrote over them afterwards.
+func TestDecommitDuringAsyncPageLoad(t *testing.T) {
+	const size = 2 * hostarch.HugePageSize
+	ctx := contexttest.Context(t)
+
+	// Save two huge pages, page i filled with i%255+1, so that no page is
+	// saved without data, as zero pages are.
+	src := newHugeTestMemoryFile(t, true /* expectHugepages */)
+	fr, err := src.Allocate(size, pgalloc.AllocOpts{Kind: usage.Anonymous, Huge: true})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	want := func(i uint64) byte { return byte(i%255 + 1) }
+	contents := make([]byte, size)
+	for i := uint64(0); i < size/pageSize; i++ {
+		copy(contents[i*pageSize:], bytes.Repeat([]byte{want(i)}, pageSizeInt))
+	}
+	if _, err := unix.Pwrite(src.FD(), contents, int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite: %v", err)
+	}
+	var metadata, pages bytes.Buffer
+	saveDone := make(chan error, 1)
+	apfs, err := pgalloc.StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 1<<20, 1, 1), func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave: %v", err)
+	}
+	if err := src.SaveTo(ctx, &metadata, &pgalloc.SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("saving pages: %v", err)
+	}
+
+	// Restore them from a pages file whose reads wait for gate, in reads of
+	// 1 MiB, one of which loading has in flight in the background at a time.
+	mf := newHugeTestMemoryFile(t, true /* expectHugepages */)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	letLoad := func() { gateOnce.Do(func() { close(gate) }) }
+	// Before the MemoryFile is destroyed, if the test ends early:
+	t.Cleanup(letLoad)
+	r := &startedReaderAt{gatedReaderAt{bytes.NewReader(pages.Bytes()), 0, gate}, make(chan int64, 64)}
+	loadDone := make(chan error, 1)
+	apfl, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(r, 1<<20, 1, 2), func(err error) { loadDone <- err }, nil /* timeline */, pgalloc.AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	if err := mf.LoadFrom(ctx, &metadata, &pgalloc.LoadOpts{
+		Image:      &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{PagesSize: uint64(pages.Len())}}},
+		PagesFiles: []*pgalloc.AsyncPagesFileLoad{apfl},
+	}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+	// The read of the first MiB is in flight; the others have not started.
+	if off := <-r.started; off != 0 {
+		t.Fatalf("first read at pages file offset %#x, want 0", off)
+	}
+
+	// Map the restored pages with a single huge pma, which holds the
+	// reference that the restore made on them.
+	mm := testMemoryManager(ctx, t)
+	mm.mf = mf // mm has no mappings yet.
+	defer mm.DecUsers(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   size,
+		Addr:     1 << 30,
+		Fixed:    true,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + size}
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+		huge:           true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	// MADV_DONTNEED pages 1-2, which the read in flight loads, and pages
+	// 517-518, in the second huge page, which no read loads yet.
+	page := func(i uint64) hostarch.Addr { return addr + hostarch.Addr(i*pageSize) }
+	decommitted := map[uint64]bool{1: true, 2: true, 517: true, 518: true}
+	for _, i := range []uint64{1, 517} {
+		if err := mm.Decommit(page(i), 2*pageSize); err != nil {
+			t.Fatalf("Decommit(page %d, 2 pages): %v", i, err)
+		}
+	}
+
+	letLoad()
+	if err := <-loadDone; err != nil {
+		t.Fatalf("async page load: %v", err)
+	}
+	b := make([]byte, pageSize)
+	for _, i := range []uint64{0, 1, 2, 3, 516, 517, 518, 519} {
+		if _, err := mm.CopyIn(ctx, page(i), b, usermem.IOOpts{}); err != nil {
+			t.Fatalf("CopyIn(page %d): %v", i, err)
+		}
+		w := want(i)
+		if decommitted[i] {
+			w = 0
+		}
+		if !bytes.Equal(b, bytes.Repeat([]byte{w}, len(b))) {
+			t.Errorf("page %d holds %d..., want every byte %d", i, b[0], w)
+		}
 	}
 }

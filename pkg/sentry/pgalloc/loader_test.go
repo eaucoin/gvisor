@@ -587,6 +587,50 @@ func TestAsyncLoadErrorWakesLoadedWaiters(t *testing.T) {
 	gens.checkPages(t, restored, page0)
 }
 
+// TestAsyncLoadDecommit checks that pages decommitted while they are being
+// loaded read as zeros once loading has completed, rather than as the data
+// that loading would write over them: pages whose read has not started are no
+// longer loaded, and their waiters are woken at once; pages whose read is in
+// flight are decommitted again as the read completes.
+func TestAsyncLoadDecommit(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 16*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: 4 * hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	page := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{fr.Start + i*hostarch.PageSize, fr.Start + (i+1)*hostarch.PageSize}
+	}
+	// A background read of the first four pages takes the only slot.
+	r.waitInflight(1)
+	// A goroutine awaits page 8, whose read cannot start before that slot
+	// is free.
+	waited := awaitAsync(restored, page(8))
+	waitForWaiters(t, l.apfl, 1)
+
+	// Page 1, being read, and page 8, not, are decommitted.
+	restored.Decommit(page(1))
+	restored.Decommit(page(8))
+	gens.set(page(1), 0)
+	gens.set(page(8), 0)
+	// Page 8 needs no read anymore: its waiter is woken at once.
+	if err := receive(t, waited, "the waiter for the decommitted page"); err != nil {
+		t.Errorf("waiter for the decommitted page: got %v, want success", err)
+	}
+
+	r.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+	checkInvariants(t, restored)
+}
+
 // TestSaveDuringAsyncLoad checks that saving a MemoryFile whose pages are
 // still loading waits for them and saves them all.
 func TestSaveDuringAsyncLoad(t *testing.T) {
