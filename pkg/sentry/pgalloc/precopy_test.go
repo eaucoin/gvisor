@@ -17,13 +17,17 @@
 package pgalloc
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // writeDirty writes generation gen to page i of tf's allocation and marks it
@@ -221,6 +225,72 @@ func TestPrecopyReallocatedPage(t *testing.T) {
 			checkSameContents(t, loadTestImage(t, ti), f, again)
 		})
 	}
+}
+
+// TestPrecopyDuringLoadCopiesDirtyPagesLoaded checks that a round of a
+// pre-copy of a MemoryFile that is still loading the image it was restored
+// from copies the dirty pages that have not been loaded once they are: a page
+// dirtied by a mark coarser than the writes it records, which holds the data
+// loading writes, and a page decommitted while it loads, which holds zeros.
+// The save that completes the pre-copy refers to their copies.
+func TestPrecopyDuringLoadCopiesDirtyPagesLoaded(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	const (
+		marked      = 1
+		decommitted = 2
+	)
+	tf.zero(decommitted)
+	pageAt := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: tf.fr.Start + i*page, End: tf.fr.Start + (i+1)*page}
+	}
+
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	p, pw := startTestPrecopy(t, f2)
+	f2.MarkDirty(pageAt(marked))
+	f2.Decommit(pageAt(decommitted))
+	dirty := f2.SwapDirty(false /* paused */)
+	for _, i := range []uint64{marked, decommitted} {
+		if !dirty.Contains(pageAt(i).Start) {
+			t.Fatalf("page %d is not dirty", i)
+		}
+	}
+	copied := make(chan uint64, 1)
+	go func() { copied <- p.Copy(dirty) }()
+	select {
+	case <-copied:
+		t.Fatalf("Precopy.Copy returned before the pages it copies were loaded")
+	case <-time.After(50 * time.Millisecond):
+	}
+	openGate.Do(func() { close(gate.gate) })
+	select {
+	case n := <-copied:
+		if n != 2*page {
+			t.Errorf("Precopy.Copy copied %d bytes, want %d", n, 2*page)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Precopy.Copy did not return after loading")
+	}
+	precopyWait(t, p)
+
+	last := f2.SwapDirty(true /* paused */)
+	ti := pw.save(t, f2, parent, SaveOpts{
+		Precopy:    p,
+		Dirty:      last,
+		PageHashes: true,
+	})
+	m := ti.mfImage()
+	for _, i := range []uint64{marked, decommitted} {
+		e, ok := m.ExtentAt(pageAt(i).Start)
+		if !ok || e.Layer != 0 {
+			t.Errorf("page %d: extent %+v (%t), want its copy in layer 0", i, e, ok)
+		}
+	}
+	checkSameContents(t, loadTestImage(t, ti), tf.f, tf.fr)
+	checkSameContents(t, f2, tf.f, tf.fr)
 }
 
 // TestPrecopyForEachUnclean checks that the pages a save completing a
