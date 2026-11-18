@@ -1477,6 +1477,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		amfl.unloaded.InsertRange(fr, aplUnloadedInfo{
 			off: e.Offset,
 		})
+		amfl.pf.bytesTotal += fr.Length()
 		amfl.pf.mu.Unlock()
 	}
 	if ws := opts.Image.GetWorkingSet(); opts.WorkingSet && ws != nil && opts.Prefetch != PrefetchOff {
@@ -1573,11 +1574,12 @@ type AsyncPagesFileLoad struct {
 	bytesLoaded uint64
 
 	// bytesTotal is the number of bytes that the MemoryFiles registered so
-	// far load from the pages file, and prefetchTotal the number of bytes of
-	// their working sets. bytesCanceled is the number of bytes of bytesTotal
-	// that no read loads, their pages freed or decommitted before their read
-	// started, which bytesTotal no longer counts. These fields are protected
-	// by mu.
+	// far load from the pages file, counted as their pages join the unloaded
+	// sets, before any of their loads can be canceled, and prefetchTotal the
+	// number of bytes of their working sets. bytesCanceled is the number of
+	// bytes of bytesTotal that no read loads, their pages freed or decommitted
+	// before their read started, which bytesTotal no longer counts. These
+	// fields are protected by mu.
 	bytesTotal    uint64
 	prefetchTotal uint64
 	bytesCanceled uint64
@@ -1965,9 +1967,6 @@ func (amfl *asyncMemoryFileLoad) startSweep(extents []*pgallocpb.ExtentProto) {
 	}
 	amfl.pf.mu.Lock()
 	amfl.sweep = merged
-	for _, e := range merged {
-		amfl.pf.bytesTotal += e.Length()
-	}
 	amfl.pf.mu.Unlock()
 	amfl.pf.lfStatus.Notify(aplLFPending)
 }

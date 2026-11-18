@@ -536,6 +536,7 @@ func TestAsyncLoadCanceledBytes(t *testing.T) {
 	restored := newTestMemoryFile(t, testMemoryFileOpts{})
 	l := startLoad(t, img, r, restored)
 	t.Cleanup(func() { releaseAll(t, restored) })
+	checkInvariants(t, restored)
 	totals := func() (total, loaded, canceled uint64) {
 		l.apfl.mu.Lock()
 		defer l.apfl.mu.Unlock()
@@ -552,6 +553,7 @@ func TestAsyncLoadCanceledBytes(t *testing.T) {
 	if total, _, canceled := totals(); total != 15*hostarch.PageSize || canceled != 9*hostarch.PageSize {
 		t.Errorf("after the decommit and the free: %d bytes to load, %d canceled; want %d and %d", total, canceled, 15*hostarch.PageSize, 9*hostarch.PageSize)
 	}
+	checkInvariants(t, restored)
 
 	r.finish()
 	if err := l.wait(t); err != nil {

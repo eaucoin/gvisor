@@ -230,11 +230,29 @@ func committedRanges(f *MemoryFile) []memmap.FileRange {
 //   - memAcct covers exactly the used, waste and releasing pages: pages with
 //     references are in memAcct and not marked waste, and pages in memAcct
 //     that are not waste or releasing have references;
-//   - memAcct lies within the file.
+//   - memAcct lies within the file;
+//   - each pages file that f loads from has at least f's unloaded pages in it
+//     left to load (bytesTotal - bytesLoaded).
 func checkInvariants(t *testing.T, f *MemoryFile) {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		for i, amfl := range loads.amfls {
+			if amfl == nil {
+				continue
+			}
+			amfl.pf.mu.Lock()
+			var unloaded uint64
+			for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+				unloaded += ulseg.Range().Length()
+			}
+			if total, loaded := amfl.pf.bytesTotal, amfl.pf.bytesLoaded; loaded > total || total-loaded < unloaded {
+				t.Errorf("layer %d: %d of %d bytes loaded, with %d bytes of pages still to load", i, loaded, total, unloaded)
+			}
+			amfl.pf.mu.Unlock()
+		}
+	}
 	fileSize := uint64(len(f.chunksLoad())) * chunkSize
 	var committed uint64
 	for seg := f.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
