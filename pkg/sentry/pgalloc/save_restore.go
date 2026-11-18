@@ -207,7 +207,9 @@ type SaveOpts struct {
 	// neither reads clean pages nor waits for them to be loaded: if f is still
 	// loading pages asynchronously from Base or an image that Base refers to
 	// for them, the pages not yet loaded are clean, and SaveTo saves while
-	// loading continues.
+	// loading continues. SaveTo reads every other page once it is loaded,
+	// waiting for those that are not, such as pages decommitted while their
+	// read was in flight. Without Base, Clean has no effect.
 	Clean func(off uint64) bool
 
 	// If PageHashes is true, SaveTo records the page hash (XXH64) of every
@@ -229,13 +231,53 @@ type SaveOpts struct {
 // an object of the state file (checkpointimage.WriteStateRecord), followed by
 // the pages, framed likewise.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
-	// Pages still loading are clean (writing them requires loading them
-	// first), so a save with Clean refers to their data in the layers it is
-	// loading from instead of waiting for it.
-	if opts.Clean == nil {
+	if opts.Base != nil && opts.PagesFile == nil {
+		return fmt.Errorf("saving a delta requires a pages file")
+	}
+	if opts.Base != nil && !opts.PageHashes {
+		return fmt.Errorf("saving a delta requires page hashes")
+	}
+	if opts.PageHashes && opts.PagesFile == nil {
+		return fmt.Errorf("page hashes require a pages file")
+	}
+
+	// If saving to a pages file, img decides where each known-committed page's
+	// data is: written to the pages file, in Base, or nowhere (zero). amfs,
+	// which writes the pages, is set below.
+	var (
+		amfs *asyncMemoryFileSave
+		img  *imageSaver
+	)
+	if opts.PagesFile != nil {
+		var err error
+		img, err = newImageSaver(f, opts, func(fr memmap.FileRange) uint64 {
+			amfs.pf.mu.Lock()
+			off := amfs.pf.saveOff
+			amfs.pf.unsaved.PushBack(apsRange{
+				amfs:      amfs,
+				FileRange: fr,
+			})
+			amfs.pf.saveOff += fr.Length()
+			amfs.pf.mu.Unlock()
+			amfs.pf.stStatus.Notify(apsSTPending)
+			return off
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Pages still loading are clean unless they were dirtied as they loaded,
+	// as decommitting them or a mark coarser than the writes it records does
+	// (writing them requires loading them first), so a save with Clean refers
+	// to the data of clean pages in the layers it is loading from instead of
+	// waiting for it. Every other page is read, once it is loaded.
+	if img == nil || img.clean == nil {
 		if err := f.AwaitLoadAll(); err != nil {
 			return fmt.Errorf("previous async page loading failed: %w", err)
 		}
+	} else if err := f.awaitUncleanLoads(img.isClean); err != nil {
+		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
 
 	// Wait for memory release.
@@ -252,19 +294,8 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		panic(fmt.Sprintf("evictions still pending for %d users; call StartEvictions and WaitForEvictions before SaveTo", len(f.evictable)))
 	}
 
-	if opts.Base != nil && opts.PagesFile == nil {
-		return fmt.Errorf("saving a delta requires a pages file")
-	}
-	if opts.Base != nil && !opts.PageHashes {
-		return fmt.Errorf("saving a delta requires page hashes")
-	}
-	if opts.PageHashes && opts.PagesFile == nil {
-		return fmt.Errorf("page hashes require a pages file")
-	}
-
 	// Register this MemoryFile with async page saving if a pages file has been
 	// provided.
-	var amfs *asyncMemoryFileSave
 	if opts.PagesFile != nil {
 		var sf stateio.SourceFile
 		if opts.PagesFile.aw.NeedRegisterSourceFD() {
@@ -305,27 +336,6 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newUncommittedBytes     uint64
 		hostHoleBytes           uint64
 	)
-	// If saving to a pages file, img decides where each known-committed page's
-	// data is: written to the pages file, in Base, or nowhere (zero).
-	var img *imageSaver
-	if amfs != nil {
-		var err error
-		img, err = newImageSaver(f, opts, func(fr memmap.FileRange) uint64 {
-			amfs.pf.mu.Lock()
-			off := amfs.pf.saveOff
-			amfs.pf.unsaved.PushBack(apsRange{
-				amfs:      amfs,
-				FileRange: fr,
-			})
-			amfs.pf.saveOff += fr.Length()
-			amfs.pf.mu.Unlock()
-			amfs.pf.stStatus.Notify(apsSTPending)
-			return off
-		})
-		if err != nil {
-			return err
-		}
-	}
 
 	// Reading an uncommitted page to determine if it is zero-filled will cause
 	// it to become committed. Thus, we need to decommit zero-filled pages that
@@ -474,7 +484,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 				pg := bs[pgoff : pgoff+pageSize]
 				off := chunkFR.Start + uint64(pgoff)
 				var isZeroed, read bool
-				if opts.Clean != nil && opts.Clean(off) {
+				if img != nil && img.isClean(off) {
 					// The page is unchanged since Base was saved: a page
 					// committed then is still committed, and a page that is
 					// not known to be committed was not in Base (it was freed
@@ -1926,6 +1936,88 @@ func (f *MemoryFile) AwaitLoadAll() error {
 		return loads.awaitLoad(memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))})
 	}
 	return nil
+}
+
+// awaitUncleanLoads blocks until every page for which clean returns false has
+// been loaded, as a save that reads such pages, and refers to the others' data
+// in the layers they are being loaded from, requires. Pages still loading are
+// clean unless they were dirtied as they loaded, so that there are few or
+// none to wait for.
+//
+// Preconditions: f.mu must not be locked.
+func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) error {
+	loads := f.asyncPageLoad.Load()
+	if loads == nil {
+		return nil
+	}
+	// Find the pages that remain to be loaded, then those of them that are
+	// not clean, without holding the loaders' locks while asking clean.
+	var unloaded []memmap.FileRange
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+			unloaded = append(unloaded, ulseg.Range())
+		}
+		amfl.pf.mu.Unlock()
+	}
+	var unclean []memmap.FileRange
+	for _, fr := range unloaded {
+		for off := fr.Start; off < fr.End; off += hostarch.PageSize {
+			if clean(off) {
+				continue
+			}
+			if n := len(unclean); n != 0 && unclean[n-1].End == off {
+				unclean[n-1].End += hostarch.PageSize
+			} else {
+				unclean = append(unclean, memmap.FileRange{Start: off, End: off + hostarch.PageSize})
+			}
+		}
+	}
+	return f.awaitLoads(loads, unclean)
+}
+
+// awaitLoads blocks until every page of frs has been loaded by loads, holding
+// a reference on the pages that remain to be loaded while it waits for them,
+// as awaitLoad requires.
+//
+// Preconditions: f.mu must not be locked.
+func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange) error {
+	if len(frs) == 0 {
+		return nil
+	}
+	// With f.mu locked, the pages that remain to be loaded are in use: pages
+	// leave the unloaded sets as they become waste (cancelWasteLoad).
+	var held []memmap.FileRange
+	f.mu.Lock()
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		for _, fr := range frs {
+			for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; ulseg = ulseg.NextSegment() {
+				held = append(held, ulseg.Range().Intersect(fr))
+			}
+		}
+		amfl.pf.mu.Unlock()
+	}
+	for _, fr := range held {
+		f.incRefLocked(fr)
+	}
+	f.mu.Unlock()
+	var err error
+	for _, fr := range held {
+		if werr := loads.awaitLoad(fr); werr != nil && err == nil {
+			err = werr
+		}
+	}
+	for _, fr := range held {
+		f.DecRef(fr)
+	}
+	return err
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr.
