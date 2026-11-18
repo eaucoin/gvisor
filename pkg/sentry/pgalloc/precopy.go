@@ -135,18 +135,37 @@ func (p *Precopy) CopyAll() (uint64, error) {
 // Copy copies the pages of f in s that are allocated, and records that the
 // others have unknown contents. It returns the number of bytes enqueued for
 // copying.
+//
+// Pages of s that are still being loaded asynchronously, which pages dirtied
+// as they loaded are (as decommitting them or a mark coarser than the writes
+// it records dirties them), are copied once they are loaded. If some will
+// never be loaded, Copy copies none of the pages of s, whose contents remain
+// unknown: the save reads them, and fails for those.
 func (p *Precopy) Copy(s *DirtySet) uint64 {
+	var dirty []memmap.FileRange
+	s.ForEachRange(memmap.FileRange{Start: 0, End: p.limit}, func(fr memmap.FileRange) bool {
+		dirty = append(dirty, fr)
+		return true
+	})
+	f := p.amfs.f
+	loaded := true
+	if loads := f.asyncPageLoad.Load(); loads != nil {
+		_, err := f.awaitLoads(loads, dirty)
+		loaded = err == nil
+	}
 	var n uint64
-	s.ForEachRange(memmap.FileRange{Start: 0, End: p.limit}, func(dirty memmap.FileRange) bool {
-		for page := dirty.Start / hostarch.PageSize; page < dirty.End/hostarch.PageSize; page++ {
+	for _, d := range dirty {
+		for page := d.Start / hostarch.PageSize; page < d.End/hostarch.PageSize; page++ {
 			p.copies[page] = copyUnknown
 		}
-		p.forEachAllocated(dirty, func(fr memmap.FileRange, _ bool) error {
+		if !loaded {
+			continue
+		}
+		p.forEachAllocated(d, func(fr memmap.FileRange, _ bool) error {
 			n += p.copy(fr)
 			return nil
 		})
-		return true
-	})
+	}
 	return n
 }
 
