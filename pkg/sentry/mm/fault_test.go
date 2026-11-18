@@ -955,3 +955,76 @@ func TestFaultWaitsForLoadUnlockedShared(t *testing.T) {
 		t.Errorf("the faulting page holds %d, want %d", got, want)
 	}
 }
+
+// TestFaultWaitingForLoadWokenByDecommit checks that a fault waiting unlocked
+// for pages whose read has not started is woken once MADV_DONTNEED has
+// decommitted all of them in place, before any read of them, and maps them
+// reading as zeros: here, the pages of a huge page, which two MADV_DONTNEEDs
+// of parts of it decommit, while another fault's awaited read and a
+// background read, which wait, take both of the pages file's slots.
+func TestFaultWaitingForLoadWokenByDecommit(t *testing.T) {
+	ctx := contexttest.Context(t)
+	const hugePages = hostarch.HugePageSize / hostarch.PageSize
+	rp := restorePages(ctx, t, restoreOpts{pages: 2 * hugePages, huge: true})
+	defer rp.finish(ctx, t)
+
+	// A fault on the first huge page waits for the background read of its
+	// first MiB and the awaited read of its second.
+	first := startFault(ctx, t, rp.mm, rp.page(hugePages/2+3), hostarch.Read)
+	rp.pf.waitStarted(t, pagesOf(hugePages/2, hugePages/2))
+	// A fault on the second huge page waits for reads that cannot start.
+	page := uint64(hugePages + 7)
+	second := startFault(ctx, t, rp.mm, rp.page(page), hostarch.Write)
+	waitForStacks(t, second, 2, loadWaitFrame, unlockedWaitFrame)
+	secondPages := pagesOf(hugePages, hugePages)
+	readOf := func(fr memmap.FileRange) bool {
+		rp.pf.mu.Lock()
+		defer rp.pf.mu.Unlock()
+		return slices.ContainsFunc(rp.pf.started, fr.Overlaps)
+	}
+	if readOf(secondPages) {
+		t.Fatalf("a read of the second huge page began: the test needs none to")
+	}
+
+	// MADV_DONTNEED of all of the second huge page but its first page, then of
+	// its first page: each decommits part of the huge page in place.
+	within(t, rp, "MADV_DONTNEED", func() {
+		if err := rp.mm.Decommit(rp.page(hugePages+1), (hugePages-1)*hostarch.PageSize); err != nil {
+			t.Fatalf("Decommit(pages %d-%d): %v", hugePages+1, 2*hugePages-1, err)
+		}
+		if err := rp.mm.Decommit(rp.page(hugePages), hostarch.PageSize); err != nil {
+			t.Fatalf("Decommit(page %d): %v", hugePages, err)
+		}
+	})
+	// The second fault needs no read anymore: it ends while the first one's
+	// reads still wait.
+	if err := faultEnds(t, second); err != nil {
+		t.Fatalf("HandleUserFault: %v", err)
+	}
+	if at, ok := rp.as.mappedAs(rp.page(page)); !ok || !at.Write {
+		t.Errorf("the page written is mapped %v (%t), want writable", at, ok)
+	}
+	select {
+	case err := <-first.err:
+		t.Fatalf("the first fault ended before its pages were loaded: %v", err)
+	default:
+	}
+
+	// The copies below read through the internal mappings of the whole pma,
+	// which wait for the first huge page to be loaded.
+	rp.letLoad()
+	if err := faultEnds(t, first); err != nil {
+		t.Fatalf("HandleUserFault: %v", err)
+	}
+	if got, want := readPage(ctx, t, rp.mm, rp.page(hugePages/2+3)), restoredByte(hugePages/2+3); got != want {
+		t.Errorf("the first fault's page holds %d, want %d", got, want)
+	}
+	for _, i := range []uint64{hugePages, page, 2*hugePages - 1} {
+		if got := readPage(ctx, t, rp.mm, rp.page(i)); got != 0 {
+			t.Errorf("decommitted page %d holds %d, want 0", i, got)
+		}
+	}
+	if readOf(secondPages) {
+		t.Errorf("the decommitted pages were read")
+	}
+}
