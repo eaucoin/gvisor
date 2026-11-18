@@ -631,6 +631,48 @@ func TestAsyncLoadDecommit(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// TestAsyncLoadDecommitFailedRead checks that a page decommitted while its
+// read is in flight reads as zeros, without waiting, after the read fails and
+// loading ends with it, while the other pages of the read, not decommitted,
+// fail: the read wrote the page before it failed, and nothing will load it.
+func TestAsyncLoadDecommitFailedRead(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 8*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: 4 * hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	// The read of pages 0-3 writes pages 0 and 1, then fails.
+	r.failAt(2 * hostarch.PageSize)
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	page := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{fr.Start + i*hostarch.PageSize, fr.Start + (i+1)*hostarch.PageSize}
+	}
+	r.waitInflight(1)
+	// A goroutine awaits page 1, which the read in flight loads.
+	waited := awaitAsync(restored, page(1))
+	waitForWaiters(t, l.apfl, 1)
+	restored.Decommit(page(1))
+	gens.set(page(1), 0)
+
+	r.finish()
+	if err := receive(t, waited, "the waiter for the decommitted page"); err != nil {
+		t.Errorf("waiter for the decommitted page: got %v, want success", err)
+	}
+	if err := l.wait(t); err != linuxerr.EIO {
+		t.Errorf("async page loading: got %v, want EIO", err)
+	}
+	gens.checkPages(t, restored, page(1))
+	for _, i := range []uint64{0, 2, 4} {
+		if _, err := restored.MapInternal(page(i), hostarch.Read); err != linuxerr.EIO {
+			t.Errorf("MapInternal(page %d) after the failure: got %v, want EIO", i, err)
+		}
+	}
+}
+
 // TestSaveDuringAsyncLoad checks that saving a MemoryFile whose pages are
 // still loading waits for them and saves them all.
 func TestSaveDuringAsyncLoad(t *testing.T) {
