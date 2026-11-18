@@ -341,3 +341,46 @@ func TestAsyncLoadPrefetchFaultWait(t *testing.T) {
 		t.Errorf("the end of the working set was read at %v, before the fault's page at %v", setEnd.submitted, awaited.submitted)
 	}
 }
+
+// TestAsyncLoadPrefetchDecommit checks that a page of a working set decommitted
+// while the background read that loads the set first is in flight reads as
+// zeros once loading has completed.
+func TestAsyncLoadPrefetchDecommit(t *testing.T) {
+	const size = 16 << 20
+	fr, gens, img := loaderTestImage(t, size)
+	// A working set of 64 KiB at 12 MiB.
+	set := memmap.FileRange{fr.Start + 12<<20, fr.Start + 12<<20 + 64*kib}
+	img.img.Proto = proto.Clone(img.img.Proto).(*pgallocpb.ImageProto)
+	img.img.Proto.WorkingSet = workingSetOf(64*kib, set)
+	opts := testSlowDisk
+	opts.manual = true
+	r := newTestPagesFile(t, img.pages, opts)
+	r.useClock()
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoadWithPrefetch(t, img, r, PrefetchAuto, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+
+	// Run until the loader has submitted the read of the set, which then is
+	// in flight.
+	setOff := int64(12 << 20)
+	for {
+		if _, ok := r.readAt(setOff); ok {
+			break
+		}
+		r.advanceToNext()
+	}
+	r.waitPending()
+	decommitted := memmap.FileRange{set.Start + hostarch.PageSize, set.Start + 2*hostarch.PageSize}
+	restored.Decommit(decommitted)
+	gens.set(decommitted, 0)
+
+	r.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading failed: %v", err)
+	}
+	if l.apfl.prefetched == 0 {
+		t.Errorf("loading read no working set first: the test needs it to")
+	}
+	gens.checkPages(t, restored, fr)
+	checkInvariants(t, restored)
+}
