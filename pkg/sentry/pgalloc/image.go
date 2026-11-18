@@ -96,6 +96,11 @@ func newImageSaver(f *MemoryFile, opts *SaveOpts, write func(memmap.FileRange) u
 	return s, nil
 }
 
+// isClean returns true if the page at off is unchanged since base was saved.
+func (s *imageSaver) isClean(off uint64) bool {
+	return s.clean != nil && s.clean(off)
+}
+
 // emit records that the known-committed pages in fr are saved.
 //
 // Preconditions:
@@ -120,7 +125,7 @@ func (s *imageSaver) emit(fr memmap.FileRange) {
 	}
 	for off := fr.Start; off < fr.End; off += hostarch.PageSize {
 		e, hasExtent, hash, hasHash := s.baseCursor.Lookup(off)
-		if s.clean != nil && s.clean(off) {
+		if s.isClean(off) {
 			flushRun(off)
 			if !hasHash {
 				// Not committed in base, hence zero then and now.
