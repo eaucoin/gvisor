@@ -276,7 +276,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		if err := f.AwaitLoadAll(); err != nil {
 			return fmt.Errorf("previous async page loading failed: %w", err)
 		}
-	} else if err := f.awaitUncleanLoads(img.isClean); err != nil {
+	} else if _, err := f.awaitUncleanLoads(img.isClean); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
 
@@ -1942,13 +1942,14 @@ func (f *MemoryFile) AwaitLoadAll() error {
 // been loaded, as a save that reads such pages, and refers to the others' data
 // in the layers they are being loaded from, requires. Pages still loading are
 // clean unless they were dirtied as they loaded, so that there are few or
-// none to wait for.
+// none to wait for. It returns the number of bytes it waited for, as
+// awaitLoads does.
 //
 // Preconditions: f.mu must not be locked.
-func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) error {
+func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) (uint64, error) {
 	loads := f.asyncPageLoad.Load()
 	if loads == nil {
-		return nil
+		return 0, nil
 	}
 	// Find the pages that remain to be loaded, then those of them that are
 	// not clean, without holding the loaders' locks while asking clean.
@@ -1981,12 +1982,14 @@ func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) error {
 
 // awaitLoads blocks until every page of frs has been loaded by loads, holding
 // a reference on the pages that remain to be loaded while it waits for them,
-// as awaitLoad requires.
+// as awaitLoad requires. It returns the number of bytes of frs that remained
+// to be loaded, which it waited for, and logs them with the time it waited:
+// a save waits for them while the sandbox is paused.
 //
 // Preconditions: f.mu must not be locked.
-func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange) error {
+func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange) (uint64, error) {
 	if len(frs) == 0 {
-		return nil
+		return 0, nil
 	}
 	// With f.mu locked, the pages that remain to be loaded are in use: pages
 	// leave the unloaded sets as they become waste (cancelWasteLoad).
@@ -2004,10 +2007,16 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 		}
 		amfl.pf.mu.Unlock()
 	}
+	var waited uint64
 	for _, fr := range held {
 		f.incRefLocked(fr)
+		waited += fr.Length()
 	}
 	f.mu.Unlock()
+	if waited == 0 {
+		return 0, nil
+	}
+	start := gohacks.Nanotime()
 	var err error
 	for _, fr := range held {
 		if werr := loads.awaitLoad(fr); werr != nil && err == nil {
@@ -2017,7 +2026,13 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 	for _, fr := range held {
 		f.DecRef(fr)
 	}
-	return err
+	dur := time.Duration(gohacks.Nanotime() - start)
+	if err != nil {
+		log.Warningf("MemoryFile(%p): waited %s for %d bytes of dirty pages still loading, whose loading failed: %v", f, dur, waited, err)
+	} else {
+		log.Infof("MemoryFile(%p): waited %s for %d bytes of dirty pages still loading", f, dur, waited)
+	}
+	return waited, err
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr.
