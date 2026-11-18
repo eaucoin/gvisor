@@ -1745,7 +1745,8 @@ type aplUnloadedInfo struct {
 
 	// decommitted is true if the pages were decommitted while their read was
 	// in flight (see cancelDecommittedLoad): the loader decommits them again
-	// once the read has written them, before it reports them loaded.
+	// once the read has written them, before it reports them loaded, or, if
+	// the read fails, as loading ends.
 	decommitted bool
 
 	// waiters queues goroutines waiting for these pages to be loaded.
@@ -2191,13 +2192,13 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.timeline.End()
 		// Wake up any remaining waiters so that they can observe apfl.err().
-		// Leave all segments in asyncMemoryFileLoad.unloaded so that new
+		// Leave the other segments in asyncMemoryFileLoad.unloaded so that new
 		// callers of awaitLoad() will still observe the correct (permanently
 		// unloaded) segments.
 		apfl.amflsMu.Lock()
 		apfl.mu.Lock()
 		for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
-			for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+			for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); {
 				ul := ulseg.ValuePtr()
 				ullen := ulseg.Range().Length()
 				for _, w := range ul.waiters {
@@ -2206,8 +2207,20 @@ func (apfl *AsyncPagesFileLoad) main() {
 						w.wakeup.Notify(1)
 					}
 				}
+				if ul.decommitted {
+					// The pages were decommitted while their read was in
+					// flight, and the read failed or was stopped, after
+					// writing any or all of them: they hold zeros again, as
+					// after the decommit, and need no read, as pages
+					// decommitted before their read started need none
+					// (cancelDecommittedLoad).
+					amfl.f.zeroFile(ulseg.Range())
+					ulseg = amfl.unloaded.Remove(ulseg).NextSegment()
+					continue
+				}
 				ul.started = false
 				ul.waiters = nil
+				ulseg = ulseg.NextSegment()
 			}
 			amfl.doneLocked(apfl.err())
 		}
@@ -2599,7 +2612,8 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 // rather than as the data that loading would write over them: pages whose
 // read has not started are no longer loaded, their waiters woken as their
 // read's completion would wake them, and pages whose read is in flight are
-// decommitted again by the loader as the read completes.
+// decommitted again by the loader as the read completes, or as loading ends
+// if the read fails.
 //
 // Preconditions:
 // - At least one reference must be held on all pages in fr.
