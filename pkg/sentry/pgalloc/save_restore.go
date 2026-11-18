@@ -1574,9 +1574,13 @@ type AsyncPagesFileLoad struct {
 
 	// bytesTotal is the number of bytes that the MemoryFiles registered so
 	// far load from the pages file, and prefetchTotal the number of bytes of
-	// their working sets. These fields are protected by mu.
+	// their working sets. bytesCanceled is the number of bytes of bytesTotal
+	// that no read loads, their pages freed or decommitted before their read
+	// started, which bytesTotal no longer counts. These fields are protected
+	// by mu.
 	bytesTotal    uint64
 	prefetchTotal uint64
+	bytesCanceled uint64
 
 	// Following fields are exclusive to the async page loader goroutine.
 
@@ -2815,7 +2819,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// Successfully completed all loading for all MemoryFiles.
 				durTotal := time.Duration(aplNanotime() - timeStart)
 				apfl.mu.Lock()
-				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s)", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget)
+				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s; %d bytes not read, freed or decommitted first); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s)", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.bytesCanceled, apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget)
 				if apfl.prefetchTotal != 0 {
 					log.Infof("Async page loading read %d of %d bytes of working sets first", apfl.prefetched, apfl.prefetchTotal)
 				}
@@ -3060,7 +3064,18 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			// references.
 			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
 		}
+		amfl.pf.cancelLocked(ulseg.Range().Length())
 	})
+}
+
+// cancelLocked records that n bytes of the MemoryFiles' pages will not be
+// loaded, their pages freed or decommitted before their read started, so
+// that the bytes left to load (bytesTotal - bytesLoaded) no longer count them.
+//
+// Preconditions: apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) cancelLocked(n uint64) {
+	apfl.bytesTotal -= n
+	apfl.bytesCanceled += n
 }
 
 // cancelDecommittedLoad cancels loading of the pages of fr, which are being
@@ -3116,6 +3131,7 @@ func (amfl *asyncMemoryFileLoad) cancelDecommittedLoad(fr memmap.FileRange) {
 				}
 			}
 		}
+		apfl.cancelLocked(ullen)
 		ulseg = amfl.unloaded.Remove(ulseg).NextSegment()
 	}
 	apfl.mu.Unlock()
