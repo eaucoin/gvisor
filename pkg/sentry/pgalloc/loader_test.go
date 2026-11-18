@@ -510,6 +510,60 @@ func TestAsyncLoadCancelWasteLoad(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// TestAsyncLoadCanceledBytes checks that the bytes that loading has left to
+// load no longer count the pages freed or decommitted before their read
+// started, which it never reads, so that it has loaded all it had to once it
+// completes.
+func TestAsyncLoadCanceledBytes(t *testing.T) {
+	f := newTestMemoryFile(t, testMemoryFileOpts{})
+	kept := allocate(t, f, 16*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	freed := allocate(t, f, 8*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	t.Cleanup(func() {
+		f.DecRef(kept)
+		f.DecRef(freed)
+	})
+	gens := make(pageGens)
+	gens.write(t, f, kept, 1)
+	gens.write(t, f, freed, 1)
+	img := saveImage(t, SaveOpts{}, f)
+
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: 4 * hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	totals := func() (total, loaded, canceled uint64) {
+		l.apfl.mu.Lock()
+		defer l.apfl.mu.Unlock()
+		return l.apfl.bytesTotal, l.apfl.bytesLoaded, l.apfl.bytesCanceled
+	}
+	// The read of the first four pages of kept is in flight. The application
+	// decommits page 8 of kept and frees the second allocation, whose reads
+	// have not started.
+	r.waitInflight(1)
+	page8 := memmap.FileRange{kept.Start + 8*hostarch.PageSize, kept.Start + 9*hostarch.PageSize}
+	restored.Decommit(page8)
+	gens.set(page8, 0)
+	restored.DecRef(freed)
+	if total, _, canceled := totals(); total != 15*hostarch.PageSize || canceled != 9*hostarch.PageSize {
+		t.Errorf("after the decommit and the free: %d bytes to load, %d canceled; want %d and %d", total, canceled, 15*hostarch.PageSize, 9*hostarch.PageSize)
+	}
+
+	r.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	if total, loaded, _ := totals(); loaded != total {
+		t.Errorf("loading completed with %d of %d bytes loaded", loaded, total)
+	}
+	gens.checkPages(t, restored, kept)
+	checkInvariants(t, restored)
+}
+
 // TestAsyncLoadErrorIsSticky checks that a failed read stops loading and fails
 // every waiter for pages that are not loaded, now and later, while loaded
 // pages stay usable.
