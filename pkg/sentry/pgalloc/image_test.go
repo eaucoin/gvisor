@@ -694,6 +694,60 @@ func TestImageDeltaDuringLoad(t *testing.T) {
 	}
 }
 
+// TestImageDeltaDuringLoadReadsDirtyPages checks that a delta of the image a
+// MemoryFile is still loading from waits for the pages that are not clean
+// although they have not been loaded, which it reads, and saves their
+// contents as loaded: a page dirtied by a mark coarser than the writes it
+// records, which holds the data loading writes, and a page decommitted while
+// it loads, which holds zeros.
+func TestImageDeltaDuringLoadReadsDirtyPages(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	const (
+		marked      = 1
+		decommitted = 2
+	)
+	tf.zero(decommitted)
+	pageAt := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: tf.fr.Start + i*page, End: tf.fr.Start + (i+1)*page}
+	}
+
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	f2.Decommit(pageAt(decommitted))
+	saved := make(chan *testImage, 1)
+	go func() {
+		saved <- saveTestImageOpts(t, f2, parent, SaveOpts{
+			Clean:      func(off uint64) bool { return off != pageAt(marked).Start && off != pageAt(decommitted).Start },
+			PageHashes: true,
+		})
+	}()
+	select {
+	case <-saved:
+		t.Fatalf("saving a delta returned before the pages it reads were loaded")
+	case <-time.After(50 * time.Millisecond):
+	}
+	openGate.Do(func() { close(gate.gate) })
+	var delta *testImage
+	select {
+	case delta = <-saved:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("saving a delta of the image being loaded did not complete after loading")
+	}
+
+	layers := pageLayers(delta.mfImage(), tf.fr)
+	if got := layers[pageAt(marked).Start]; got != 1 {
+		t.Errorf("marked page: in layer %d of the delta, want 1 (unchanged since the parent, by hash)", got)
+	}
+	if got := layers[pageAt(decommitted).Start]; got != -1 {
+		t.Errorf("decommitted page: in layer %d of the delta, want none (zero)", got)
+	}
+	checkSameContents(t, loadTestImage(t, delta), tf.f, tf.fr)
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
 // TestImageLoadRejects checks that loading fails, before reading any page, if
 // the pages files do not match the image's layers.
 func TestImageLoadRejects(t *testing.T) {
