@@ -31,7 +31,8 @@ name: Fork integrate
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}
+  # Not the workflow's name, a group GitHub once held for no run, queueing all.
+  group: fork-integrate-main
   cancel-in-progress: false
 
 permissions:
