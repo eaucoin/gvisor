@@ -631,6 +631,75 @@ func TestAsyncLoadDecommit(t *testing.T) {
 	checkInvariants(t, restored)
 }
 
+// deliveredHookReader is a testPagesFile that calls delivered with the
+// completions that Wait or WaitOr returns, once their reads have written their
+// pages and before the loader processes them.
+type deliveredHookReader struct {
+	*testPagesFile
+	delivered func(cs []stateio.Completion)
+}
+
+// Wait implements stateio.AsyncReader.Wait.
+func (r *deliveredHookReader) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
+	n := len(cs)
+	cs, err := r.testPagesFile.Wait(cs, minCompletions)
+	if len(cs) > n {
+		r.delivered(cs[n:])
+	}
+	return cs, err
+}
+
+// WaitOr implements stateio.WaitOrAsyncReader.WaitOr.
+func (r *deliveredHookReader) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]stateio.Completion, error) {
+	n := len(cs)
+	cs, err := r.testPagesFile.WaitOr(cs, wake)
+	if len(cs) > n {
+		r.delivered(cs[n:])
+	}
+	return cs, err
+}
+
+// TestAsyncLoadDecommitAfterReadDelivered checks that a page decommitted after
+// its read has written it, but before the loader has processed the read's
+// completion, reads as zeros once loading has completed.
+func TestAsyncLoadDecommitAfterReadDelivered(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 8*hostarch.PageSize)
+	pf := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: 4 * hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	page := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{fr.Start + i*hostarch.PageSize, fr.Start + (i+1)*hostarch.PageSize}
+	}
+	// Only the loader's goroutine calls delivered.
+	decommitted := false
+	r := &deliveredHookReader{pf, func([]stateio.Completion) {
+		if decommitted {
+			return
+		}
+		decommitted = true
+		// The read of pages 0-3, the first, has written them.
+		restored.Decommit(page(1))
+	}}
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	pf.waitInflight(1)
+	gens.set(page(1), 0)
+
+	pf.finish()
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	if !decommitted {
+		t.Fatalf("no read completed")
+	}
+	gens.checkPages(t, restored, fr)
+	checkInvariants(t, restored)
+}
+
 // TestAsyncLoadDecommitFailedRead checks that a page decommitted while its
 // read is in flight reads as zeros, without waiting, after the read fails and
 // loading ends with it, while the other pages of the read, not decommitted,
