@@ -748,6 +748,59 @@ func TestImageDeltaDuringLoadReadsDirtyPages(t *testing.T) {
 	checkSameContents(t, f2, tf.f, tf.fr)
 }
 
+// TestImageDeltaDuringLoadWaitedBytes checks that the wait of a delta save for
+// the pages that are not clean although they have not been loaded counts the
+// bytes it waited for, as the log of the save reports them: those pages, and
+// none once loading has completed.
+func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	pageAt := func(i uint64) uint64 { return tf.fr.Start + i*page }
+	// Pages 1 and 4 hold data (newImageTestFile), so that the image has them
+	// to load.
+	clean := func(off uint64) bool { return off != pageAt(1) && off != pageAt(4) }
+
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	type result struct {
+		waited uint64
+		err    error
+	}
+	awaited := make(chan result, 1)
+	go func() {
+		waited, err := f2.awaitUncleanLoads(clean)
+		awaited <- result{waited, err}
+	}()
+	select {
+	case <-awaited:
+		t.Fatalf("awaitUncleanLoads returned before the pages it waits for were loaded")
+	case <-time.After(50 * time.Millisecond):
+	}
+	openGate.Do(func() { close(gate.gate) })
+	var res result
+	select {
+	case res = <-awaited:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("awaitUncleanLoads did not return after loading")
+	}
+	if res.err != nil {
+		t.Fatalf("awaitUncleanLoads: %v", res.err)
+	}
+	if want := uint64(2 * page); res.waited != want {
+		t.Errorf("awaitUncleanLoads waited for %d bytes, want %d", res.waited, want)
+	}
+
+	if err := f2.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	if waited, err := f2.awaitUncleanLoads(clean); err != nil || waited != 0 {
+		t.Errorf("awaitUncleanLoads once loaded: waited for %d bytes, error %v; want 0, nil", waited, err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
 // TestImageLoadRejects checks that loading fails, before reading any page, if
 // the pages files do not match the image's layers.
 func TestImageLoadRejects(t *testing.T) {
