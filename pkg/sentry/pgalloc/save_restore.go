@@ -2519,8 +2519,10 @@ func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
 // loaded. A caller that must not wait for pages while holding its own locks
 // waits for them with AwaitLoad first, then accesses them without waiting.
 //
-// Preconditions: The caller must hold a reference on every page of fr that
-// remains to be loaded, for as long as AwaitLoad waits.
+// The caller need hold no reference on the pages of fr: pages freed while it
+// waits end its wait as if they were loaded, as no contents of theirs remain
+// to wait for. It must hold none of its own locks that the pages' loading or
+// freeing may need.
 func (f *MemoryFile) AwaitLoad(fr memmap.FileRange) error {
 	if loads := f.asyncPageLoad.Load(); loads != nil {
 		return loads.awaitLoad(fr)
@@ -2530,10 +2532,8 @@ func (f *MemoryFile) AwaitLoad(fr memmap.FileRange) error {
 
 // awaitLoad blocks until data has been loaded for all pages in fr, or until
 // the await of the calling goroutine is cut short (CancelAwaits), in which case
-// it returns linuxerr.EINTR.
-//
-// Preconditions: At least one reference must be held on all unloaded pages in
-// fr.
+// it returns linuxerr.EINTR. Pages of fr that become waste end the wait as if
+// they were loaded (cancelWasteLoad).
 func (loads *asyncMemoryFileLoads) awaitLoad(fr memmap.FileRange) error {
 	// Register a waiter with the loader of every layer that has unloaded
 	// pages in fr, so that all of their reads are prioritized, then wait for
@@ -2673,9 +2673,6 @@ type aplAwait struct {
 // startAwait prioritizes loading of the unloaded pages of fr in amfl. If any
 // remain to be loaded, it returns a waiter that must be passed to
 // amfl.finishAwait(). It returns an error if pages of fr will never be loaded.
-//
-// Preconditions: At least one reference must be held on all unloaded pages in
-// fr.
 func (amfl *asyncMemoryFileLoad) startAwait(fr memmap.FileRange) (*aplWaiter, error) {
 	// fr might not be page-aligned; everything else involved in async page
 	// loading requires page-aligned FileRanges.
@@ -3566,8 +3563,10 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 		return
 	}
 
-	amfl.pf.mu.Lock()
-	defer amfl.pf.mu.Unlock()
+	apfl := amfl.pf
+	var wakeups []*aplWaiter
+	apfl.mu.Lock()
+	now := aplNanotime()
 	amfl.unloaded.RemoveRangeWith(fr, func(ulseg aplUnloadedIterator) {
 		ul := ulseg.ValuePtr()
 		if ul.started {
@@ -3575,13 +3574,38 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			// reading (see MemoryFile.asyncPageLoadMain()).
 			panic(fmt.Sprintf("pages %v becoming waste during inflight read from async loading", ulseg.Range()))
 		}
-		if n := len(ul.waiters); n != 0 {
-			// This shouldn't be possible since the waiters should hold page
-			// references.
-			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
-		}
-		amfl.pf.cancelLocked(ulseg.Range().Length())
+		// Waiters need not hold references on the pages they wait for
+		// (MemoryFile.AwaitLoad): pages freed while they wait have no
+		// contents left to wait for.
+		ullen := ulseg.Range().Length()
+		wakeups = apfl.unwaitLocked(ul, ullen, now, wakeups)
+		apfl.cancelLocked(ullen)
 	})
+	apfl.mu.Unlock()
+	for _, w := range wakeups {
+		w.wakeup.Notify(1)
+	}
+}
+
+// unwaitLocked records that the ullen bytes of ul's pages will not be loaded,
+// so that its waiters no longer wait for them, and appends to wakeups, which
+// it returns, the waiters that wait for no other page and must be woken.
+//
+// Preconditions: apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) unwaitLocked(ul *aplUnloadedInfo, ullen uint64, now int64, wakeups []*aplWaiter) []*aplWaiter {
+	for _, w := range ul.waiters {
+		w.pending -= ullen
+		if w.pending == 0 {
+			wakeups = append(wakeups, w)
+			apfl.durWaitedTotal += time.Duration(now - w.timeStart)
+			apfl.numWaiters--
+			if apfl.numWaiters == 0 {
+				apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
+				apfl.timeStartWaiters = math.MaxInt64
+			}
+		}
+	}
+	return wakeups
 }
 
 // cancelLocked records that n bytes of the MemoryFiles' pages will not be
@@ -3635,18 +3659,7 @@ func (amfl *asyncMemoryFileLoad) cancelDecommittedLoad(fr memmap.FileRange) {
 			continue
 		}
 		ullen := ulseg.Range().Length()
-		for _, w := range ul.waiters {
-			w.pending -= ullen
-			if w.pending == 0 {
-				wakeups = append(wakeups, w)
-				apfl.durWaitedTotal += time.Duration(now - w.timeStart)
-				apfl.numWaiters--
-				if apfl.numWaiters == 0 {
-					apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
-					apfl.timeStartWaiters = math.MaxInt64
-				}
-			}
-		}
+		wakeups = apfl.unwaitLocked(ul, ullen, now, wakeups)
 		apfl.cancelLocked(ullen)
 		ulseg = amfl.unloaded.Remove(ulseg).NextSegment()
 	}
