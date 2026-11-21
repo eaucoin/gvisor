@@ -450,6 +450,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(image *checkpointimage.Image, page
 			return
 		}
 		cu.Add(apfl.MemoryFilesDone)
+		if pageLoadOpts.Trace {
+			log.Infof("Async page loading trace: loader %p reads layer %d", apfl, i)
+		}
 		opts.PagesFiles[i] = apfl
 	}
 	mfl.apfls = opts.PagesFiles

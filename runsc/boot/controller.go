@@ -465,7 +465,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		// loader bounds its background reads by a budget that leaves a slot
 		// to awaited reads, and its slow start measures the pages file from
 		// the first reads, which a throttle phase would serialize.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{}) // transfers ownership
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{
+			Trace: cm.l.root.conf.AsyncLoadTrace == config.AsyncLoadTraceAll,
+		}) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")
 	}

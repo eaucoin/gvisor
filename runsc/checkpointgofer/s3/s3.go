@@ -188,6 +188,12 @@ type FileServerOptions struct {
 	// once. If they are 0, they are 32 MiB and 4.
 	PagesFilePartBytes     int
 	PagesFileWriteParallel int
+
+	// If Trace is true, each GET of a pages file is logged as it ends, as a
+	// line beginning "S3 read trace:", with the kind of the read it serves,
+	// and each pages file's reader logs its GETs and the process's CPU time
+	// as it closes.
+	Trace bool
 }
 
 // ParsePagesRetry returns the FileServerOptions.PagesRetryWhileRunning that
@@ -450,7 +456,9 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	}
 	obj := s.object(path)
 	log.Infof("Opening %s for reading", obj)
-	return newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel), nil
+	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
+	r.trace = s.opts.Trace && path == checkpointfiles.PagesFileName
+	return r, nil
 }
 
 // OpenWrite implements stateipc.AsyncFileServerImpl.OpenWrite.
