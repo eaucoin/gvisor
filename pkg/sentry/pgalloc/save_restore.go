@@ -194,10 +194,9 @@ type SaveOpts struct {
 
 	// If Base is not nil, SaveTo saves f as a delta of Base, f's part of an
 	// image saved earlier: pages whose contents are unchanged since Base was
-	// saved refer to Base's data instead of being written to PagesFile. Pages
-	// for which Clean returns true are unchanged by definition (their hash is
-	// Base's, and they are not read); others are unchanged if their hash is
-	// Base's. (Page hashes are not cryptographic: an application that writes
+	// saved refer to Base's data instead of being written to PagesFile. Clean
+	// pages (see Dirty) are unchanged by definition (their hash is Base's, and
+	// they are not read); others are unchanged if their hash is Base's. (Page hashes are not cryptographic: an application that writes
 	// a page colliding with its Base page gets the Base page back on restore,
 	// contents that were its own memory when Base was saved.) Base's layer i
 	// is layer BaseLayers[i] of the image being saved. Base requires
@@ -205,16 +204,16 @@ type SaveOpts struct {
 	Base       *checkpointimage.MemoryFileImage
 	BaseLayers []uint32
 
-	// If Clean is not nil, Clean(off) returns true if the page at MemoryFile
-	// offset off is known not to have changed since Base was saved, or since
-	// its last copy by Precopy. SaveTo neither reads clean pages nor waits for
-	// them to be loaded: if f is still loading pages asynchronously from Base
-	// or an image that Base refers to for them, the pages not yet loaded are
-	// clean, and SaveTo saves while loading continues. SaveTo reads every
-	// other page once it is loaded, waiting for those that are not, such as
-	// pages decommitted while their read was in flight. Without Base or
-	// Precopy, Clean has no effect.
-	Clean func(off uint64) bool
+	// If Dirty is not nil, the pages of f that are not in Dirty are clean:
+	// known not to have changed since Base was saved, or since their last
+	// copy by Precopy. SaveTo neither reads clean pages nor waits for them to
+	// be loaded: if f is still loading pages asynchronously from Base or an
+	// image that Base refers to for them, the pages not yet loaded are clean,
+	// and SaveTo saves while loading continues. SaveTo reads every other page
+	// once it is loaded, waiting for those that are not, such as pages
+	// decommitted while their read was in flight. If Dirty is nil, no page is
+	// known to be clean. Without Base or Precopy, Dirty has no effect.
+	Dirty *DirtySet
 
 	// If PageHashes is true, SaveTo records the page hash (XXH64) of every
 	// known-committed page in its record, for an image whose
@@ -278,14 +277,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 
 	// Pages still loading are clean unless they were dirtied as they loaded,
 	// as decommitting them or a mark coarser than the writes it records does
-	// (writing them requires loading them first), so a save with Clean refers
+	// (writing them requires loading them first), so a save with Dirty refers
 	// to the data of clean pages in the layers it is loading from instead of
 	// waiting for it. Every other page is read, once it is loaded.
-	if img == nil || img.clean == nil {
+	if img == nil || img.dirty == nil {
 		if err := f.AwaitLoadAll(); err != nil {
 			return fmt.Errorf("previous async page loading failed: %w", err)
 		}
-	} else if _, err := f.awaitUncleanLoads(img.isClean); err != nil {
+	} else if _, err := f.awaitUncleanLoads(img); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
 
@@ -2338,21 +2337,24 @@ func (f *MemoryFile) AwaitLoadAll() error {
 	return nil
 }
 
-// awaitUncleanLoads blocks until every page for which clean returns false has
-// been loaded, as a save that reads such pages, and refers to the others' data
-// in the layers they are being loaded from, requires. Pages still loading are
-// clean unless they were dirtied as they loaded, so that there are few or
-// none to wait for. It returns the number of bytes it waited for, as
+// awaitUncleanLoads blocks until every page that the save of img reads, every
+// page that is not clean, has been loaded, as a save that refers to the
+// others' data in the layers they are being loaded from requires. Pages still
+// loading are clean unless they were dirtied as they loaded, so that there are
+// few or none to wait for. It returns the number of bytes it waited for, as
 // awaitLoads does.
 //
-// Preconditions: f.mu must not be locked.
-func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) (uint64, error) {
+// Preconditions:
+//   - img.dirty != nil.
+//   - f.mu must not be locked.
+func (f *MemoryFile) awaitUncleanLoads(img *imageSaver) (uint64, error) {
 	loads := f.asyncPageLoad.Load()
 	if loads == nil {
 		return 0, nil
 	}
 	// Find the pages that remain to be loaded, then those of them that are
-	// not clean, without holding the loaders' locks while asking clean.
+	// not clean, a word of the dirty set at a time, without holding the
+	// loaders' locks.
 	var unloaded []memmap.FileRange
 	for _, amfl := range loads.amfls {
 		if amfl == nil {
@@ -2366,16 +2368,13 @@ func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) (uint64, err
 	}
 	var unclean []memmap.FileRange
 	for _, fr := range mergeFileRanges(unloaded) {
-		for off := fr.Start; off < fr.End; off += hostarch.PageSize {
-			if clean(off) {
-				continue
-			}
-			if n := len(unclean); n != 0 && unclean[n-1].End == off {
-				unclean[n-1].End += hostarch.PageSize
+		img.forEachUnclean(fr, func(ufr memmap.FileRange) {
+			if n := len(unclean); n != 0 && unclean[n-1].End == ufr.Start {
+				unclean[n-1].End = ufr.End
 			} else {
-				unclean = append(unclean, memmap.FileRange{Start: off, End: off + hostarch.PageSize})
+				unclean = append(unclean, ufr)
 			}
-		}
+		})
 	}
 	return f.awaitLoads(loads, unclean)
 }

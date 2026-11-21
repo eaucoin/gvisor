@@ -669,5 +669,5 @@ func (p *Precopy) setSaveOpts(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile, la
 		return
 	}
 	opts.Precopy = pc
-	opts.Clean = func(off uint64) bool { return !set.Contains(off) }
+	opts.Dirty = set
 }

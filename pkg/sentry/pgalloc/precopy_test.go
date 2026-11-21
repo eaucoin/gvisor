@@ -19,6 +19,7 @@ package pgalloc
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -92,7 +93,7 @@ func TestPrecopy(t *testing.T) {
 	last := tf.f.SwapDirty(true /* paused */)
 	ti := pw.save(t, tf.f, nil, SaveOpts{
 		Precopy:    p,
-		Clean:      func(off uint64) bool { return !last.Contains(off) },
+		Dirty:      last,
 		PageHashes: true,
 	})
 	if got, want := uint64(len(ti.pages)), uint64(n+3+2)*page; got != want {
@@ -218,7 +219,7 @@ func TestPrecopyReallocatedPage(t *testing.T) {
 			}
 			ti := pw.save(t, f, parent, SaveOpts{
 				Precopy:    p,
-				Clean:      func(off uint64) bool { return !last.Contains(off) },
+				Dirty:      last,
 				PageHashes: true,
 			})
 			checkSameContents(t, loadTestImage(t, ti), f, again)
@@ -278,7 +279,7 @@ func TestPrecopyDuringLoadCopiesDirtyPagesLoaded(t *testing.T) {
 	last := f2.SwapDirty(true /* paused */)
 	ti := pw.save(t, f2, parent, SaveOpts{
 		Precopy:    p,
-		Clean:      func(off uint64) bool { return !last.Contains(off) },
+		Dirty:      last,
 		PageHashes: true,
 	})
 	m := ti.mfImage()
@@ -290,4 +291,53 @@ func TestPrecopyDuringLoadCopiesDirtyPagesLoaded(t *testing.T) {
 	}
 	checkSameContents(t, loadTestImage(t, ti), tf.f, tf.fr)
 	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// TestPrecopyForEachUnclean checks that the pages a save completing a
+// pre-copy finds unclean, range by range, as it does among those still
+// loading, are those it finds unclean page by page: the dirty pages, and the
+// pages whose contents the pre-copy does not know, among them those beyond
+// its limit.
+func TestPrecopyForEachUnclean(t *testing.T) {
+	const pages = 1024
+	rng := rand.New(rand.NewSource(1))
+	for round := 0; round < 50; round++ {
+		limit := uint64(rng.Intn(pages)) * page
+		p := &Precopy{limit: limit, copies: make([]uint64, limit/page), hashes: make([]uint64, limit/page)}
+		for i := range p.copies {
+			switch rng.Intn(3) {
+			case 0:
+				p.copies[i] = copyUnknown
+			case 1:
+				p.copies[i] = 1 + uint64(i)*page
+			}
+		}
+		dirty := &DirtySet{words: make([]uint64, pages/64)}
+		for i := 0; i < pages/8; i++ {
+			off := uint64(rng.Intn(pages)) * page
+			dirty.add(memmap.FileRange{Start: off, End: off + page})
+		}
+		s := &imageSaver{dirty: dirty, precopy: p}
+		fr := memmap.FileRange{Start: uint64(rng.Intn(pages/2)) * page, End: uint64(pages/2+rng.Intn(pages/2)) * page}
+		var got []uint64
+		last := fr.Start
+		s.forEachUnclean(fr, func(ufr memmap.FileRange) {
+			if ufr.Start < last || ufr.Length() == 0 || !fr.IsSupersetOf(ufr) {
+				t.Fatalf("round %d: range %v out of order, empty or outside %v", round, ufr, fr)
+			}
+			last = ufr.End
+			for off := ufr.Start; off < ufr.End; off += page {
+				got = append(got, off)
+			}
+		})
+		var want []uint64
+		for off := fr.Start; off < fr.End; off += page {
+			if !s.isClean(off) {
+				want = append(want, off)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("round %d: unclean pages %v, want %v", round, got, want)
+		}
+	}
 }

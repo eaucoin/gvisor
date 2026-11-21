@@ -814,7 +814,7 @@ func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.Resour
 // pages in lastRound. owner identifies a private MemoryFile, and is nil for
 // the application MemoryFile.
 func setMemoryFileSaveOpts(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile, owner *checkpoint.ResourceID, delta *incrementalSave, precopy *Precopy, lastRound *DirtyEpochResult) {
-	opts.Base, opts.BaseLayers, opts.Clean, opts.Precopy = nil, nil, nil, nil
+	opts.Base, opts.BaseLayers, opts.Dirty, opts.Precopy = nil, nil, nil, nil
 	if delta != nil {
 		delta.setBase(opts, mf, owner)
 	}

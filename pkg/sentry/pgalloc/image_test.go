@@ -121,11 +121,27 @@ func (ti *testImage) mfImage() *checkpointimage.MemoryFileImage {
 }
 
 // saveTestImage saves f as an image. If parent is not nil, it saves a delta of
-// parent with clean as SaveOpts.Clean, parent's layers becoming the following
-// layers of the image.
+// parent whose clean pages are those for which clean returns true, parent's
+// layers becoming the following layers of the image.
 func saveTestImage(t *testing.T, f *MemoryFile, parent *testImage, clean func(uint64) bool) *testImage {
 	t.Helper()
-	return saveTestImageOpts(t, f, parent, SaveOpts{Clean: clean, PageHashes: true})
+	return saveTestImageOpts(t, f, parent, SaveOpts{Dirty: dirtySetOf(f, clean), PageHashes: true})
+}
+
+// dirtySetOf returns the set of the pages of f for which clean returns false,
+// or nil if clean is nil.
+func dirtySetOf(f *MemoryFile, clean func(uint64) bool) *DirtySet {
+	if clean == nil {
+		return nil
+	}
+	size := uint64(len(f.chunksLoad())) * chunkSize
+	s := &DirtySet{words: make([]uint64, size/hostarch.PageSize/64)}
+	for off := uint64(0); off < size; off += hostarch.PageSize {
+		if !clean(off) {
+			s.add(memmap.FileRange{Start: off, End: off + hostarch.PageSize})
+		}
+	}
+	return s
 }
 
 // saveTestImageOpts is saveTestImage with the given SaveOpts, whose Base,
@@ -421,7 +437,7 @@ func TestImageDeltaKeepsCleanPages(t *testing.T) {
 	}
 }
 
-// TestImageDeltaByHash saves a delta without SaveOpts.Clean: every page is
+// TestImageDeltaByHash saves a delta without SaveOpts.Dirty: every page is
 // hashed and compared with the parent's.
 func TestImageDeltaByHash(t *testing.T) {
 	tf := newImageTestFile(t, 32)
@@ -692,7 +708,7 @@ func TestImageDeltaDuringLoad(t *testing.T) {
 			saved := make(chan *testImage, 1)
 			go func() {
 				saved <- saveTestImageOpts(t, f2, parent, SaveOpts{
-					Clean:                     func(uint64) bool { return true },
+					Dirty:                     &DirtySet{},
 					ExcludeCommittedZeroPages: exclude,
 					PageHashes:                true,
 				})
@@ -750,7 +766,7 @@ func TestImageDeltaDuringLoadReadsDirtyPages(t *testing.T) {
 	saved := make(chan *testImage, 1)
 	go func() {
 		saved <- saveTestImageOpts(t, f2, parent, SaveOpts{
-			Clean:      func(off uint64) bool { return off != pageAt(marked).Start && off != pageAt(decommitted).Start },
+			Dirty:      dirtySetOf(f2, func(off uint64) bool { return off != pageAt(marked).Start && off != pageAt(decommitted).Start }),
 			PageHashes: true,
 		})
 	}()
@@ -794,13 +810,14 @@ func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
 	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
 	var openGate sync.Once
 	defer openGate.Do(func() { close(gate.gate) })
+	img := &imageSaver{dirty: dirtySetOf(f2, clean)}
 	type result struct {
 		waited uint64
 		err    error
 	}
 	awaited := make(chan result, 1)
 	go func() {
-		waited, err := f2.awaitUncleanLoads(clean)
+		waited, err := f2.awaitUncleanLoads(img)
 		awaited <- result{waited, err}
 	}()
 	select {
@@ -825,7 +842,7 @@ func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
 	if err := f2.AwaitLoadAll(); err != nil {
 		t.Fatalf("AwaitLoadAll: %v", err)
 	}
-	if waited, err := f2.awaitUncleanLoads(clean); err != nil || waited != 0 {
+	if waited, err := f2.awaitUncleanLoads(img); err != nil || waited != 0 {
 		t.Errorf("awaitUncleanLoads once loaded: waited for %d bytes, error %v; want 0, nil", waited, err)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
@@ -932,6 +949,34 @@ func TestAwaitLoadsUnloadedIn(t *testing.T) {
 		want = mergeFileRanges(want)
 		if got := loads.unloadedIn(frs); !slices.Equal(got, want) {
 			t.Fatalf("round %d: unloadedIn(%v) = %v, want %v", round, frs, got, want)
+		}
+	}
+}
+
+// BenchmarkAwaitUncleanLoads measures how long a save's wait takes to find
+// the pages it must wait for among the pages of a large MemoryFile that
+// remain to be loaded, few of them dirty: it is spent with the sandbox
+// paused.
+func BenchmarkAwaitUncleanLoads(b *testing.B) {
+	const pages = 1 << 18 // 1 GiB
+	f := newTestMemoryFile(b, testMemoryFileOpts{})
+	fr, err := f.Allocate(pages*page, AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		b.Fatalf("Allocate: %v", err)
+	}
+	dirty := dirtySetOf(f, func(off uint64) bool { return (off-fr.Start)/page%4096 != 0 })
+	img := &imageSaver{dirty: dirty}
+	// Every page of the allocation remains to be loaded, in one layer whose
+	// loader never runs.
+	amfl := &asyncMemoryFileLoad{f: f, pf: &AsyncPagesFileLoad{}}
+	amfl.unloaded.InsertRange(fr, aplUnloadedInfo{})
+	loads := &asyncMemoryFileLoads{amfls: []*asyncMemoryFileLoad{amfl}}
+	b.ResetTimer()
+	for b.Loop() {
+		var unclean []memmap.FileRange
+		img.forEachUnclean(fr, func(ufr memmap.FileRange) { unclean = append(unclean, ufr) })
+		if got := loads.unloadedIn(unclean); len(got) != pages/4096 {
+			b.Fatalf("found %d ranges to wait for, want %d", len(got), pages/4096)
 		}
 	}
 }

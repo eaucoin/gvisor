@@ -169,6 +169,40 @@ func (p *Precopy) Copy(s *DirtySet) uint64 {
 	return n
 }
 
+// forEachUnknown calls fn on each maximal range of pages of fr whose contents
+// p does not know (see lookup), intersected with fr, in increasing order.
+func (p *Precopy) forEachUnknown(fr memmap.FileRange, fn func(memmap.FileRange)) {
+	var run memmap.FileRange
+	for off := fr.Start; off < min(fr.End, p.limit); off += hostarch.PageSize {
+		if p.copies[off/hostarch.PageSize] != copyUnknown {
+			if run.Length() != 0 {
+				fn(run)
+				run = memmap.FileRange{}
+			}
+			continue
+		}
+		if run.Length() == 0 {
+			run.Start = off
+		}
+		run.End = off + hostarch.PageSize
+	}
+	// Pages at or beyond limit were never copied.
+	if fr.End > p.limit {
+		beyond := memmap.FileRange{Start: max(fr.Start, p.limit), End: fr.End}
+		if run.Length() != 0 && run.End == beyond.Start {
+			run.End = beyond.End
+		} else {
+			if run.Length() != 0 {
+				fn(run)
+			}
+			run = beyond
+		}
+	}
+	if run.Length() != 0 {
+		fn(run)
+	}
+}
+
 // forEachAllocated calls fn on each allocated range of f that overlaps fr,
 // intersected with fr, in increasing order, with f.mu locked and whether the
 // range is known-committed. It stops at the first error fn returns.

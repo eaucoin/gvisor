@@ -91,7 +91,7 @@ func (s *incrementalSave) layers() []*pgallocpb.LayerProto {
 // mf was tracked since the parent was saved or restored. owner identifies a
 // private MemoryFile, and is nil for the application MemoryFile.
 func (s *incrementalSave) setBase(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile, owner *checkpoint.ResourceID) {
-	opts.Base, opts.BaseLayers, opts.Clean = nil, nil, nil
+	opts.Base, opts.BaseLayers, opts.Dirty = nil, nil, nil
 	set, ok := s.sets[mf]
 	if !ok {
 		// mf was not tracked: save it whole.
@@ -109,5 +109,5 @@ func (s *incrementalSave) setBase(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile
 	for i := range opts.BaseLayers {
 		opts.BaseLayers[i] = uint32(i + 1)
 	}
-	opts.Clean = func(off uint64) bool { return !set.Contains(off) }
+	opts.Dirty = set
 }
