@@ -180,19 +180,18 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 // unloadedFaultRangeLocked returns the MemoryFile and the range of it that
 // mapASLocked would wait to be loaded, asynchronously from a checkpoint,
 // before it maps the faulting page ar on an application fault; or a nil
-// MemoryFile if mapASLocked would wait for no page. It takes a reference on
-// the range returned for the caller, which must drop it with DecRef, so that
-// the caller may wait for the range to be loaded once it has unlocked
-// mm.activeMu: the mm's other tasks may then unmap the pages or copy them
-// away, but the pages are not freed until the caller's wait has ended (the
-// precondition of pgalloc.MemoryFile.AwaitLoad).
+// MemoryFile if mapASLocked would wait for no page. The caller may wait for
+// the range to be loaded once it has unlocked mm.activeMu, holding no
+// reference on it: the mm's other tasks may then unmap the pages or copy them
+// away, and pages freed meanwhile end the wait
+// (pgalloc.MemoryFile.AwaitLoad).
 //
 // Preconditions:
 //   - ar is the page of an application fault.
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start), and its pma holds ar.
 //
 // +checklocksread:mm.activeMu
-func (mm *MemoryManager) unloadedFaultRangeLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange) (*pgalloc.MemoryFile, memmap.FileRange) {
+func (mm *MemoryManager) unloadedFaultRangeLocked(pseg pmaIterator, ar hostarch.AddrRange) (*pgalloc.MemoryFile, memmap.FileRange) {
 	pma := pseg.ValuePtr()
 	mf, ok := pma.file.(*pgalloc.MemoryFile)
 	if !ok || !mf.IsAsyncLoading() {
@@ -213,7 +212,6 @@ func (mm *MemoryManager) unloadedFaultRangeLocked(ctx context.Context, pseg pmaI
 	// Record the touch as mapASLocked would have before waiting, so that the
 	// working set keeps the order in which the application first touched it.
 	mf.RecordTouch(fr)
-	mf.IncRef(fr, pgalloc.MemoryCgroupIDFromContext(ctx))
 	return mf, fr
 }
 

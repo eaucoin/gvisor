@@ -1028,3 +1028,80 @@ func TestFaultWaitingForLoadWokenByDecommit(t *testing.T) {
 		t.Errorf("the decommitted pages were read")
 	}
 }
+
+// pageFileRange returns the MemoryFile range of the page at addr, which a pma
+// maps.
+func pageFileRange(t *testing.T, mm *MemoryManager, addr hostarch.Addr) memmap.FileRange {
+	t.Helper()
+	mm.activeMu.RLock()
+	defer mm.activeMu.RUnlock()
+	pseg := mm.pmas.FindSegment(addr)
+	if !pseg.Ok() {
+		t.Fatalf("no pma maps %#x", addr)
+	}
+	return pseg.fileRangeOf(hostarch.AddrRange{addr, addr + hostarch.PageSize})
+}
+
+// TestFaultWaitingForLoadHoldsNoReference checks that a fault waiting for its
+// pages holds no reference on them: the pma that maps them holds the only
+// one, so that another task's write fault on them takes them over rather
+// than copying them, as it does once the wait has ended.
+func TestFaultWaitingForLoadHoldsNoReference(t *testing.T) {
+	ctx := contexttest.Context(t)
+	rp := restorePages(ctx, t, restoreOpts{pages: 256 + 64})
+	defer rp.finish(ctx, t)
+
+	// A fault past the first MiB, whose background read waits, takes the
+	// pages file's other slot with its awaited read, which holds references
+	// on the pages it reads. A second fault's pages, past the first's, wait
+	// for a read that cannot start.
+	first := startFault(ctx, t, rp.mm, rp.page(256+3), hostarch.Read)
+	rp.pf.waitStarted(t, pagesOf(256, asyncLoadingMapUnit/hostarch.PageSize))
+	page := uint64(256 + 40)
+	second := startFault(ctx, t, rp.mm, rp.page(page), hostarch.Read)
+	waitForStacks(t, second, 2, loadWaitFrame)
+	if fr := pageFileRange(t, rp.mm, rp.page(page)); !rp.mf.HasUniqueRef(fr) {
+		t.Errorf("pages %v have another reference than their pma's while a fault waits for them", fr)
+	}
+	rp.letLoad()
+	for i, fault := range []*faultResult{first, second} {
+		if err := faultEnds(t, fault); err != nil {
+			t.Errorf("HandleUserFault %d: %v", i, err)
+		}
+	}
+	if got, want := readPage(ctx, t, rp.mm, rp.page(page)), restoredByte(page); got != want {
+		t.Errorf("the faulting page holds %d, want %d", got, want)
+	}
+}
+
+// TestFaultWaitingForLoadOfFreedPages checks that a fault waiting for pages
+// whose read has not started ends once the pages are freed, as unmapping
+// them frees them, rather than once they would have loaded: it then fails as
+// a fault on unmapped memory does.
+func TestFaultWaitingForLoadOfFreedPages(t *testing.T) {
+	ctx := contexttest.Context(t)
+	rp := restorePages(ctx, t, restoreOpts{pages: 256 + 64})
+	defer rp.finish(ctx, t)
+
+	// As in TestFaultWaitingForLoadHoldsNoReference, the second fault's
+	// pages wait for a read that cannot start.
+	first := startFault(ctx, t, rp.mm, rp.page(256+3), hostarch.Read)
+	rp.pf.waitStarted(t, pagesOf(256, asyncLoadingMapUnit/hostarch.PageSize))
+	page := uint64(256 + 40)
+	second := startFault(ctx, t, rp.mm, rp.page(page), hostarch.Read)
+	waitForStacks(t, second, 2, loadWaitFrame)
+	unit := hostarch.Addr(asyncLoadingMapUnit)
+	start := rp.page(page) &^ (unit - 1)
+	within(t, rp, "MUnmap", func() {
+		if err := rp.mm.MUnmap(ctx, start, uint64(unit)); err != nil {
+			t.Fatalf("MUnmap: %v", err)
+		}
+	})
+	if err := faultEnds(t, second); !linuxerr.Equals(linuxerr.EFAULT, err) {
+		t.Errorf("HandleUserFault on freed memory: got %v, want EFAULT", err)
+	}
+	rp.letLoad()
+	if err := faultEnds(t, first); err != nil {
+		t.Errorf("HandleUserFault: %v", err)
+	}
+}
