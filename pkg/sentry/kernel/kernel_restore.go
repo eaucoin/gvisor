@@ -335,7 +335,7 @@ func loadPrivateMemoryFiles(ctx context.Context, r io.Reader, mfmap map[checkpoi
 // loadMemoryFiles loads MemoryFiles saved inline in the state file r.
 func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 	opts := pgalloc.LoadOpts{Image: &pgallocpb.ImageProto{}}
-	if err := checkpointimage.ReadRecord(r, opts.Image, checkpointimage.MaxBodySize); err != nil {
+	if err := checkpointimage.ReadStateRecord(r, opts.Image, checkpointimage.MaxBodySize); err != nil {
 		return fmt.Errorf("failed to read image metadata: %w", err)
 	}
 	if err := checkpointimage.ValidateImage(opts.Image); err != nil {

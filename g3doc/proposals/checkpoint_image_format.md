@@ -44,7 +44,10 @@ An uncompressed checkpoint image is a directory of three files
     wrote again.
 
 A compressed checkpoint keeps its memory in its state file and has neither
-`pages_meta.img` nor `pages.img`; nothing in this document applies to it.
+`pages_meta.img` nor `pages.img`; nothing in this document applies to it but
+the records of its memory's metadata, the same as the body's below, which its
+state file holds each framed as data that is not an object of the state file,
+as its pages are, so that `runsc statefile` skips them.
 
 ## Byte layout of `pages_meta.img`
 

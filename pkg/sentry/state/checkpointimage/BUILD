@@ -18,6 +18,8 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/state",
+        "//pkg/state/wire",
         "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
