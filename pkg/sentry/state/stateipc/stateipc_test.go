@@ -19,6 +19,7 @@ import (
 	"io"
 	"io/fs"
 	"math/bits"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -878,5 +879,116 @@ func TestReadParallelReads(t *testing.T) {
 			t.Errorf("ParallelReads of %q: got %d, want %d", tc.path, got, tc.want)
 		}
 		ar.Close()
+	}
+}
+
+// kindReader is an AsyncReader that records the kind of each read it is
+// given, as stateio.KindAsyncReader.SetReadKind says it.
+type kindReader struct {
+	stateio.AsyncReader
+	next  map[int]stateio.ReadKind
+	kinds []stateio.ReadKind
+}
+
+// SetReadKind implements stateio.KindAsyncReader.SetReadKind.
+func (r *kindReader) SetReadKind(id int, kind stateio.ReadKind) {
+	r.next[id] = kind
+}
+
+// AddRead implements stateio.AsyncReader.AddRead.
+func (r *kindReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.kinds = append(r.kinds, r.next[id])
+	delete(r.next, id)
+	r.AsyncReader.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+// AddReadv implements stateio.AsyncReader.AddReadv.
+func (r *kindReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.kinds = append(r.kinds, r.next[id])
+	delete(r.next, id)
+	r.AsyncReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+// testKindServer serves a file whose reader records the kinds of its reads.
+type testKindServer struct {
+	reader *kindReader
+}
+
+func (s *testKindServer) Destroy() {}
+
+func (s *testKindServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	s.reader = &kindReader{
+		AsyncReader: stateio.NewIOReader(bytes.NewReader(make([]byte, 4*4096)), 4096, 2 /* maxRanges */, 4 /* maxParallel */),
+		next:        make(map[int]stateio.ReadKind),
+	}
+	return s.reader, nil
+}
+
+func (s *testKindServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// TestReadKinds checks that the server's reader of a file is told the kind of
+// each read of the client's reader, awaited or background, as the client's
+// caller set it, and that a read whose kind was not set is of unknown kind.
+func TestReadKinds(t *testing.T) {
+	usrv := urpc.NewServer()
+	srv := &testKindServer{}
+	server, err := NewAsyncFileServer(srv)
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	usrv.StartHandling(serverSock)
+
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestReadKinds", 4*4096)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+	ar, err := client.OpenRead("file")
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	kr, ok := ar.(stateio.KindAsyncReader)
+	if !ok {
+		t.Fatalf("the client's reader, %T, takes no read kinds", ar)
+	}
+	df, err := ar.RegisterDestinationFD(memfd, 4*4096, 0 /* discard */, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	want := []stateio.ReadKind{stateio.ReadAwaited, stateio.ReadBackground, stateio.ReadUnknown, stateio.ReadBackground}
+	for i, kind := range want {
+		if kind != stateio.ReadUnknown {
+			kr.SetReadKind(i, kind)
+		}
+		fr := memmap.FileRange{uint64(i) * 4096, uint64(i+1) * 4096}
+		if i%2 == 0 {
+			ar.AddRead(i, int64(fr.Start), df, fr, buf[fr.Start:fr.End])
+		} else {
+			ar.AddReadv(i, int64(fr.Start), 4096, df, []memmap.FileRange{fr}, []unix.Iovec{{Base: &buf[fr.Start], Len: 4096}})
+		}
+	}
+	for done := 0; done < len(want); {
+		cs, err := ar.Wait(nil, 1 /* minCompletions */)
+		if err != nil {
+			t.Fatalf("AsyncReader.Wait failed: %v", err)
+		}
+		done += len(cs)
+	}
+	if got := srv.reader.kinds; !slices.Equal(got, want) {
+		t.Errorf("the server's reader was given reads of kinds %v, want %v", got, want)
 	}
 }

@@ -208,6 +208,11 @@ type asyncReadWriter struct {
 	connectorWG sync.WaitGroup
 
 	reserve uint64
+
+	// kinds holds, for a reader, the kind of each read ID that
+	// SetReadKind set, which the read it enqueues next carries to the
+	// server. kinds is used by the goroutine that enqueues reads.
+	kinds []stateio.ReadKind
 }
 
 // Close implements stateio.AsyncReader.Close and stateio.AsyncWriter.Close.
@@ -315,6 +320,26 @@ func (rw *asyncReadWriter) registerClientFD(fd int32, size, discard uint64, sett
 	return clientFileHandle(resp.Handle), nil
 }
 
+// SetReadKind implements stateio.KindAsyncReader.SetReadKind: the server's
+// reader of the file is told the kind of each read, if it takes it.
+func (rw *asyncReadWriter) SetReadKind(id int, kind stateio.ReadKind) {
+	if rw.kinds == nil {
+		rw.kinds = make([]stateio.ReadKind, rw.maxParallel)
+	}
+	rw.kinds[id] = kind
+}
+
+// readKind returns the kind of the read with the given ID that SetReadKind
+// set, and forgets it.
+func (rw *asyncReadWriter) readKind(id int) stateio.ReadKind {
+	if rw.kinds == nil {
+		return stateio.ReadUnknown
+	}
+	kind := rw.kinds[id]
+	rw.kinds[id] = stateio.ReadUnknown
+	return kind
+}
+
 // AddRead implements stateio.AsyncReader.AddRead.
 func (rw *asyncReadWriter) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
 	if rw.ensureConnected() != nil {
@@ -323,6 +348,7 @@ func (rw *asyncReadWriter) AddRead(id int, off int64, dstFile stateio.Destinatio
 	subHdr := rw.ioep.scanReadSubmissionHeader()
 	*subHdr = readSubmissionHeader{
 		ID:        uint32(id),
+		Kind:      uint32(rw.readKind(id)),
 		Offset:    off,
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: 1,
@@ -340,6 +366,7 @@ func (rw *asyncReadWriter) AddReadv(id int, off int64, total uint64, dstFile sta
 	numRanges := uint32(len(dstFRs))
 	*subHdr = readSubmissionHeader{
 		ID:        uint32(id),
+		Kind:      uint32(rw.readKind(id)),
 		Offset:    off,
 		DstHandle: uint32(dstFile.(clientFileHandle)),
 		NumRanges: numRanges,
