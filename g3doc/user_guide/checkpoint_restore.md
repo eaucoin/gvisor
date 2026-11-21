@@ -202,7 +202,10 @@ A thread waiting for a page still loading is killable, as a Linux task waiting
 for I/O in a page fault is: killed (`SIGKILL`, `runsc kill`, the end of its
 process or of its container), it stops waiting and exits, however long the
 page's read takes, and `runsc kill --all` and `runsc delete` do not wait for
-the read. Its page goes on loading for the threads that remain.
+the read. Its page goes on loading for the threads that remain. A thread whose
+fault waits so also stops waiting when it must stop, as for a checkpoint's
+pause, which so does not wait for the page either: it faults again once it
+runs on.
 
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means

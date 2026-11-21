@@ -36,6 +36,12 @@ import (
 // even if its pages are replaced by others not loaded yet each time it waits.
 const maxFaultLoadWaits = 3
 
+// killableBlocker is the context of a task that can block until it is killed
+// or required to stop (kernel.Task.BlockKillable).
+type killableBlocker interface {
+	BlockKillable(C <-chan struct{}) error
+}
+
 // HandleUserFault handles an application page fault. sp is the faulting
 // application thread's stack pointer.
 //
@@ -47,8 +53,10 @@ const maxFaultLoadWaits = 3
 // it changes mm's pmas, so that it copies a copy-on-write page, or ends
 // dirty tracking's write protection of a page, only once the page is loaded,
 // and holds no reference on the pages while it waits, so that it does not
-// keep other tasks' copy-on-write faults from taking them over. Like that
-// wait, it ends early only when the task is killed.
+// keep other tasks' copy-on-write faults from taking them over. Like Linux's,
+// the wait ends early when the task is killed or must stop, as for a
+// checkpoint: the fault then returns without mapping anything, so that the
+// task handles that first, and faults again if it runs on.
 //
 // Preconditions: mm.as != nil.
 //
@@ -87,7 +95,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 			mm.activeMu.RUnlock()
 			if mf != nil {
 				mm.mappingMu.RUnlock()
-				if end, err := mm.awaitFaultLoad(mf, fr, &waits); end {
+				if end, err := mm.awaitFaultLoad(ctx, mf, fr, &waits); end {
 					return err
 				}
 				continue
@@ -113,7 +121,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 				// pseg and vseg are invalid once activeMu is unlocked: the
 				// fault is handled again from the start.
 				mm.activeMu.RUnlock()
-				if end, err := mm.awaitFaultLoad(mf, fr, &waits); end {
+				if end, err := mm.awaitFaultLoad(ctx, mf, fr, &waits); end {
 					return err
 				}
 				continue
@@ -129,19 +137,26 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 
 // awaitFaultLoad waits, holding none of mm's locks, for the pages fr of mf
 // that a fault maps to be loaded. It returns true, with the error that the
-// fault returns, if the fault must end without being handled:
-// linuxerr.EINTR if its wait was cut short (pgalloc.CancelAwaits) because
-// its task was killed. Otherwise, the fault is
+// fault returns, if the fault must end without being handled: nil if the
+// fault's task was killed or must stop, as ctx's BlockKillable says, so that
+// the task does that first; or linuxerr.EINTR if its wait was cut short
+// (pgalloc.CancelAwaits) because its task was killed. Otherwise, the fault is
 // handled again; if some of its pages will never be loaded, it no longer
 // waits unlocked for them, but lets mapASLocked fail as it does for them, if
 // the fault still maps them, by setting *waits to maxFaultLoadWaits.
 //
 // +checklocksexclude:mm.mappingMu
 // +checklocksexclude:mm.activeMu
-func (mm *MemoryManager) awaitFaultLoad(mf *pgalloc.MemoryFile, fr memmap.FileRange, waits *int) (bool, error) {
-	switch err := mf.AwaitLoad(fr); err {
+func (mm *MemoryManager) awaitFaultLoad(ctx context.Context, mf *pgalloc.MemoryFile, fr memmap.FileRange, waits *int) (bool, error) {
+	var block func(<-chan struct{}) error
+	if kb, ok := ctx.(killableBlocker); ok {
+		block = kb.BlockKillable
+	}
+	switch err := mf.AwaitLoad(fr, block); err {
 	case nil:
 		return false, nil
+	case linuxerr.ErrInterrupted:
+		return true, nil
 	case linuxerr.EINTR:
 		return true, err
 	default:
