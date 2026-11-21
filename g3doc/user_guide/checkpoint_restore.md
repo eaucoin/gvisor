@@ -186,7 +186,14 @@ than it would alone, which drops them back for a while. The log line "Async page
 loading completed" reports how many times and how long the application waited
 for pages, as do the metrics `/checkpoint/async_load_waits`,
 `/checkpoint/async_load_wait_bytes` and `/checkpoint/async_load_wait_nanoseconds`
-(see [observability](observability.md)).
+(see [observability](observability.md)). For debugging, `--async-load-trace=all`
+logs each read as it completes, with its kind (awaited, background or
+full-background), pages file offset, bytes, bytes of gaps, times of issue and
+completion, and the bound on background reads in flight then, in lines
+beginning "Async page loading trace:"; and the S3 checkpoint gofer, which is
+told whether each read it serves is awaited or made in the background, logs
+each GET of a pages file as it ends, with that kind, its worker and the times it
+began, was answered and ended, in lines beginning "S3 read trace:".
 
 The pages that an image keeps in a parent layer are scattered across that
 layer's pages file, between the pages that later layers replaced. A background

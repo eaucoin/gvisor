@@ -240,6 +240,7 @@ go_test(
         ":pgalloc_metadata_go_proto",
         "//pkg/context",
         "//pkg/hostarch",
+        "//pkg/log",
         "//pkg/memutil",
         "//pkg/sentry/hostmm",
         "//pkg/sentry/hostmm/hostmmtest",

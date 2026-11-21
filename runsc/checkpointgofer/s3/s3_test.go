@@ -34,10 +34,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/checkpointgofer/s3/s3test"
 )
 
@@ -141,6 +143,62 @@ func TestPagesReadParallelReads(t *testing.T) {
 	}
 	if got := pr.ParallelReads(); got != 12 || r.MaxParallel() != 12 {
 		t.Errorf("ParallelReads = %d, MaxParallel = %d; want 12 and 12", got, r.MaxParallel())
+	}
+}
+
+// traceLines is a log.Emitter that keeps the lines that begin with prefix.
+type traceLines struct {
+	prefix string
+	mu     sync.Mutex
+	lines  []string
+}
+
+// Emit implements log.Emitter.Emit.
+func (e *traceLines) Emit(_ int, _ log.Level, _ time.Time, format string, v ...any) {
+	if line := fmt.Sprintf(format, v...); strings.HasPrefix(line, e.prefix) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.lines = append(e.lines, line)
+	}
+}
+
+// TestPagesReadTrace checks that a reader of the pages file of a FileServer
+// that traces logs each GET as it ends, with the kind of the read it serves
+// as the reader was told it, and a summary as it closes.
+func TestPagesReadTrace(t *testing.T) {
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, testObject(64<<10))
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, Trace: true})
+	r, err := srv.OpenRead(checkpointfiles.PagesFileName)
+	if err != nil {
+		t.Fatalf("OpenRead: %v", err)
+	}
+	kr, ok := r.(stateio.KindAsyncReader)
+	if !ok {
+		t.Fatalf("the pages file's reader, %T, takes no read kinds", r)
+	}
+	lines := &traceLines{prefix: "S3 read trace:"}
+	prev := log.Log()
+	log.SetTarget(lines)
+	defer log.SetTarget(prev.Emitter)
+
+	buf := make([]byte, 4096)
+	kr.SetReadKind(0, stateio.ReadAwaited)
+	read(t, r, 0, buf)
+	kr.SetReadKind(0, stateio.ReadBackground)
+	read(t, r, 4096, buf)
+	read(t, r, 8192, buf)
+	r.Close()
+
+	lines.mu.Lock()
+	defer lines.mu.Unlock()
+	if len(lines.lines) != 4 {
+		t.Fatalf("traced %d lines, want 3 GETs and a summary: %q", len(lines.lines), lines.lines)
+	}
+	for i, want := range []string{" awaited off 0 bytes 4096 got 4096 ", " background off 4096 bytes 4096 got 4096 ", " unknown off 8192 bytes 4096 got 4096 ", "closed "} {
+		if !strings.Contains(lines.lines[i], want) {
+			t.Errorf("trace line %d is %q, want it to contain %q", i, lines.lines[i], want)
+		}
 	}
 }
 

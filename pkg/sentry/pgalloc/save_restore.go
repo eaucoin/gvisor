@@ -1618,6 +1618,10 @@ type AsyncPagesFileLoad struct {
 	// otherwise. kinds is immutable.
 	kinds stateio.KindAsyncReader
 
+	// If trace is true, each read is logged as it completes
+	// (AsyncPagesFileLoadOpts.Trace). trace is immutable.
+	trace bool
+
 	// parallelReads is the number of reads that ar serves at once, each at
 	// the rate of one alone, if it implements stateio.ParallelAsyncReader,
 	// and 0 otherwise. parallelReads is immutable.
@@ -2187,6 +2191,13 @@ type AsyncPagesFileLoadOpts struct {
 	// If Throttled is true, reads of pages without waiters are throttled
 	// until AsyncPagesFileLoad.Unthrottle() is called.
 	Throttled bool
+
+	// If Trace is true, the async page loader logs each read as it completes,
+	// as a line beginning "Async page loading trace:": its kind, pages file
+	// offset, bytes and bytes of gaps, when it was issued and completed (Unix
+	// nanoseconds), the bytes of background reads in flight as it was issued,
+	// and the budget's bound, floor and drops then.
+	Trace bool
 }
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
@@ -2213,6 +2224,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
 		throttled:        atomicbitops.FromBool(opts.Throttled),
+		trace:            opts.Trace,
 		discard:          discard,
 		discardSlot:      discardSlot,
 		qavail:           maxParallel,
@@ -3358,6 +3370,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
 	timeStart := aplNanotime()
+	// The trace's times are Unix nanoseconds: aplNanotime() plus wallOffset.
+	wallOffset := time.Now().UnixNano() - timeStart
 	// Background reads may use every slot but one, which is kept for awaited
 	// reads (see mayStartBackgroundRead).
 	apfl.bgBudget.init(timeStart, apfl.maxReadBytes, uint64(max(maxParallel-1, 1))*apfl.maxReadBytes, apfl.parallelReads)
@@ -3611,6 +3625,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				apfl.awaitedInflight--
 			}
 			apfl.bgBudget.readCompleted(now, c.N, op.issued, kind, op.bgInflight, op.awaitedInflight)
+			if apfl.trace {
+				log.Infof("Async page loading trace: loader %p op %d %s off %d bytes %d gap %d issued %d completed %d bg-inflight %d budget %d floor %d drops %d", apfl, c.ID, kind, op.off(), op.total, op.gap, op.issued+wallOffset, now+wallOffset, op.bgInflight, apfl.bgBudget.bytes, apfl.bgBudget.floor, apfl.bgBudget.drops)
+			}
 			if op.firstRound {
 				apfl.firstRoundClosed = true
 				apfl.firstRoundDone++

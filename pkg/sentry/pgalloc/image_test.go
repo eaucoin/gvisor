@@ -32,6 +32,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
@@ -230,6 +231,12 @@ func (pw *testPagesWriter) save(t *testing.T, f *MemoryFile, parent *testImage, 
 // to complete.
 func loadTestImage(t *testing.T, ti *testImage, readers ...stateio.AsyncReader) *MemoryFile {
 	t.Helper()
+	return loadTestImageOpts(t, ti, AsyncPagesFileLoadOpts{}, readers...)
+}
+
+// loadTestImageOpts is loadTestImage, which loads each layer with loadOpts.
+func loadTestImageOpts(t *testing.T, ti *testImage, loadOpts AsyncPagesFileLoadOpts, readers ...stateio.AsyncReader) *MemoryFile {
+	t.Helper()
 	f := newTestMemoryFile(t, testMemoryFileOpts{})
 	opts := LoadOpts{Image: ti.img.Proto}
 	for i, layer := range ti.layers {
@@ -245,7 +252,7 @@ func loadTestImage(t *testing.T, ti *testImage, readers ...stateio.AsyncReader) 
 				t.Errorf("async page loading from layer %d: %v", i, err)
 			}
 			close(done)
-		}, nil, AsyncPagesFileLoadOpts{})
+		}, nil, loadOpts)
 		if err != nil {
 			t.Fatalf("StartAsyncPagesFileLoad: %v", err)
 		}
@@ -1302,4 +1309,47 @@ func TestAsyncLoadReadKinds(t *testing.T) {
 		t.Errorf("reads of kinds %v, want awaited and background reads only", kr.kinds)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// traceLines is a log.Emitter that keeps the lines that begin with prefix.
+type traceLines struct {
+	prefix string
+	mu     sync.Mutex
+	lines  []string
+}
+
+// Emit implements log.Emitter.Emit.
+func (e *traceLines) Emit(_ int, _ log.Level, _ time.Time, format string, v ...any) {
+	if line := fmt.Sprintf(format, v...); strings.HasPrefix(line, e.prefix) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.lines = append(e.lines, line)
+	}
+}
+
+// TestAsyncLoadTrace checks that async page loading with
+// AsyncPagesFileLoadOpts.Trace logs each read as it completes, with its kind,
+// offset and bytes.
+func TestAsyncLoadTrace(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	lines := &traceLines{prefix: "Async page loading trace:"}
+	prev := log.Log()
+	log.SetTarget(lines)
+	defer log.SetTarget(prev.Emitter)
+	f2 := loadTestImageOpts(t, parent, AsyncPagesFileLoadOpts{Trace: true})
+	for deadline := time.Now().Add(testWaitTimeout); !f2.IsLoaded(tf.fr); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the pages did not load")
+		}
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+
+	lines.mu.Lock()
+	defer lines.mu.Unlock()
+	// The image's pages but every third, which is zero, are 5 pages of its
+	// pages file, which one background read reads.
+	if len(lines.lines) != 1 || !strings.Contains(lines.lines[0], fmt.Sprintf(" background off 0 bytes %d gap 0 issued ", 5*page)) {
+		t.Errorf("trace lines %q, want one of a background read of %d bytes at 0", lines.lines, 5*page)
+	}
 }

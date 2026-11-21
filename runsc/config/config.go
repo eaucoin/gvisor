@@ -527,6 +527,10 @@ type Config struct {
 	// saved in the image before the rest of its memory.
 	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
 
+	// AsyncLoadTrace is what of a background restore's reads is logged, for
+	// debugging.
+	AsyncLoadTrace AsyncLoadTrace `flag:"async-load-trace"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -2328,6 +2332,57 @@ func (p WorkingSetPrefetch) String() string {
 		return "off"
 	default:
 		panic(fmt.Sprintf("invalid working set prefetch policy %d", p))
+	}
+}
+
+// AsyncLoadTrace is what of a background restore's reads is logged.
+type AsyncLoadTrace int
+
+// AsyncLoadTrace values.
+const (
+	// AsyncLoadTraceNone logs no read.
+	AsyncLoadTraceNone AsyncLoadTrace = iota
+
+	// AsyncLoadTraceAll logs every read of the async page loader as it
+	// completes (pgalloc.AsyncPagesFileLoadOpts.Trace), and every GET of a
+	// pages file by the S3 checkpoint gofer as it ends, with the kind of the
+	// read it serves.
+	AsyncLoadTraceAll
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (t *AsyncLoadTrace) Set(v string) error {
+	switch v {
+	case "none":
+		*t = AsyncLoadTraceNone
+	case "all":
+		*t = AsyncLoadTraceAll
+	default:
+		return fmt.Errorf("invalid async load trace %q: must be none or all", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `t`.
+// Useful in flag declaration line.
+func (t AsyncLoadTrace) Ptr() *AsyncLoadTrace {
+	return &t
+}
+
+// Get implements flag.Get.
+func (t *AsyncLoadTrace) Get() any {
+	return *t
+}
+
+// String implements flag.String.
+func (t AsyncLoadTrace) String() string {
+	switch t {
+	case AsyncLoadTraceNone:
+		return "none"
+	case AsyncLoadTraceAll:
+		return "all"
+	default:
+		panic(fmt.Sprintf("invalid async load trace %d", t))
 	}
 }
 
