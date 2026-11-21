@@ -186,8 +186,9 @@ type readSubmissionHeader struct {
 	// ID is the id passed to AsyncReader.StartRead/Readv.
 	ID uint32
 
-	// Padding is unused, but aligns the following field to 8 bytes.
-	Padding uint32
+	// Kind is the read's stateio.ReadKind. It also aligns the following
+	// field to 8 bytes.
+	Kind uint32
 
 	// Offset is the offset into the file being read at which the read begins.
 	Offset int64
