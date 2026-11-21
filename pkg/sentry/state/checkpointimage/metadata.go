@@ -27,14 +27,16 @@ import (
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/log"
 	pb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
+	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/state/wire"
 )
 
 // WriteRecord writes m to w as a record: its length as a little-endian
 // uint64, then m.
 func WriteRecord(w io.Writer, m proto.Message) error {
-	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	data, err := marshalRecord(m)
 	if err != nil {
-		return fmt.Errorf("failed to marshal %T: %w", m, err)
+		return err
 	}
 	var lengthBuf [8]byte
 	binary.LittleEndian.PutUint64(lengthBuf[:], uint64(len(data)))
@@ -52,7 +54,47 @@ func ReadRecord(r io.Reader, m proto.Message, limit uint64) error {
 	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return fmt.Errorf("failed to read %T length: %w", m, err)
 	}
-	length := binary.LittleEndian.Uint64(lengthBuf[:])
+	return readRecordBody(r, m, binary.LittleEndian.Uint64(lengthBuf[:]), limit)
+}
+
+// WriteStateRecord writes m to w, a state file, as a record framed as data
+// that is not an object of the state file (state.WriteHeader), so that tools
+// that read the state file's objects, such as runsc statefile, skip it.
+func WriteStateRecord(w io.Writer, m proto.Message) error {
+	data, err := marshalRecord(m)
+	if err != nil {
+		return err
+	}
+	if err := state.WriteHeader(&wire.Writer{Writer: w}, uint64(len(data)), false /* object */); err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+// ReadStateRecord reads a record written by WriteStateRecord from r, a state
+// file, into m. limit bounds the length of the record.
+func ReadStateRecord(r io.Reader, m proto.Message, limit uint64) error {
+	length, object, err := state.ReadHeader(&wire.Reader{Reader: r})
+	if err != nil {
+		return fmt.Errorf("failed to read %T header: %w", m, err)
+	}
+	if object {
+		return formatErrorf("%T is an object of the state file", m)
+	}
+	return readRecordBody(r, m, length, limit)
+}
+
+func marshalRecord(m proto.Message) ([]byte, error) {
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal %T: %w", m, err)
+	}
+	return data, nil
+}
+
+// readRecordBody reads the length bytes of a record from r into m.
+func readRecordBody(r io.Reader, m proto.Message, length, limit uint64) error {
 	if length > limit {
 		return formatErrorf("%T of %d bytes exceeds the limit of %d bytes", m, length, limit)
 	}
