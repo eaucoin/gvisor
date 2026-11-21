@@ -187,11 +187,11 @@ An image saved relative to another, its parent (`pgalloc.SaveOpts.Base`),
 starts with the parent's layers as its own layers 1 to *n* (the parent is one of
 them) and refers to them directly:
 
-*   a page that has not been written since the parent was saved
-    (`SaveOpts.Clean`), or whose XXH64 is the parent's hash at that offset,
-    refers to the parent's extent for that page, with its layer index remapped
-    to the new image's (`SaveOpts.BaseLayers`), so it names the layer that
-    holds the data, not the parent;
+*   a page that has not been written since the parent was saved (one that
+    `SaveOpts.Dirty` does not hold), or whose XXH64 is the parent's hash at
+    that offset, refers to the parent's extent for that page, with its layer
+    index remapped to the new image's (`SaveOpts.BaseLayers`), so it names the
+    layer that holds the data, not the parent;
 *   a page that is zero has no extent;
 *   any other page is written to the image's own `pages.img`, and its extent
     refers to layer 0.
