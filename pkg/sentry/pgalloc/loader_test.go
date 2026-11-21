@@ -18,7 +18,9 @@ package pgalloc
 
 import (
 	"bytes"
+	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -1358,5 +1360,45 @@ func TestAsyncLoadScatteredLayer(t *testing.T) {
 				t.Errorf("loading the layer took %v, want at most %v (%.2f times the %v that a whole image takes)", took, limit, tc.maxSlowdown, wholeTook)
 			}
 		})
+	}
+}
+
+// TestLoadWaitAfterFailure checks that a save's wait for pages whose loading
+// has failed fails with that failure, as SaveTo would ("previous async page
+// loading failed"), rather than with ErrLoadWaitExpired, even with its
+// deadline past: the pages will never load, and the save is not one to try
+// again.
+func TestLoadWaitAfterFailure(t *testing.T) {
+	fr, _, img := loaderTestImage(t, 16*hostarch.PageSize)
+	r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+		manual:       true,
+	})
+	r.failAt(8 * hostarch.PageSize)
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	r.waitInflight(1)
+	r.finish()
+	if err := l.wait(t); err != linuxerr.EIO {
+		t.Fatalf("async page loading: got %v, want EIO", err)
+	}
+	restored.EnableDirtyTracking()
+	restored.MarkDirty(memmap.FileRange{Start: fr.Start + 8*hostarch.PageSize, End: fr.Start + 9*hostarch.PageSize})
+	past := time.Now().Add(-time.Second)
+	// The deadline passed, the wait's own expiry races the failure it finds:
+	// tried again and again, the failure must win every time.
+	for i := 0; i < 100; i++ {
+		for name, wait := range map[string]func() error{
+			"every page":     func() error { return restored.AwaitSaveLoads(&SaveOpts{}, past) },
+			"the dirty page": func() error { return restored.AwaitDirtyLoads(past) },
+		} {
+			err := wait()
+			if !errors.Is(err, linuxerr.EIO) || errors.Is(err, ErrLoadWaitExpired) || !strings.Contains(err.Error(), "previous async page loading failed") {
+				t.Fatalf("wait for %s after the failure, its deadline past: got %v, want the failure (EIO), as SaveTo says it", name, err)
+			}
+		}
 	}
 }

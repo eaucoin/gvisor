@@ -499,6 +499,12 @@ type Config struct {
 	// disk or a remote store does, for tests that cannot throttle a device.
 	TestOnlyCheckpointWriteRate uint64 `flag:"TESTONLY-checkpoint-write-rate"`
 
+	// TestOnlySaveRunningLoadWait tells whether a checkpoint with a load
+	// wait waits for the pages still loading while the sandbox runs, before
+	// the save/restore binary runs; tests skip it to reach its waits in the
+	// binary and in the pause.
+	TestOnlySaveRunningLoadWait SaveRunningLoadWait `flag:"TESTONLY-save-running-load-wait"`
+
 	// RestoreSpecValidation indicates the level of spec validation to be
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
@@ -1013,6 +1019,53 @@ func (a AutosaveKind) String() string {
 		return "incremental"
 	}
 	panic(fmt.Sprintf("Invalid autosave kind %d", a))
+}
+
+// SaveRunningLoadWait tells whether a checkpoint with a load wait waits for
+// the pages still loading while the sandbox runs, before the save/restore
+// binary runs.
+type SaveRunningLoadWait int
+
+const (
+	// SaveRunningLoadWaitOn waits.
+	SaveRunningLoadWaitOn SaveRunningLoadWait = iota
+
+	// SaveRunningLoadWaitSkip does not, so that tests reach the checkpoint's
+	// waits in the save/restore binary and in the pause.
+	SaveRunningLoadWaitSkip
+)
+
+func saveRunningLoadWaitPtr(v SaveRunningLoadWait) *SaveRunningLoadWait {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (s *SaveRunningLoadWait) Set(v string) error {
+	switch v {
+	case "on":
+		*s = SaveRunningLoadWaitOn
+	case "skip":
+		*s = SaveRunningLoadWaitSkip
+	default:
+		return fmt.Errorf("invalid running load wait %q: must be on or skip", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (s *SaveRunningLoadWait) Get() any {
+	return *s
+}
+
+// String implements flag.Value.
+func (s SaveRunningLoadWait) String() string {
+	switch s {
+	case SaveRunningLoadWaitOn:
+		return "on"
+	case SaveRunningLoadWaitSkip:
+		return "skip"
+	}
+	panic(fmt.Sprintf("Invalid running load wait %d", s))
 }
 
 // DirtyTrackingVerifyMode tells whether checkpoints verify that dirty tracking

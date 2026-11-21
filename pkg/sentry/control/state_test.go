@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	pkgstate "gvisor.dev/gvisor/pkg/state"
@@ -113,6 +114,35 @@ func TestStateSaveGraphEngineOverride(t *testing.T) {
 	}
 }
 
+// TestResumeAfterBinaryExpiredLeavesCuda checks that the resume of a save
+// whose save/restore binary was killed for waiting past its load wait does not
+// undo CUDA's checkpoint, which preSave runs after the binary and so did not
+// run for it: CUDA's checkpoint state, as one before left it, is left as it
+// is.
+func TestResumeAfterBinaryExpiredLeavesCuda(t *testing.T) {
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("testutil.Boot() failed: %v", err)
+	}
+	defer k.Timekeeper().Destroy()
+	k.AddStateToCheckpoint(cudaCheckpointPathKey, "/cuda-checkpoint")
+	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, false)
+	k.AddStateToCheckpoint(cudaProcsKey, []*kernel.ThreadGroup(nil))
+	if err := resumeAfterBinaryExpired(k)(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := k.PopCheckpointState(cudaCheckpointPathKey); got != "/cuda-checkpoint" {
+		t.Errorf("CUDA's checkpoint state after the resume: got %v, want it left as it was", got)
+	}
+}
+
+// TestStateServesRPCs checks that State, every exported method of which
+// serves an RPC, registers with a urpc server, as the sandbox's controller
+// registers it as it boots.
+func TestStateServesRPCs(t *testing.T) {
+	urpc.NewServer().Register(&State{})
+}
+
 // fakeLoads is what async page loads are doing, as a test sets it.
 type fakeLoads struct {
 	mu sync.Mutex
@@ -137,12 +167,13 @@ func (f *fakeLoads) progress() pgalloc.AsyncPageLoadProgress {
 	return f.p
 }
 
-// waitWithinAsync runs waitWithin in a goroutine of its own: the channel
-// receives when it returned false, or the zero time if it returned true.
+// waitWithinAsync runs waitWithin, without a load wait, in a goroutine of its
+// own: the channel receives when it timed out, or the zero time if it was
+// done.
 func waitWithinAsync(done <-chan struct{}, timeout time.Duration, f *fakeLoads) <-chan time.Time {
 	returned := make(chan time.Time, 1)
 	go func() {
-		if waitWithin(done, timeout, f.progress) {
+		if waitWithin(done, timeout, time.Time{}, f.progress) == waitDone {
 			returned <- time.Time{}
 			return
 		}
@@ -163,8 +194,8 @@ func TestWaitWithin(t *testing.T) {
 	t.Run("done", func(t *testing.T) {
 		done := make(chan struct{})
 		close(done)
-		if !waitWithin(done, timeout, (&fakeLoads{}).progress) {
-			t.Errorf("waitWithin of what was done: got false, want true")
+		if got := waitWithin(done, timeout, time.Time{}, (&fakeLoads{}).progress); got != waitDone {
+			t.Errorf("waitWithin of what was done: got %v, want %v", got, waitDone)
 		}
 	})
 
@@ -291,4 +322,39 @@ func TestWaitWithin(t *testing.T) {
 			t.Fatalf("waitWithin had not returned 5 s after what it waited for ended")
 		}
 	})
+
+	// A load wait ends the wait at the first tick past its deadline at which
+	// the loads stall, rather than stop the clock; loads that run past it
+	// leave the timeout as it was.
+	for _, tc := range []struct {
+		name string
+		p    pgalloc.AsyncPageLoadProgress
+		want waitOutcome
+		// minTook and maxTook bound the time the wait takes.
+		minTook, maxTook time.Duration
+	}{
+		{name: "loads that stall past the load wait", p: stalled, want: waitLoadWaitExpired, minTook: timeout / 2, maxTook: timeout},
+		{name: "loads that run past the load wait", p: loading, want: waitTimedOut, minTook: timeout, maxTook: timeout + time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			returned := make(chan waitOutcome, 1)
+			go func() {
+				returned <- waitWithin(make(chan struct{}), timeout, start.Add(timeout/2), (&fakeLoads{p: tc.p}).progress)
+			}()
+			var got waitOutcome
+			select {
+			case got = <-returned:
+			case <-time.After(timeout + 5*time.Second):
+				t.Fatalf("waitWithin had not returned %v after its timeout", 5*time.Second)
+			}
+			took := time.Since(start)
+			if got != tc.want {
+				t.Errorf("waitWithin: got %v, want %v", got, tc.want)
+			}
+			if took < tc.minTook || took > tc.maxTook {
+				t.Errorf("waitWithin took %v, want between %v and %v", took, tc.minTook, tc.maxTook)
+			}
+		})
+	}
 }

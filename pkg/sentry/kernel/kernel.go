@@ -808,6 +808,56 @@ func savePrivateMFs(ctx context.Context, w io.Writer, owners []checkpoint.Resour
 	return nil
 }
 
+// AwaitSaveLoads waits, while k runs, until deadline for the pages that a
+// save of k, incremental if incremental is true, would read that are still
+// being loaded asynchronously, and fails with pgalloc.ErrLoadWaitExpired
+// after. A save that follows waits for few or none: a save that is not
+// incremental reads every page; an incremental one reads those of its
+// MemoryFiles dirtied since the image k was last saved to or restored from,
+// of which few are still loading, those dirtied as they loaded (pages
+// decommitted then, or marked by marks coarser than the writes they record),
+// and every page of the MemoryFiles it saves whole.
+//
+// Preconditions: k is not being saved or restored.
+func (k *Kernel) AwaitSaveLoads(ctx context.Context, incremental bool, deadline time.Time) error {
+	for _, mf := range append([]*pgalloc.MemoryFile{k.mf}, k.privateMemoryFiles(ctx)...) {
+		var err error
+		if incremental && k.trackedSinceLastImage(mf) {
+			err = mf.AwaitDirtyLoads(deadline)
+		} else {
+			err = mf.AwaitSaveLoads(&pgalloc.SaveOpts{}, deadline)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// awaitSaveLoads waits until deadline for the pages that the saves of the
+// application MemoryFile mf and of the private MemoryFiles mfsToSave, with
+// SaveOpts set as saveMemoryFiles sets them, will read that are still being
+// loaded asynchronously, and fails with pgalloc.ErrLoadWaitExpired after. A
+// save without a pages file (havePagesFile false) reads every page.
+func awaitSaveLoads(mf *pgalloc.MemoryFile, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, havePagesFile bool, delta *incrementalSave, precopy *Precopy, lastRound *DirtyEpochResult, deadline time.Time) error {
+	await := func(mf *pgalloc.MemoryFile, owner *checkpoint.ResourceID) error {
+		var opts pgalloc.SaveOpts
+		if havePagesFile {
+			setMemoryFileSaveOpts(&opts, mf, owner, delta, precopy, lastRound)
+		}
+		return mf.AwaitSaveLoads(&opts, deadline)
+	}
+	if err := await(mf, nil /* owner */); err != nil {
+		return err
+	}
+	for fsID, mf := range mfsToSave {
+		if err := await(mf, &fsID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // setMemoryFileSaveOpts sets the options of opts that depend on the
 // MemoryFile being saved, mf: its part of the parent image if delta is not
 // nil, and its pre-copy if precopy copied it, whose last round dirtied the
@@ -837,10 +887,18 @@ func setMemoryFileSaveOpts(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile, owner
 // same parent: it writes to precopy's pages file, and pagesFile must be nil.
 // SaveTo takes ownership of precopy, even if it returns a non-nil error.
 //
+// If loadWaitDeadline is not zero, SaveTo waits until then for the pages it
+// reads that are still being loaded asynchronously, before it writes any of
+// the kernel's state or memory, and fails with pgalloc.ErrLoadWaitExpired
+// after: the kernel is then as it was before SaveTo, its dirty pages still
+// dirty, and may run on (see BeforeResume); what the caller wrote to
+// stateFile before, such as its header, and what precopy wrote are
+// incomplete.
+//
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool, parent *checkpointimage.Digest, precopy *Precopy) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time) error {
 	// The bypass is part of the saved task state, so it is armed before the
 	// state is written and covers both resuming after the save and restoring.
 	k.armSeccompRestartSyscallBypasses()
@@ -880,14 +938,14 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 			state.EnableGraphEngine(*graphEngine)
 			defer state.EnableGraphEngine(prevGraphEngine)
 		}
-		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, parent, precopy, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, parent, precopy, loadWaitDeadline, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
 }
 
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, parent *checkpointimage.Digest, precopy *Precopy, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
@@ -951,6 +1009,12 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			retErr = k.endDirtySave(ctx, saveEpoch, saved, image, retErr)
 		}()
 		if err != nil {
+			return err
+		}
+	}
+
+	if !loadWaitDeadline.IsZero() {
+		if err := awaitSaveLoads(k.mf, mfsToSaveActual, pagesMetadata != nil, delta, precopy, lastRound, loadWaitDeadline); err != nil {
 			return err
 		}
 	}

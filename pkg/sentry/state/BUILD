@@ -19,6 +19,7 @@ go_library(
         "//pkg/context",
         "//pkg/log",
         "//pkg/sentry/kernel",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",

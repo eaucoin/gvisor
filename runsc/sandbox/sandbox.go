@@ -2150,6 +2150,10 @@ type CheckpointOpts struct {
 	PrecopyBudget    time.Duration
 	PrecopyMaxRounds int
 	PrecopyThrottle  bool
+
+	// LoadWait bounds the save's wait for pages still being loaded; see
+	// controlapi.SaveOpts.LoadWait.
+	LoadWait time.Duration
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2186,6 +2190,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		PrecopyBudget:    opts.PrecopyBudget,
 		PrecopyMaxRounds: opts.PrecopyMaxRounds,
 		PrecopyThrottle:  opts.PrecopyThrottle,
+		LoadWait:         opts.LoadWait,
 	}
 	if opts.StateEngine != nil {
 		useGraph := *opts.StateEngine == config.StateEngineGraph
