@@ -831,6 +831,111 @@ func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
 	checkSameContents(t, f2, tf.f, tf.fr)
 }
 
+// TestAwaitLoadsFindsUnloadedPagesUnlocked checks that a wait for pages that
+// are all loaded, or were never to be loaded, does not lock the MemoryFile:
+// a save's or a pre-copy round's wait finds the pages that remain to be
+// loaded among ranges that may be many, as those of a dirty set are, while
+// allocations and frees wait for the MemoryFile's lock.
+func TestAwaitLoadsFindsUnloadedPagesUnlocked(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	loads := f2.asyncPageLoad.Load()
+	if loads == nil {
+		t.Fatalf("no async page loading")
+	}
+	// Every third page is zero (newImageTestFile): the image has no data
+	// for it, so it is not loaded.
+	var zero []memmap.FileRange
+	for i := uint64(0); i < 8; i += 3 {
+		off := tf.fr.Start + i*page
+		zero = append(zero, memmap.FileRange{Start: off, End: off + page})
+	}
+	f2.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f2.awaitLoads(loads, zero)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		f2.mu.Unlock()
+		if err != nil {
+			t.Fatalf("awaitLoads: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		f2.mu.Unlock()
+		<-done
+		t.Fatalf("awaitLoads of pages that are not loading waited for the MemoryFile's lock")
+	}
+	openGate.Do(func() { close(gate.gate) })
+	if err := f2.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+}
+
+// TestAwaitLoadsUnloadedIn checks that the pages that awaitLoads finds to
+// remain to be loaded among many ranges, in several layers, are those that
+// do, as a look-up of each range in each layer finds them.
+func TestAwaitLoadsUnloadedIn(t *testing.T) {
+	const pages = 512
+	tf := newImageTestFile(t, pages)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	for i := uint64(0); i < pages; i += 5 {
+		tf.write(i, 1)
+	}
+	delta := saveTestImage(t, tf.f, parent, tf.clean)
+	var gates []*gatedReader
+	var readers []stateio.AsyncReader
+	for _, layer := range delta.layers {
+		g := &gatedReader{r: bytes.NewReader(layer), gate: make(chan struct{})}
+		gates = append(gates, g)
+		readers = append(readers, stateio.NewIOReader(g, 64<<10, 16, 4))
+	}
+	f2 := loadTestImage(t, delta, readers...)
+	defer func() {
+		for _, g := range gates {
+			close(g.gate)
+		}
+		if err := f2.AwaitLoadAll(); err != nil {
+			t.Errorf("AwaitLoadAll: %v", err)
+		}
+	}()
+	loads := f2.asyncPageLoad.Load()
+	rng := rand.New(rand.NewSource(1))
+	for round := 0; round < 100; round++ {
+		// Random sorted ranges of the allocation, some of them abutting.
+		var frs []memmap.FileRange
+		for off := tf.fr.Start; off < tf.fr.End; {
+			n := uint64(1+rng.Intn(8)) * page
+			if rng.Intn(2) == 0 {
+				frs = append(frs, memmap.FileRange{Start: off, End: min(off+n, tf.fr.End)})
+			}
+			off += n
+		}
+		var want []memmap.FileRange
+		for _, amfl := range loads.amfls {
+			if amfl == nil {
+				continue
+			}
+			amfl.pf.mu.Lock()
+			for _, fr := range frs {
+				for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; ulseg = ulseg.NextSegment() {
+					want = append(want, ulseg.Range().Intersect(fr))
+				}
+			}
+			amfl.pf.mu.Unlock()
+		}
+		want = mergeFileRanges(want)
+		if got := loads.unloadedIn(frs); !slices.Equal(got, want) {
+			t.Fatalf("round %d: unloadedIn(%v) = %v, want %v", round, frs, got, want)
+		}
+	}
+}
+
 // TestImageLoadRejects checks that loading fails, before reading any page, if
 // the pages files do not match the image's layers.
 func TestImageLoadRejects(t *testing.T) {
