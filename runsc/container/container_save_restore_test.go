@@ -49,6 +49,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm/hostmmtest"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/state"
@@ -1126,6 +1127,382 @@ func TestCheckpointRestoreS3StoreAway(t *testing.T) {
 				t.Errorf("the store refused none of the restore's %d reads of its pages", reads)
 			}
 		})
+	}
+}
+
+// storeAwayRestore is a container restored with --background from an
+// S3-compatible object store, with pages_retry "while-running", whose store is
+// away from when the restore has returned until the test brings it back (see
+// newStoreAwayRestore).
+type storeAwayRestore struct {
+	conf *config.Config
+	args Args
+	// dir holds the checkpoint's S3 options and the application's output.
+	dir string
+	// cont is the restored container.
+	cont *Container
+	// The application writes the checksum of its data to outputPath, which
+	// outputFile is open on; want is its checksum before the checkpoint.
+	outputPath string
+	outputFile *os.File
+	want       string
+
+	mu sync.Mutex
+	// awayIf, if not nil, returns true while the store is away; refused is
+	// the number of reads of pages that the store refused.
+	awayIf  func() bool
+	refused int
+}
+
+// storeAwayLoadTime is how long the restore's reads of its pages last with the
+// store there. The store goes away only once the restore has returned, which
+// may wait for some of the pages, and storeAwayLoadTime leaves most of them
+// still to load then.
+const storeAwayLoadTime = 8 * time.Second
+
+// newStoreAwayRestore checkpoints, to an S3-compatible object store, a
+// container whose application holds 32 MiB in a file of a tmpfs of the
+// sentry's, whose pages it reads on, and writes their checksum; restores it
+// with --background, its pages read over storeAwayLoadTime; sends the store
+// away once the restore has returned; and returns once the store has refused
+// one of the restore's reads of its pages, the restore's loading stalled.
+func newStoreAwayRestore(t *testing.T, conf *config.Config) *storeAwayRestore {
+	t.Helper()
+	store := s3test.NewStore(t)
+	r := &storeAwayRestore{conf: conf, dir: s3ImageDir(t, store, pagesRetryOpts)}
+	store.Fault = func(w http.ResponseWriter, req *http.Request, op string, n int) bool {
+		if !isPagesRead(req, op) {
+			return false
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.awayIf == nil || !r.awayIf() {
+			return false
+		}
+		r.refused++
+		s3test.ResetConnection(t, w, "")
+		return true
+	}
+
+	r.outputPath = filepath.Join(r.dir, "output")
+	var err error
+	r.outputFile, err = createWriteableOutputFile(r.outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	t.Cleanup(func() { r.outputFile.Close() })
+	script := fmt.Sprintf(`head -c %d /dev/urandom > /etc/held; while true; do md5sum /etc/held >> %q; sleep 0.2; done`, 32<<20, r.outputPath)
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	t.Cleanup(cleanup)
+	r.args = Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir}
+	cont, err := New(conf, r.args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForFileNotEmpty(r.outputFile); err != nil {
+		t.Fatalf("Failed to wait for output file: %v", err)
+	}
+	if r.want, err = firstLine(r.outputPath); err != nil {
+		t.Fatalf("error reading output: %v", err)
+	}
+	if err := cont.Checkpoint(conf, r.dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont.Destroy()
+
+	pages, ok := store.Object("image/" + checkpointfiles.PagesFileName)
+	if !ok {
+		t.Fatalf("checkpoint did not write %s to the object store", checkpointfiles.PagesFileName)
+	}
+	conf.TestOnlyRestoreReadRate = uint64(len(pages)) * uint64(time.Second) / uint64(storeAwayLoadTime)
+	if r.cont, err = New(conf, r.args); err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	t.Cleanup(func() { r.cont.Destroy() })
+	if err := r.cont.Restore(conf, r.dir, sandbox.RestoreOpts{Background: true}); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	conf.TestOnlyRestoreReadRate = 0
+	r.setAwayIf(func() bool { return true })
+	// The restore's reads of its pages stall: the store refuses them.
+	if err := testutil.Poll(func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.refused == 0 {
+			return fmt.Errorf("the store refused none of the restore's reads of its pages yet")
+		}
+		return nil
+	}, 30*time.Second); err != nil {
+		t.Fatalf("the store away: %v", err)
+	}
+	return r
+}
+
+// setAwayIf has the store away while awayIf returns true, or there if it is
+// nil.
+func (r *storeAwayRestore) setAwayIf(awayIf func() bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.awayIf = awayIf
+}
+
+// back brings the store back, and checks that the application, which runs on,
+// writes on, its data intact.
+func (r *storeAwayRestore) back(t *testing.T) {
+	t.Helper()
+	if err := os.Truncate(r.outputPath, 0); err != nil {
+		t.Fatalf("error truncating output: %v", err)
+	}
+	r.setAwayIf(nil)
+	if err := waitForFileNotEmpty(r.outputFile); err != nil {
+		t.Fatalf("the container wrote nothing once the store was back: %v", err)
+	}
+	got, err := firstLine(r.outputPath)
+	if err != nil {
+		t.Fatalf("error reading output: %v", err)
+	}
+	if got != r.want {
+		t.Errorf("checksum of the application's data once the store was back is %q, want %q as before the checkpoint", got, r.want)
+	}
+}
+
+// checkpointLoadWaitExpires checkpoints r's container, without
+// --leave-running, with opts and a load wait of loadWait, to a new directory,
+// and checks that the checkpoint fails with pgalloc.ErrLoadWaitExpired once
+// loadWait has passed, within a while. It returns the checkpoint's error.
+func (r *storeAwayRestore) checkpointLoadWaitExpires(t *testing.T, opts sandbox.CheckpointOpts, loadWait time.Duration) error {
+	t.Helper()
+	opts.Compression = statefile.CompressionLevelNone
+	opts.LoadWait = loadWait
+	start := time.Now()
+	err := r.cont.Checkpoint(r.conf, newCheckpointDir(t), opts)
+	took := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), pgalloc.ErrLoadWaitExpired.Error()) {
+		t.Fatalf("checkpoint with the store away: %v, want %q", err, pgalloc.ErrLoadWaitExpired)
+	}
+	if took < loadWait || took > loadWait+15*time.Second {
+		t.Errorf("checkpoint with the store away failed after %v, want after its load wait of %v", took, loadWait)
+	}
+	return err
+}
+
+// checkRunning checks that r's container runs.
+func (r *storeAwayRestore) checkRunning(t *testing.T) {
+	t.Helper()
+	if got, want := r.cont.State().Status, Running; got != want {
+		t.Errorf("container status: got %v, want %v", got, want)
+	}
+}
+
+// newCheckpointDir returns a new directory for a checkpoint, removed as the
+// test ends.
+func newCheckpointDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	if err := os.Chmod(d, 0777); err != nil {
+		t.Fatalf("error chmoding dir: %q, %v", d, err)
+	}
+	return d
+}
+
+// TestCheckpointRestoreS3StoreAwayLoadWait checks a checkpoint with a load
+// wait of a container restored with --background from an S3-compatible object
+// store, with pages_retry "while-running", whose store is away as its pages
+// load: the checkpoint, which would wait for the pages until the store came
+// back, fails once its load wait has passed, as it waits for them before the
+// save/restore binary runs, with pgalloc.ErrLoadWaitExpired, and the
+// container runs on, though the checkpoint did not leave it running; once the
+// store is back, its pages load, the container writes on, and a checkpoint of
+// it restores with its data intact.
+func TestCheckpointRestoreS3StoreAwayLoadWait(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			r := newStoreAwayRestore(t, conf)
+			r.checkpointLoadWaitExpires(t, sandbox.CheckpointOpts{}, time.Second)
+			r.checkRunning(t)
+			r.back(t)
+
+			// A checkpoint now saves the container whole.
+			saved := newCheckpointDir(t)
+			if err := r.cont.Checkpoint(conf, saved, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone, LoadWait: time.Minute}); err != nil {
+				t.Fatalf("error checkpointing the container once the store was back: %v", err)
+			}
+			r.cont.Destroy()
+			if err := os.Truncate(r.outputPath, 0); err != nil {
+				t.Fatalf("error truncating output: %v", err)
+			}
+			cont3, err := New(conf, r.args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont3.Destroy()
+			if err := cont3.Restore(conf, saved, sandbox.RestoreOpts{}); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			if err := waitForFileNotEmpty(r.outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+			got, err := firstLine(r.outputPath)
+			if err != nil {
+				t.Fatalf("error reading output: %v", err)
+			}
+			if got != r.want {
+				t.Errorf("checksum of the application's data after the last restore is %q, want %q as before the first checkpoint", got, r.want)
+			}
+		})
+	}
+}
+
+// TestCheckpointRestoreS3StoreAwayLoadWaitLater checks the expiry of a
+// checkpoint's load wait past its wait before the save/restore binary runs,
+// which --TESTONLY-save-running-load-wait=skip skips, as an incremental
+// checkpoint's would pass, its pages dirty loaded: in the binary, which waits
+// for pages that the store, away, keeps from loading, and is killed as the
+// load wait expires, its wait not counted against its timeout; and in the
+// pause, the binary having ended, its pages loading slower than the load wait
+// lets them (storeAwayLoadTime). In the pause, the store is there: one away
+// would hold the pause itself as long as any task waits in a system call for
+// a page it keeps from loading, which no load wait bounds. Either way, the
+// checkpoint, without --leave-running, fails with pgalloc.ErrLoadWaitExpired
+// once its load wait has passed, rather than when its pages have loaded; the
+// sandbox is resumed rather than killed, its save/restore binary run to resume
+// it; and its application runs on. If the binary fails to resume it, the
+// sandbox is killed, as after a checkpoint that succeeded; and a checkpoint
+// asked while it resumes it waits for it within its load wait, then fails as
+// one whose wait expired.
+func TestCheckpointRestoreS3StoreAwayLoadWaitLater(t *testing.T) {
+	const (
+		loadWait    = time.Second
+		hookTimeout = 10 * time.Second
+		// slowResumeFor is how long a slow save/restore binary takes to
+		// resume.
+		slowResumeFor = 8 * time.Second
+		// storeBack is when the store comes back if the test has not
+		// brought it back, so that a checkpoint that waits for it ends.
+		storeBack = 30 * time.Second
+	)
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, tc := range []struct {
+			name string
+			// inBinary has the save/restore binary read the application's
+			// data, whose pages are still loading.
+			inBinary bool
+			// failResume has the save/restore binary fail to resume.
+			failResume bool
+			// slowResume has the save/restore binary resume for
+			// slowResumeFor, and a checkpoint follow at once, which waits
+			// for it within its load wait.
+			slowResume bool
+		}{
+			{name: "in the save/restore binary", inBinary: true},
+			{name: "in the pause"},
+			{name: "in the pause, resuming fails", failResume: true},
+			{name: "in the pause, the next checkpoint before the resume ends", slowResume: true},
+		} {
+			t.Run(fmt.Sprintf("%s/%s", name, tc.name), func(t *testing.T) {
+				conf.TestOnlySaveRunningLoadWait = config.SaveRunningLoadWaitSkip
+				r := newStoreAwayRestore(t, conf)
+				hookLogPath := filepath.Join(r.dir, "hook.log")
+				hookPath := filepath.Join(r.dir, "hook.sh")
+				hook := fmt.Sprintf("echo $GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE >> %q\n", hookLogPath)
+				if tc.inBinary {
+					hook += "md5sum /etc/held > /dev/null\n"
+				}
+				if tc.failResume {
+					hook += "[ \"$GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE\" != resume ]\n"
+				}
+				if tc.slowResume {
+					hook += fmt.Sprintf("if [ \"$GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE\" = resume ]; then sleep %d; fi\n", int(slowResumeFor/time.Second))
+				}
+				if !tc.inBinary {
+					r.setAwayIf(nil)
+				}
+				if err := os.WriteFile(hookPath, []byte(hook), 0755); err != nil {
+					t.Fatalf("error writing hook: %v", err)
+				}
+				backTimer := time.AfterFunc(storeBack, func() { r.setAwayIf(nil) })
+				defer backTimer.Stop()
+
+				err := r.checkpointLoadWaitExpires(t, sandbox.CheckpointOpts{
+					SaveRestoreExecArgv:        "/bin/bash " + hookPath,
+					SaveRestoreExecTimeout:     hookTimeout,
+					SaveRestoreExecContainerID: r.cont.ID,
+				}, loadWait)
+				if inBinary := strings.Contains(err.Error(), "save/restore binary"); inBinary != tc.inBinary {
+					t.Errorf("checkpoint error %q: expired in the save/restore binary %t, want %t", err, inBinary, tc.inBinary)
+				}
+				backTimer.Stop()
+				if tc.slowResume {
+					// The next checkpoint waits for the resume, which the
+					// checkpoint before left running, within its load
+					// wait, then fails as one whose wait expired, having
+					// run nothing.
+					start := time.Now()
+					err := r.cont.Checkpoint(conf, newCheckpointDir(t), sandbox.CheckpointOpts{
+						Compression:                statefile.CompressionLevelNone,
+						LoadWait:                   loadWait,
+						SaveRestoreExecArgv:        "/bin/bash " + hookPath,
+						SaveRestoreExecTimeout:     hookTimeout,
+						SaveRestoreExecContainerID: r.cont.ID,
+					})
+					took := time.Since(start)
+					if err == nil || !strings.Contains(err.Error(), pgalloc.ErrLoadWaitExpired.Error()) || !strings.Contains(err.Error(), "is still running") {
+						t.Fatalf("checkpoint during the resume of the one before: %v, want %q, as its resume is still running", err, pgalloc.ErrLoadWaitExpired)
+					}
+					if took < loadWait || took >= slowResumeFor {
+						t.Errorf("checkpoint during the resume of the one before failed after %v, want after its load wait of %v, before the resume's %v", took, loadWait, slowResumeFor)
+					}
+				}
+				if tc.failResume {
+					// The binary fails to resume the sandbox, which is
+					// killed then.
+					exited := make(chan error, 1)
+					go func() {
+						_, err := r.cont.Wait()
+						exited <- err
+					}()
+					select {
+					case <-exited:
+					case <-time.After(30 * time.Second):
+						t.Fatalf("the sandbox whose save/restore binary failed to resume it ran on %v after the checkpoint", 30*time.Second)
+					}
+					return
+				}
+				r.checkRunning(t)
+				r.back(t)
+
+				// The save/restore binary ran to resume the sandbox.
+				if err := testutil.Poll(func() error {
+					log, err := os.ReadFile(hookLogPath)
+					if err != nil {
+						return err
+					}
+					if !strings.HasSuffix(string(log), "resume\n") {
+						return fmt.Errorf("hook log %q", log)
+					}
+					return nil
+				}, 30*time.Second); err != nil {
+					t.Fatalf("the save/restore binary did not run to resume the sandbox: %v", err)
+				}
+				if !tc.inBinary {
+					if log, err := os.ReadFile(hookLogPath); err != nil || string(log) != "save\nresume\n" {
+						t.Errorf("hook log %q, error %v; want %q", log, err, "save\nresume\n")
+					}
+				}
+			})
+		}
 	}
 }
 

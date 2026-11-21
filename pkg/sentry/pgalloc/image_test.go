@@ -18,6 +18,7 @@ package pgalloc
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -817,7 +818,7 @@ func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
 	}
 	awaited := make(chan result, 1)
 	go func() {
-		waited, err := f2.awaitUncleanLoads(img)
+		waited, err := f2.awaitUncleanLoads(img, time.Time{})
 		awaited <- result{waited, err}
 	}()
 	select {
@@ -842,7 +843,7 @@ func TestImageDeltaDuringLoadWaitedBytes(t *testing.T) {
 	if err := f2.AwaitLoadAll(); err != nil {
 		t.Fatalf("AwaitLoadAll: %v", err)
 	}
-	if waited, err := f2.awaitUncleanLoads(img); err != nil || waited != 0 {
+	if waited, err := f2.awaitUncleanLoads(img, time.Time{}); err != nil || waited != 0 {
 		t.Errorf("awaitUncleanLoads once loaded: waited for %d bytes, error %v; want 0, nil", waited, err)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
@@ -874,7 +875,7 @@ func TestAwaitLoadsFindsUnloadedPagesUnlocked(t *testing.T) {
 	f2.mu.Lock()
 	done := make(chan error, 1)
 	go func() {
-		_, err := f2.awaitLoads(loads, zero)
+		_, err := f2.awaitLoads(loads, zero, time.Time{})
 		done <- err
 	}()
 	select {
@@ -1068,6 +1069,170 @@ func TestImageInlineFramesMetadata(t *testing.T) {
 	f2 := newTestMemoryFile(t, testMemoryFileOpts{})
 	if err := f2.LoadFrom(context.Background(), &saved, &LoadOpts{Image: &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{}}}}); err != nil {
 		t.Fatalf("LoadFrom: %v", err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// TestAwaitSaveLoadsDeadline checks that a save's wait for the pages it reads
+// that are still loading ends at its deadline with ErrLoadWaitExpired, saying
+// how long it waited for how many bytes, and leaves the pages loading, holding
+// no reference on them: a save without Dirty waits for every page, one with
+// Dirty for the dirty pages still loading, and for none if there are none.
+func TestAwaitSaveLoadsDeadline(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	pageAt := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: tf.fr.Start + i*page, End: tf.fr.Start + (i+1)*page}
+	}
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	base := parent.mfImage()
+
+	const wait = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		opts SaveOpts
+		// expires is true if the save reads pages still loading.
+		expires bool
+	}{
+		{name: "whole", opts: SaveOpts{}, expires: true},
+		{name: "delta, a dirty page loading", opts: SaveOpts{Base: base, Dirty: dirtySetOf(f2, func(off uint64) bool { return off != pageAt(1).Start })}, expires: true},
+		{name: "delta, no dirty page loading", opts: SaveOpts{Base: base, Dirty: &DirtySet{}}},
+	} {
+		start := time.Now()
+		err := f2.AwaitSaveLoads(&tc.opts, start.Add(wait))
+		took := time.Since(start)
+		switch {
+		case !tc.expires && err != nil:
+			t.Errorf("%s: AwaitSaveLoads: %v, want nil", tc.name, err)
+		case tc.expires && !errors.Is(err, ErrLoadWaitExpired):
+			t.Errorf("%s: AwaitSaveLoads: %v, want ErrLoadWaitExpired", tc.name, err)
+		case tc.expires && !strings.Contains(err.Error(), "bytes of pages still loading"):
+			t.Errorf("%s: AwaitSaveLoads: %q says nothing of the bytes it waited for", tc.name, err)
+		case tc.expires && took < wait:
+			t.Errorf("%s: AwaitSaveLoads returned after %v, before its deadline", tc.name, took)
+		}
+	}
+
+	openGate.Do(func() { close(gate.gate) })
+	if err := f2.AwaitSaveLoads(&SaveOpts{}, time.Now().Add(10*time.Second)); err != nil {
+		t.Fatalf("AwaitSaveLoads once the pages load: %v", err)
+	}
+	// Loading has ended, and its reads drop their references just after.
+	for deadline := time.Now().Add(testWaitTimeout); !f2.HasUniqueRef(pageAt(1)); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("a wait that expired kept a reference on the page it waited for")
+		}
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// TestAwaitDirtyLoadsDeadline checks that the wait for the pages dirty now
+// that are still loading, as a delta save would read them, waits for those
+// only, until its deadline.
+func TestAwaitDirtyLoadsDeadline(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	f2.EnableDirtyTracking()
+
+	if err := f2.AwaitDirtyLoads(time.Now().Add(10 * time.Second)); err != nil {
+		t.Errorf("AwaitDirtyLoads with no page dirty: %v", err)
+	}
+	f2.MarkDirty(memmap.FileRange{Start: tf.fr.Start + page, End: tf.fr.Start + 2*page})
+	if err := f2.AwaitDirtyLoads(time.Now().Add(100 * time.Millisecond)); !errors.Is(err, ErrLoadWaitExpired) {
+		t.Errorf("AwaitDirtyLoads with a dirty page loading: %v, want ErrLoadWaitExpired", err)
+	}
+	openGate.Do(func() { close(gate.gate) })
+	if err := f2.AwaitDirtyLoads(time.Now().Add(10 * time.Second)); err != nil {
+		t.Errorf("AwaitDirtyLoads once the pages load: %v", err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// newHeldLoadTestFile returns a MemoryFile restored from an image of n pages,
+// none of them zero, whose reads, of a page each and at most 2 at once, wait
+// until the returned function is called (and the test ends): one background
+// read and one awaited read are in flight, so that the further pages of a
+// waiter stay in apfl.priority.
+func newHeldLoadTestFile(t *testing.T, n uint64) (*imageTestFile, *MemoryFile, func()) {
+	t.Helper()
+	tf := newImageTestFile(t, n)
+	for i := uint64(0); i < n; i += 3 {
+		tf.write(i, 0)
+	}
+	parent := saveTestImage(t, tf.f, nil, nil)
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, page, 1, 2))
+	var openGate sync.Once
+	release := func() { openGate.Do(func() { close(gate.gate) }) }
+	t.Cleanup(release)
+	return tf, f2, release
+}
+
+// priorityOf returns the number of entries of the priority queue of f's
+// loader, and the number of waiters it has.
+func priorityOf(f *MemoryFile) (entries, waiters int) {
+	apfl := f.asyncPageLoad.Load().amfls[0].pf
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	return apfl.priority.Len(), apfl.numWaiters
+}
+
+// TestAwaitSaveLoadsWholeAwaitsNoPage checks that a whole save's wait for
+// every page still loading, which runs while the sandbox does, awaits none of
+// them, so that a task's fault meanwhile is not read after all of them.
+func TestAwaitSaveLoadsWholeAwaitsNoPage(t *testing.T) {
+	tf, f2, release := newHeldLoadTestFile(t, 256)
+	done := make(chan error, 1)
+	go func() { done <- f2.AwaitSaveLoads(&SaveOpts{}, time.Now().Add(time.Second)) }()
+	time.Sleep(100 * time.Millisecond)
+	if entries, waiters := priorityOf(f2); entries != 0 || waiters != 0 {
+		t.Errorf("waiting for every page, the loader has %d priority entries and %d waiters, want none", entries, waiters)
+	}
+	if err := <-done; !errors.Is(err, ErrLoadWaitExpired) {
+		t.Errorf("AwaitSaveLoads: %v, want ErrLoadWaitExpired", err)
+	}
+	release()
+	if err := f2.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// TestExpiredAwaitLeavesNoPriority checks that the pages that a wait whose
+// deadline passed awaited, which no read loads yet, are no longer read before
+// others once it has ended.
+func TestExpiredAwaitLeavesNoPriority(t *testing.T) {
+	tf, f2, release := newHeldLoadTestFile(t, 256)
+	awaited := []memmap.FileRange{{Start: tf.fr.Start + 128*page, End: tf.fr.End}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := f2.awaitLoads(f2.asyncPageLoad.Load(), awaited, time.Now().Add(time.Second))
+		done <- err
+	}()
+	for start := time.Now(); ; time.Sleep(10 * time.Millisecond) {
+		if entries, _ := priorityOf(f2); entries != 0 {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("the awaited pages never queued in the loader's priority")
+		}
+	}
+	if err := <-done; !errors.Is(err, ErrLoadWaitExpired) {
+		t.Errorf("awaitLoads: %v, want ErrLoadWaitExpired", err)
+	}
+	if entries, waiters := priorityOf(f2); entries != 0 || waiters != 0 {
+		t.Errorf("after the wait expired, the loader has %d priority entries and %d waiters, want none", entries, waiters)
+	}
+	release()
+	if err := f2.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
 }

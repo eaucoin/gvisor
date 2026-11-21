@@ -220,6 +220,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("TESTONLY-autosave-compression", "flate-best-speed", "TEST ONLY; compression level of auto saves for syscall tests: none|flate-best-speed.")
 	flagSet.Uint64("TESTONLY-restore-read-rate", 0, "TEST ONLY; limit the rate at which a restore reads pages files, in bytes per second, as a throttled disk does; 0 for no limit.")
 	flagSet.Uint64("TESTONLY-checkpoint-write-rate", 0, "TEST ONLY; limit the rate at which a checkpoint writes its pages file, in bytes per second, as a throttled disk or a remote store does; 0 for no limit.")
+	flagSet.Var(saveRunningLoadWaitPtr(SaveRunningLoadWaitOn), "TESTONLY-save-running-load-wait", "TEST ONLY; whether a checkpoint with --load-wait waits for the pages still loading while the sandbox runs, before the save/restore binary runs: on (default), or skip, so that tests reach its waits in the binary and in the pause.")
 	flagSet.Var(autosaveKindPtr(AutosaveFull), "TESTONLY-autosave-kind", "TEST ONLY; what the auto saves of syscall tests save: full (default), or incremental, of the image the sandbox was restored from (requires --dirty-tracking).")
 
 	RegisterDeprecatedFlags(flagSet)

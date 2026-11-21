@@ -109,6 +109,17 @@ type SaveOpts struct {
 	// fast rather than stop when a round does not halve the memory left to
 	// write. See kernel.PrecopyOpts.Throttle.
 	PrecopyThrottle bool `json:"precopy_throttle"`
+
+	// LoadWait, if not zero, bounds the time that the save waits for the
+	// pages that are still being loaded asynchronously from the checkpoint
+	// the sandbox was restored from, those it reads and those the
+	// save/restore binary waits for: once it has passed, the save fails with
+	// pgalloc.ErrLoadWaitExpired, the sandbox running on as it was, whether
+	// or not Resume is set, and what it wrote is incomplete. It does not
+	// bound the save/restore binary's own run time, writing the save, nor a
+	// pause held by a task blocked in a system call on such pages. See
+	// control.SaveWithOpts.
+	LoadWait time.Duration `json:"load_wait"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
