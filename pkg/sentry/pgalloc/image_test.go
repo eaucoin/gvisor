@@ -20,7 +20,10 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +35,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/state/pretty"
+	"gvisor.dev/gvisor/pkg/state/wire"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -661,4 +667,45 @@ func TestImageSaveRejects(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestImageInlineFramesMetadata checks that a MemoryFile saved inline, into a
+// state file, frames its metadata as it frames its pages: as data that is not
+// an object of the state file, which a tool that prints the state file's
+// objects, as runsc statefile does, skips whole. Without the frame, the tool
+// read the metadata's bytes as objects, and failed or not by their content.
+func TestImageInlineFramesMetadata(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	var saved bytes.Buffer
+	if err := tf.f.SaveTo(context.Background(), &saved, &SaveOpts{}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	var printed strings.Builder
+	if err := pretty.PrintText(&printed, bytes.NewReader(saved.Bytes())); err != nil {
+		t.Fatalf("PrintText: %v", err)
+	}
+	region := regexp.MustCompile(`^\((\d+) bytes non-object data\)$`)
+	var framed int
+	for _, line := range strings.Split(strings.TrimSuffix(printed.String(), "\n"), "\n") {
+		m := region.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("PrintText printed %q, want only regions of non-object data", line)
+		}
+		n, _ := strconv.Atoi(m[1])
+		var header bytes.Buffer
+		if err := state.WriteHeader(&wire.Writer{Writer: &header}, uint64(n), false /* object */); err != nil {
+			t.Fatalf("WriteHeader: %v", err)
+		}
+		framed += header.Len() + n
+	}
+	if framed != saved.Len() {
+		t.Errorf("PrintText found %d bytes in regions of non-object data, want all %d bytes saved", framed, saved.Len())
+	}
+
+	// The MemoryFile loads from what it saved.
+	f2 := newTestMemoryFile(t, testMemoryFileOpts{})
+	if err := f2.LoadFrom(context.Background(), &saved, &LoadOpts{Image: &pgallocpb.ImageProto{Layers: []*pgallocpb.LayerProto{{}}}}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
 }
