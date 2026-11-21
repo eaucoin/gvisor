@@ -1105,3 +1105,30 @@ func TestFaultWaitingForLoadOfFreedPages(t *testing.T) {
 		t.Errorf("HandleUserFault: %v", err)
 	}
 }
+
+// TestWriteFaultWaitingForLoadLeavesPageClean checks that a write fault
+// waiting for its pages, which dirty tracking write-protects, leaves them
+// write-protected and clean until they are loaded: a save meanwhile need not
+// wait for them, as it waits for the dirty pages still loading that it reads.
+// Once loaded, the write fault makes the page writable and dirty.
+func TestWriteFaultWaitingForLoadLeavesPageClean(t *testing.T) {
+	ctx := contexttest.Context(t)
+	rp := restorePages(ctx, t, restoreOpts{pages: 32, dirtyTracked: true})
+	defer rp.finish(ctx, t)
+	rp.mm.ArmDirtyTracking(hostarch.PageSize)
+
+	fault := startFault(ctx, t, rp.mm, rp.page(17), hostarch.Write)
+	if n := rp.mf.DirtyBytes(); n != 0 {
+		t.Errorf("%d bytes are dirty while a write fault waits for its pages, want 0", n)
+	}
+	rp.letLoad()
+	if err := faultEnds(t, fault); err != nil {
+		t.Fatalf("HandleUserFault: %v", err)
+	}
+	if at, ok := rp.as.mappedAs(rp.page(17)); !ok || !at.Write {
+		t.Errorf("the page written is mapped %v (%t), want writable", at, ok)
+	}
+	if got, want := dirtyPages(t, rp.mm, rp.ar), []uint64{17}; !slices.Equal(got, want) {
+		t.Errorf("dirty pages: got %v, want %v", got, want)
+	}
+}
