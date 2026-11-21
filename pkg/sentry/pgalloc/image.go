@@ -41,13 +41,14 @@ type imageSaver struct {
 	// returns the pages file offset at which they will be written.
 	write func(fr memmap.FileRange) uint64
 
-	// If base is not nil, pages that clean reports as unchanged since base was
-	// saved, and pages whose hash is unchanged since then, refer to base's
-	// data in layer baseLayers[layer] rather than being written.
+	// If base is not nil, clean pages, those that dirty does not hold, which
+	// are unchanged since base was saved, and pages whose hash is unchanged
+	// since then, refer to base's data in layer baseLayers[layer] rather than
+	// being written. If dirty is nil, no page is clean.
 	base       *checkpointimage.MemoryFileImage
 	baseCursor checkpointimage.Cursor
 	baseLayers []uint32
-	clean      func(off uint64) bool
+	dirty      *DirtySet
 
 	// extents are the extents of the pages emitted so far.
 	extents []*pgallocpb.ExtentProto
@@ -91,14 +92,25 @@ func newImageSaver(f *MemoryFile, opts *SaveOpts, write func(memmap.FileRange) u
 		s.base = opts.Base
 		s.baseCursor = opts.Base.Cursor()
 		s.baseLayers = opts.BaseLayers
-		s.clean = opts.Clean
+		s.dirty = opts.Dirty
 	}
 	return s, nil
 }
 
 // isClean returns true if the page at off is unchanged since base was saved.
 func (s *imageSaver) isClean(off uint64) bool {
-	return s.clean != nil && s.clean(off)
+	return s.dirty != nil && !s.dirty.Contains(off)
+}
+
+// forEachUnclean calls fn on each maximal range of pages of fr that are not
+// clean, intersected with fr, in increasing order.
+//
+// Preconditions: s.dirty != nil.
+func (s *imageSaver) forEachUnclean(fr memmap.FileRange, fn func(memmap.FileRange)) {
+	s.dirty.ForEachRange(fr, func(dfr memmap.FileRange) bool {
+		fn(dfr)
+		return true
+	})
 }
 
 // emit records that the known-committed pages in fr are saved.
