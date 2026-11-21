@@ -1613,6 +1613,11 @@ type AsyncPagesFileLoad struct {
 	// (CurrentAsyncPageLoadProgress). retrying is immutable.
 	retrying stateio.RetryingAsyncReader
 
+	// kinds is ar if it implements stateio.KindAsyncReader, which is told
+	// whether each read is awaited or made in the background, and nil
+	// otherwise. kinds is immutable.
+	kinds stateio.KindAsyncReader
+
 	// parallelReads is the number of reads that ar serves at once, each at
 	// the rate of one alone, if it implements stateio.ParallelAsyncReader,
 	// and 0 otherwise. parallelReads is immutable.
@@ -2216,6 +2221,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	}
 	apfl.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
 	apfl.retrying, _ = ar.(stateio.RetryingAsyncReader)
+	apfl.kinds, _ = ar.(stateio.KindAsyncReader)
 	if pr, ok := ar.(stateio.ParallelAsyncReader); ok {
 		apfl.parallelReads = uint64(max(pr.ParallelReads(), 0))
 	}
@@ -3073,6 +3079,13 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 			apfl.firstRoundStart = op.issued
 		}
 		apfl.firstRoundReads++
+	}
+	if apfl.kinds != nil {
+		kind := stateio.ReadAwaited
+		if op.background {
+			kind = stateio.ReadBackground
+		}
+		apfl.kinds.SetReadKind(int(apfl.curOpID), kind)
 	}
 	if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized read to save an indirection (and possible

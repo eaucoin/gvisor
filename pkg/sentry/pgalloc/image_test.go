@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -1233,6 +1234,72 @@ func TestExpiredAwaitLeavesNoPriority(t *testing.T) {
 	release()
 	if err := f2.AwaitLoadAll(); err != nil {
 		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	checkSameContents(t, f2, tf.f, tf.fr)
+}
+
+// kindRecorder is an AsyncReader that records the kind of each read it is
+// given, as stateio.KindAsyncReader.SetReadKind says it.
+type kindRecorder struct {
+	stateio.AsyncReader
+	mu    sync.Mutex
+	next  map[int]stateio.ReadKind
+	kinds []stateio.ReadKind
+}
+
+// SetReadKind implements stateio.KindAsyncReader.SetReadKind.
+func (r *kindRecorder) SetReadKind(id int, kind stateio.ReadKind) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next[id] = kind
+}
+
+func (r *kindRecorder) record(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.kinds = append(r.kinds, r.next[id])
+	delete(r.next, id)
+}
+
+// AddRead implements stateio.AsyncReader.AddRead.
+func (r *kindRecorder) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.record(id)
+	r.AsyncReader.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+// AddReadv implements stateio.AsyncReader.AddReadv.
+func (r *kindRecorder) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.record(id)
+	r.AsyncReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+// TestAsyncLoadReadKinds checks that async page loading tells a reader that
+// takes read kinds, through a reader that limits it, the kind of each of its
+// reads: background for those it makes ahead, awaited for those of pages
+// waited for.
+func TestAsyncLoadReadKinds(t *testing.T) {
+	const pages = 1024
+	tf := newImageTestFile(t, pages)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	kr := &kindRecorder{AsyncReader: stateio.NewIOReader(bytes.NewReader(parent.layers[0]), 64<<10, 16, 4), next: make(map[int]stateio.ReadKind)}
+	// Slow enough that the last page is not loaded in the background before
+	// it is waited for.
+	f2 := loadTestImage(t, parent, stateio.NewRateLimitedReader(kr, 1<<20))
+	// The last page that holds data (newImageTestFile).
+	last := memmap.FileRange{Start: tf.fr.End - 2*page, End: tf.fr.End - page}
+	if err := f2.AwaitLoad(last, nil); err != nil {
+		t.Fatalf("AwaitLoad: %v", err)
+	}
+	// The other pages load in the background, unawaited.
+	for deadline := time.Now().Add(testWaitTimeout); !f2.IsLoaded(tf.fr); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the pages did not load")
+		}
+	}
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	if !slices.Contains(kr.kinds, stateio.ReadAwaited) || !slices.Contains(kr.kinds, stateio.ReadBackground) || slices.Contains(kr.kinds, stateio.ReadUnknown) {
+		t.Errorf("reads of kinds %v, want awaited and background reads only", kr.kinds)
 	}
 	checkSameContents(t, f2, tf.f, tf.fr)
 }

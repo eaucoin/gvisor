@@ -16,6 +16,8 @@
 package stateio
 
 import (
+	"fmt"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
@@ -171,6 +173,50 @@ type ParallelAsyncReader interface {
 	// does not tell. All calls to ParallelReads for a given AsyncReader must
 	// return the same value.
 	ParallelReads() int
+}
+
+// ReadKind is why a read is made, as an AsyncReader's caller says it
+// (KindAsyncReader).
+type ReadKind uint8
+
+// Possible values of ReadKind.
+const (
+	// ReadUnknown is the kind of a read whose caller does not say.
+	ReadUnknown ReadKind = iota
+
+	// ReadAwaited is the kind of a read whose data is waited for, as a task's
+	// page fault waits for its page.
+	ReadAwaited
+
+	// ReadBackground is the kind of a read made ahead of the use of its
+	// data.
+	ReadBackground
+)
+
+// String implements fmt.Stringer.String.
+func (k ReadKind) String() string {
+	switch k {
+	case ReadUnknown:
+		return "unknown"
+	case ReadAwaited:
+		return "awaited"
+	case ReadBackground:
+		return "background"
+	default:
+		return fmt.Sprintf("ReadKind(%d)", uint8(k))
+	}
+}
+
+// KindAsyncReader is an AsyncReader that takes the kind of each read from its
+// caller, as a reader that passes its reads on to another process passes their
+// kinds with them, for what serves them to act on and to report.
+type KindAsyncReader interface {
+	AsyncReader
+
+	// SetReadKind sets the kind of the read with the given ID that AddRead or
+	// AddReadv enqueue next. A read whose kind was not set is of ReadUnknown.
+	// SetReadKind is called by the goroutine that calls AddRead and AddReadv.
+	SetReadKind(id int, kind ReadKind)
 }
 
 // AsyncWriter represents a file supporting asynchronous sequential writes.
