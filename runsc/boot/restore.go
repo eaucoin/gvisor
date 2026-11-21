@@ -983,6 +983,7 @@ func (l *Loader) save(o *controlapi.SaveOpts) error {
 	if rate := l.root.conf.TestOnlyCheckpointWriteRate; rate != 0 && saveOpts.PagesFile != nil {
 		saveOpts.PagesFile = stateio.NewRateLimitedWriter(saveOpts.PagesFile, rate)
 	}
+	saveOpts.TestOnlySkipRunningLoadWait = l.root.conf.TestOnlySaveRunningLoadWait == config.SaveRunningLoadWaitSkip
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
@@ -995,10 +996,16 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	defer l.saveMu.Unlock()
 
 	hasFSSave := saveOpts.FSSaveOpts != nil
+	var resume func() error
 	defer func() {
 		// This closure is required to capture the final value of err.
-		if err == nil && saveOpts.Resume {
-			go l.postResume()
+		if resume != nil {
+			resumed := make(chan struct{})
+			l.resuming = resumed
+			go func() {
+				defer close(resumed)
+				l.postResume(resume, err)
+			}()
 		} else {
 			l.k.OnCheckpointAttempt(err)
 		}
@@ -1006,6 +1013,18 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 			l.k.SignalAllFSSaveWaiters(err)
 		}
 	}()
+
+	// The post-resume work of the save before, which runs once its caller
+	// was answered, ends first: a save would race the save/restore binary's
+	// resume with its own preparation. A save with a load wait waits for it
+	// no longer than for its pages, then fails as one whose wait expired,
+	// having done nothing.
+	if resumed := l.resuming; resumed != nil {
+		if err := awaitResumed(resumed, saveOpts.LoadWaitDeadline); err != nil {
+			return err
+		}
+		l.resuming = nil
+	}
 
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
@@ -1044,22 +1063,48 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 		return err
 	}
 
-	state := control.State{
-		Kernel:   l.k,
-		Watchdog: l.watchdog,
-	}
 	defer l.stopIfKilled()
-	return state.SaveWithOpts(saveOpts, execOpts)
+	resume, err = control.SaveWithOpts(l.k, l.watchdog, saveOpts, execOpts)
+	return err
 }
 
-// postResume runs post-resume work and then completes the checkpoint attempt.
-func (l *Loader) postResume() {
-	err := control.PostResume(l.k, nil)
-	l.k.OnCheckpointAttempt(err)
-	if err != nil {
-		log.Warningf("Killing the sandbox after post resume work failed: %v", err)
-		l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+// awaitResumed waits until resumed is closed, until deadline if it is not
+// zero, after which it fails with pgalloc.ErrLoadWaitExpired.
+func awaitResumed(resumed <-chan struct{}, deadline time2.Time) error {
+	if deadline.IsZero() {
+		<-resumed
+		return nil
 	}
+	t := time2.NewTimer(time2.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-resumed:
+		return nil
+	case <-t.C:
+		return fmt.Errorf("the save/restore binary's resume after the save before, which a save may not race, is still running: %w", pgalloc.ErrLoadWaitExpired)
+	}
+}
+
+// postResume runs post-resume work, resume, and then completes the checkpoint
+// attempt, which ended with saveErr: nil, or the expiry of its load wait, after
+// which the sandbox runs on as after a save that resumes it. The checkpoint's
+// caller was answered before, so that its answer is not held by the
+// save/restore binary's resume, which may wait for the very pages that the
+// load wait gave up on: a sandbox whose post-resume work fails is killed
+// either way, as the end of a sandbox that its caller left running, and the
+// checkpoint attempt's waiters (Kernel.CheckpointWait) are told why.
+func (l *Loader) postResume(resume func() error, saveErr error) {
+	err := resume()
+	if err == nil {
+		l.k.OnCheckpointAttempt(saveErr)
+		return
+	}
+	if saveErr != nil {
+		err = fmt.Errorf("post resume work after a save whose load wait ran out: %w", err)
+	}
+	l.k.OnCheckpointAttempt(err)
+	log.Warningf("Killing the sandbox after post resume work failed: %v", err)
+	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 }
 
 func procFiles(conf *config.Config) []string {

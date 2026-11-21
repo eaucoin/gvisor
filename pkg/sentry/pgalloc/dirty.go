@@ -383,6 +383,14 @@ func (f *MemoryFile) SwapDirty(paused bool) *DirtySet {
 //
 // Preconditions: Dirty tracking must be enabled.
 func (f *MemoryFile) DirtyBytes() uint64 {
+	return f.dirtyNow().Bytes()
+}
+
+// dirtyNow returns the pages that the next call to SwapDirty would return if
+// it were called now, without swapping them.
+//
+// Preconditions: Dirty tracking must be enabled.
+func (f *MemoryFile) dirtyNow() *DirtySet {
 	f.dirty.swapMu.Lock()
 	defer f.dirty.swapMu.Unlock()
 	written := f.dirty.written.load()
@@ -396,7 +404,7 @@ func (f *MemoryFile) DirtyBytes() uint64 {
 	for _, fr := range f.dirty.always {
 		s.add(fr)
 	}
-	return s.Bytes()
+	return s
 }
 
 // UnswapDirty returns the pages in s, which a call to SwapDirty returned, to

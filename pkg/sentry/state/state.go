@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -104,6 +105,21 @@ type SaveOpts struct {
 	// If Precopy is not nil, the save writes memory while the sandbox runs
 	// before pausing it, as Precopy configures. See kernel.Kernel.Precopy.
 	Precopy *kernel.PrecopyOpts
+
+	// If LoadWaitDeadline is not zero, the save's waits for the pages that
+	// are still being loaded asynchronously end then, and it fails with
+	// pgalloc.ErrLoadWaitExpired: pre-copy rounds' waits, the sandbox
+	// running, and the save's wait in the pause, before it writes the
+	// kernel's state or any memory but what pre-copy rounds wrote. The
+	// sandbox then runs on, whether or not Resume is set. See also
+	// control.SaveWithOpts.
+	LoadWaitDeadline time.Time
+
+	// If TestOnlySkipRunningLoadWait is true, a save with a load wait does
+	// not wait for the pages still loading before the save/restore binary
+	// runs (control.SaveWithOpts), so that tests reach its waits in
+	// the binary and in the pause.
+	TestOnlySkipRunningLoadWait bool
 }
 
 // Close releases resources owned by opts.
@@ -151,7 +167,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 			return fmt.Errorf("pre-copy requires a pages file")
 		}
 		log.Infof("Pre-copying memory while tasks run.")
-		precopy, err = k.Precopy(ctx, opts.PagesFile, opts.Parent, *opts.Precopy) // transfers ownership of opts.PagesFile
+		precopyOpts := *opts.Precopy
+		precopyOpts.LoadWaitDeadline = opts.LoadWaitDeadline
+		precopy, err = k.Precopy(ctx, opts.PagesFile, opts.Parent, precopyOpts) // transfers ownership of opts.PagesFile
 		opts.PagesFile = nil
 		if err != nil {
 			return fmt.Errorf("pre-copy: %w", err)
@@ -217,7 +235,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		vfsOpts := vfs.PrepareSaveOptions{
 			ValidateMetadata: opts.ValidateMetadata,
 		}
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine, opts.Parent, precopy) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine, opts.Parent, precopy, opts.LoadWaitDeadline) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
@@ -225,14 +243,22 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 
 	t1, _ := CPUTime()
 	log.Infof("Save CPU usage: %s", (t1 - t).String())
-	if err == nil {
+	expired := errors.Is(err, pgalloc.ErrLoadWaitExpired)
+	switch {
+	case err == nil:
 		log.Infof("Save succeeded: exiting...")
 		k.SetSaveSuccess(opts.Autosave)
-	} else {
+	case expired:
+		log.Warningf("Save deferred, the sandbox runs on: %v", err)
+	default:
 		log.Warningf("Save failed: exiting... %v", err)
 		k.SetSaveError(err)
 	}
-	if opts.Resume {
+	if opts.Resume || expired {
+		// A save whose load wait expired wrote none of the kernel's state:
+		// the sandbox runs on, as the save's caller expects of a failed
+		// save that waited for pages too long, so that it can save it
+		// again later.
 		k.BeforeResume(ctx)
 	} else {
 		// Kill the sandbox. An autosave that dirty tracking verification

@@ -207,6 +207,29 @@ fault waits so also stops waiting when it must stop, as for a checkpoint's
 pause, which so does not wait for the page either: it faults again once it
 runs on.
 
+A checkpoint of a sandbox whose memory is still loading waits for the pages it
+saves: every page, or, for an incremental checkpoint, the pages dirtied as they
+loaded, which are few. Its save/restore exec binary waits for the pages it
+touches too. With a store that is away, these waits last until the store is
+back. `runsc checkpoint --load-wait=<duration>` bounds them: once it has
+passed, the checkpoint fails with "the save's load wait expired", and the
+sandbox runs on as it was, even without `--leave-running`, its pages loading
+on, for a later checkpoint to save. The checkpoint waits for the pages it saves
+before it runs the save/restore exec binary and pauses the sandbox, without
+hurrying them before those its tasks fault on; the binary, whose timeout does
+not count the time it waits for a store that is away, is killed if it waits
+past the deadline, then run to resume; pre-copy rounds, then, paused, the save
+wait for the pages dirtied meanwhile, few or none, within what remains of the
+wait. Pages whose loading failed fail the checkpoint at once, as they would
+without the deadline. A checkpoint asked while the binary still resumes the
+sandbox after one whose wait ran out waits for it within its own wait. What the checkpoint wrote before it failed, such as the state file's
+header and pre-copied pages, is incomplete and must be discarded. The deadline
+does not bound the binary's own run time, which its timeout does, nor writing
+the checkpoint, nor the pause: a task blocked in a system call on pages still
+loading, such as a read of a tmpfs file, stops only once they have loaded,
+which can happen to an incremental checkpoint, whose first wait is for the
+dirty pages only.
+
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means
 that until the sandbox has fully restored (async page loading has completed):

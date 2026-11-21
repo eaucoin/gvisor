@@ -284,7 +284,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		if err := f.AwaitLoadAll(); err != nil {
 			return fmt.Errorf("previous async page loading failed: %w", err)
 		}
-	} else if _, err := f.awaitUncleanLoads(img); err != nil {
+	} else if _, err := f.awaitUncleanLoads(img, time.Time{}); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
 
@@ -1733,6 +1733,10 @@ type asyncMemoryFileLoads struct {
 
 	// doneCallback is called when loading from every layer has completed.
 	doneCallback func(error)
+
+	// done is closed when loading from every layer has completed, err then
+	// set. done is immutable.
+	done chan struct{}
 }
 
 // asyncMemoryFileLoad holds async page loading state for a single MemoryFile
@@ -1807,6 +1811,7 @@ func (f *MemoryFile) startAsyncLoads(pb *pgallocpb.MemoryFileMetadataProto, page
 		fileSize:     fileSize,
 		amfls:        make([]*asyncMemoryFileLoad, len(pagesFiles)),
 		doneCallback: doneCallback,
+		done:         make(chan struct{}),
 	}
 	for _, e := range pb.Extents {
 		if loads.amfls[e.Layer] == nil {
@@ -1885,6 +1890,7 @@ func (loads *asyncMemoryFileLoads) lfDone() {
 	if loads.layers() == 0 {
 		// There is nothing to load.
 		loads.f.asyncPageLoad.Store(nil)
+		close(loads.done)
 		loads.releaseLoadMapping()
 		loads.timeline.End()
 		if loads.doneCallback != nil {
@@ -1956,6 +1962,7 @@ func (loads *asyncMemoryFileLoads) amflDone(err error) {
 		// reports the failure for pages that will never be loaded.
 		loads.f.asyncPageLoad.Store(nil)
 	}
+	close(loads.done)
 	// No read into the MemoryFile is in flight anymore.
 	loads.releaseLoadMapping()
 	loads.timeline.End()
@@ -2337,17 +2344,194 @@ func (f *MemoryFile) AwaitLoadAll() error {
 	return nil
 }
 
+// ErrLoadWaitExpired is returned, wrapped, by the waits for pages being
+// loaded asynchronously that have a deadline, once it has passed. The pages
+// go on loading.
+var ErrLoadWaitExpired = errors.New("the save's load wait expired")
+
+// awaitLoadingDone blocks until async page loading has completed, until
+// deadline if it is not zero, after which it fails with ErrLoadWaitExpired.
+// Unlike AwaitLoadAll, it awaits none of the pages that remain to be loaded,
+// so that they are read in the order they would be without it: a task's
+// fault meanwhile is still served first, rather than after all of them. It
+// returns the error that ended async page loading, if any.
+//
+// A loading that failed fails it with its error, whether or not the deadline
+// has passed: its pages will never load.
+func (f *MemoryFile) awaitLoadingDone(deadline time.Time) error {
+	loads := f.asyncPageLoad.Load()
+	if loads == nil {
+		return nil
+	}
+	if err := loads.failure(); err != nil {
+		return err
+	}
+	if deadline.IsZero() {
+		<-loads.done
+	} else {
+		start := gohacks.Nanotime()
+		t := time.NewTimer(time.Until(deadline))
+		defer t.Stop()
+		select {
+		case <-loads.done:
+		case <-t.C:
+			if err := loads.failure(); err != nil {
+				return err
+			}
+			return loads.expired(time.Duration(gohacks.Nanotime()-start), loads.unloadedBytes(), ErrLoadWaitExpired)
+		}
+	}
+	loads.mu.Lock()
+	defer loads.mu.Unlock()
+	return loads.err
+}
+
+// failure returns the error that ended loading from one of loads' layers,
+// whose pages that remain to be loaded will never be, or nil if none did.
+func (loads *asyncMemoryFileLoads) failure() error {
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		if err := amfl.pf.err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AwaitSaveLoads blocks until every page that SaveTo(opts) waits for has been
+// loaded, so that SaveTo then waits for none of them: a caller bounds the
+// wait with a deadline, if it is not zero, after which AwaitSaveLoads fails
+// with ErrLoadWaitExpired. The pages go on loading. opts.PagesFile is not
+// used: a save without one waits for every page, as without opts.Dirty.
+//
+// A wait for every page awaits none (see awaitLoadingDone): with the
+// sandbox running, the pages that its tasks fault on are read first. A wait
+// for some pages, such as those dirtied as they loaded, awaits them, so that
+// they are read first. Pages whose loading failed fail it with "previous
+// async page loading failed", as they fail SaveTo, whether or not the
+// deadline has passed.
+//
+// Preconditions: f.mu must not be locked.
+func (f *MemoryFile) AwaitSaveLoads(opts *SaveOpts, deadline time.Time) error {
+	if opts.Dirty == nil || (opts.Base == nil && opts.Precopy == nil) {
+		return saveLoadError(f.awaitLoadingDone(deadline))
+	}
+	_, err := f.awaitUncleanLoads(&imageSaver{dirty: opts.Dirty, precopy: opts.Precopy}, deadline)
+	return saveLoadError(err)
+}
+
+// AwaitDirtyLoads blocks until every page of f that is dirty now, and still
+// loading, has been loaded: those that a delta save would read if it began
+// now. It waits until deadline if it is not zero, then fails with
+// ErrLoadWaitExpired. The pages go on loading.
+//
+// Preconditions:
+//   - Dirty tracking is enabled for f.
+//   - f.mu must not be locked.
+func (f *MemoryFile) AwaitDirtyLoads(deadline time.Time) error {
+	_, err := f.awaitUncleanLoads(&imageSaver{dirty: f.dirtyNow()}, deadline)
+	return saveLoadError(err)
+}
+
+// saveLoadError returns err, the error of a save's wait for pages still
+// loading, as SaveTo says that their loading failed, which a wait whose
+// deadline passed (ErrLoadWaitExpired) did not find.
+func saveLoadError(err error) error {
+	if err == nil || errors.Is(err, ErrLoadWaitExpired) {
+		return err
+	}
+	return fmt.Errorf("previous async page loading failed: %w", err)
+}
+
+// deadlineBlock returns a block function (see awaitThrough) that ends the
+// wait at deadline with ErrLoadWaitExpired, or nil if deadline is zero.
+func deadlineBlock(deadline time.Time) func(<-chan struct{}) error {
+	if deadline.IsZero() {
+		return nil
+	}
+	return func(C <-chan struct{}) error {
+		t := time.NewTimer(time.Until(deadline))
+		defer t.Stop()
+		select {
+		case <-C:
+			return nil
+		case <-t.C:
+			return ErrLoadWaitExpired
+		}
+	}
+}
+
+// awaitThrough calls wait, which waits for pages being loaded, through block
+// if it is not nil: block blocks until C is ready, or returns an error to end
+// the wait at once. wait then runs on a goroutine of its own, whose awaits
+// are cut short (CancelAwaits) if block returns an error first, and
+// awaitThrough returns that error, unless wait failed by itself meanwhile, as
+// it does at once for pages whose loading failed, whose error it returns
+// then. Without block, awaitThrough returns what wait returns.
+func awaitThrough(block func(C <-chan struct{}) error, wait func() error) error {
+	if block == nil {
+		return wait()
+	}
+	var (
+		g    = make(chan int64, 1)
+		done = make(chan struct{})
+		err  error
+	)
+	go func() {
+		g <- goid.Get()
+		err = wait()
+		close(done)
+	}()
+	waiter := <-g
+	if berr := block(done); berr != nil {
+		CancelAwaits(waiter)
+		<-done
+		ForgetCanceledAwaits(waiter)
+		if err != nil && err != linuxerr.EINTR {
+			return err
+		}
+		return berr
+	}
+	return err
+}
+
+// expired returns the error of a wait for n bytes of pages being loaded by
+// loads, which err ended after d, as its deadline passed.
+func (loads *asyncMemoryFileLoads) expired(d time.Duration, n uint64, err error) error {
+	log.Warningf("MemoryFile(%p): waited %s for %d bytes of pages still loading, past the wait's deadline", loads.f, d, n)
+	return fmt.Errorf("save waited %s for %d bytes of pages still loading: %w", d.Round(time.Millisecond), n, err)
+}
+
+// unloadedBytes returns the number of bytes of pages that remain to be
+// loaded by loads.
+func (loads *asyncMemoryFileLoads) unloadedBytes() uint64 {
+	var n uint64
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+			n += ulseg.Range().Length()
+		}
+		amfl.pf.mu.Unlock()
+	}
+	return n
+}
+
 // awaitUncleanLoads blocks until every page that the save of img reads, every
 // page that is not clean, has been loaded, as a save that refers to the
 // others' data in the layers they are being loaded from requires. Pages still
 // loading are clean unless they were dirtied as they loaded, so that there are
 // few or none to wait for. It returns the number of bytes it waited for, as
-// awaitLoads does.
+// awaitLoads does, which waits until deadline if it is not zero.
 //
 // Preconditions:
 //   - img.dirty != nil.
 //   - f.mu must not be locked.
-func (f *MemoryFile) awaitUncleanLoads(img *imageSaver) (uint64, error) {
+func (f *MemoryFile) awaitUncleanLoads(img *imageSaver, deadline time.Time) (uint64, error) {
 	loads := f.asyncPageLoad.Load()
 	if loads == nil {
 		return 0, nil
@@ -2376,7 +2560,7 @@ func (f *MemoryFile) awaitUncleanLoads(img *imageSaver) (uint64, error) {
 			}
 		})
 	}
-	return f.awaitLoads(loads, unclean)
+	return f.awaitLoads(loads, unclean, deadline)
 }
 
 // mergeFileRanges sorts frs and merges those that overlap or abut, in place,
@@ -2398,14 +2582,16 @@ func mergeFileRanges(frs []memmap.FileRange) []memmap.FileRange {
 
 // awaitLoads blocks until every page of frs has been loaded by loads, holding
 // a reference on the pages that remain to be loaded while it waits for them,
-// as awaitLoad requires. It returns the number of bytes of frs that remained
-// to be loaded, which it waited for, and logs them with the time it waited:
-// a save waits for them while the sandbox is paused.
+// so that their data is still theirs once they are loaded. It returns the
+// number of bytes of frs that remained to be loaded, which it waited for, and
+// logs them with the time it waited: a save waits for them while the sandbox
+// is paused. If deadline is not zero, it waits until deadline, then fails
+// with ErrLoadWaitExpired.
 //
 // Preconditions:
 //   - frs are sorted by offset and do not overlap.
 //   - f.mu must not be locked.
-func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange) (uint64, error) {
+func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange, deadline time.Time) (uint64, error) {
 	// Find the pages of frs that remain to be loaded without f.mu locked:
 	// frs may be many ranges, such as those of a dirty set, and allocations
 	// and frees wait for f.mu.
@@ -2428,16 +2614,22 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 		return 0, nil
 	}
 	start := gohacks.Nanotime()
-	var err error
-	for _, fr := range held {
-		if werr := loads.awaitLoad(fr); werr != nil && err == nil {
-			err = werr
+	err := awaitThrough(deadlineBlock(deadline), func() error {
+		var err error
+		for _, fr := range held {
+			if werr := loads.awaitLoad(fr); werr != nil && err == nil {
+				err = werr
+			}
 		}
-	}
+		return err
+	})
 	for _, fr := range held {
 		f.DecRef(fr)
 	}
 	dur := time.Duration(gohacks.Nanotime() - start)
+	if errors.Is(err, ErrLoadWaitExpired) {
+		return waited, loads.expired(dur, waited, err)
+	}
 	if err != nil {
 		log.Warningf("MemoryFile(%p): waited %s for %d bytes of dirty pages still loading, whose loading failed: %v", f, dur, waited, err)
 	} else {
@@ -2533,29 +2725,7 @@ func (f *MemoryFile) AwaitLoad(fr memmap.FileRange, block func(C <-chan struct{}
 	if loads == nil || f.IsLoaded(fr) {
 		return nil
 	}
-	if block == nil {
-		return loads.awaitLoad(fr)
-	}
-	// Wait on a goroutine of its own, whose await is cut short if block
-	// returns first.
-	var (
-		g    = make(chan int64, 1)
-		done = make(chan struct{})
-		err  error
-	)
-	go func() {
-		g <- goid.Get()
-		err = loads.awaitLoad(fr)
-		close(done)
-	}()
-	waiter := <-g
-	if berr := block(done); berr != nil {
-		CancelAwaits(waiter)
-		<-done
-		ForgetCanceledAwaits(waiter)
-		return berr
-	}
-	return err
+	return awaitThrough(block, func() error { return loads.awaitLoad(fr) })
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr, or until
@@ -2803,6 +2973,7 @@ func (amfl *asyncMemoryFileLoad) withdrawAwait(w *aplWaiter) bool {
 	}
 	// startAwait split amfl.unloaded around w.fr, and its segments with
 	// waiters are never merged.
+	unawaited := false
 	for ulseg := amfl.unloaded.LowerBoundSegment(w.fr.Start); ulseg.Ok() && ulseg.Start() < w.fr.End; ulseg = ulseg.NextSegment() {
 		ul := ulseg.ValuePtr()
 		i := slices.Index(ul.waiters, w)
@@ -2813,9 +2984,15 @@ func (amfl *asyncMemoryFileLoad) withdrawAwait(w *aplWaiter) bool {
 		// aplUnloaded's split), so a new slice holds the others.
 		ul.waiters = slices.Concat(ul.waiters[:i:i], ul.waiters[i+1:])
 		w.pending -= ulseg.Range().Length()
+		if len(ul.waiters) == 0 && !ul.started {
+			unawaited = true
+		}
 	}
 	if w.pending != 0 {
 		panic(fmt.Sprintf("MemoryFile(%p): waiter for %v withdrawn with %d bytes pending in no unloaded segment", amfl.f, w.fr, w.pending))
+	}
+	if unawaited {
+		apfl.prunePriorityLocked()
 	}
 	now := aplNanotime()
 	apfl.durWaitedTotal += time.Duration(now - w.timeStart)
@@ -2825,6 +3002,28 @@ func (amfl *asyncMemoryFileLoad) withdrawAwait(w *aplWaiter) bool {
 		apfl.timeStartWaiters = math.MaxInt64
 	}
 	return true
+}
+
+// prunePriorityLocked removes from apfl.priority the pages that no read loads
+// yet and that no waiter awaits anymore, those of waiters cut short: they are
+// read in the background, as pages never awaited are, rather than before the
+// pages that waiters await later, as a task's fault after a save's wait for
+// many pages expired.
+//
+// Preconditions: apfl.mu must be locked.
+func (apfl *AsyncPagesFileLoad) prunePriorityLocked() {
+	for n := apfl.priority.Len(); n > 0; n-- {
+		fr := apfl.priority.PopFront()
+		// fr's pages were split from the others as startAwait added them,
+		// and segments with waiters are never merged: each segment is
+		// awaited or not as a whole. Pages that no longer need loading are
+		// no longer in fr.amfl.unloaded.
+		for ulseg := fr.amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; ulseg = ulseg.NextSegment() {
+			if ul := ulseg.ValuePtr(); !ul.started && len(ul.waiters) != 0 {
+				apfl.priority.PushBack(aplFileRange{fr.amfl, ulseg.Range().Intersect(fr.FileRange)})
+			}
+		}
+	}
 }
 
 func (apfl *AsyncPagesFileLoad) canEnqueue() bool {

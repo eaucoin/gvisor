@@ -448,6 +448,7 @@ go_test(
         "kcov_test.go",
         "kernel_idle_test.go",
         "kernel_restore_test.go",
+        "loadwait_test.go",
         "pending_signals_test.go",
         "precopy_test.go",
         "seccomp_cache_test.go",
