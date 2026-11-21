@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 // maxFaultLoadWaits is the number of times HandleUserFault waits for the
@@ -42,8 +43,12 @@ const maxFaultLoadWaits = 3
 // pages are not loaded yet waits for them without holding mm's locks, so that
 // mm's other tasks can fault and access memory meanwhile, and then handles
 // the fault again from the start, as Linux retries a fault that waited for a
-// page's I/O without holding the mmap lock (VM_FAULT_RETRY). Like that wait,
-// it ends early only when the task is killed.
+// page's I/O without holding the mmap lock (VM_FAULT_RETRY). It waits before
+// it changes mm's pmas, so that it copies a copy-on-write page, or ends
+// dirty tracking's write protection of a page, only once the page is loaded,
+// and holds no reference on the pages while it waits, so that it does not
+// keep other tasks' copy-on-write faults from taking them over. Like that
+// wait, it ends early only when the task is killed.
 //
 // Preconditions: mm.as != nil.
 //
@@ -57,9 +62,6 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	}
 
 	for waits := 0; ; waits++ {
-		// Don't bother trying existingPMAsLocked; in most cases, if we did
-		// have existing pmas, we wouldn't have faulted.
-
 		// Ensure that we have a usable vma. Here and below, since we are only
 		// asking for a single page, there is no possibility of partial
 		// success, and any error is immediately fatal.
@@ -68,6 +70,28 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		if err != nil {
 			mm.mappingMu.RUnlock()
 			return err
+		}
+
+		// Wait for the pages of an existing pma that are still loading
+		// before handling the fault, which may change the pma with activeMu
+		// locked for writing.
+		if waits < maxFaultLoadWaits {
+			mm.activeMu.RLock()
+			var (
+				mf *pgalloc.MemoryFile
+				fr memmap.FileRange
+			)
+			if pseg := mm.pmas.FindSegment(ar.Start); pseg.Ok() {
+				mf, fr = mm.unloadedFaultRangeLocked(pseg, ar)
+			}
+			mm.activeMu.RUnlock()
+			if mf != nil {
+				mm.mappingMu.RUnlock()
+				if end, err := mm.awaitFaultLoad(mf, fr, &waits); end {
+					return err
+				}
+				continue
+			}
 		}
 
 		// Ensure that we have a usable pma.
@@ -83,23 +107,14 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		// pmas anymore.
 		mm.activeMu.DowngradeLock()
 
+		// A pma that getPMAsLocked created may map pages still loading.
 		if waits < maxFaultLoadWaits {
 			if mf, fr := mm.unloadedFaultRangeLocked(pseg, ar); mf != nil {
-				// Wait for the pages to be loaded unlocked, holding no
-				// reference on them, so that the fault does not keep other
-				// tasks' copy-on-write faults from taking them over. pseg
-				// and vseg are invalid once activeMu is unlocked: the fault
-				// is handled again from the start.
+				// pseg and vseg are invalid once activeMu is unlocked: the
+				// fault is handled again from the start.
 				mm.activeMu.RUnlock()
-				err := mf.AwaitLoad(fr)
-				if err == linuxerr.EINTR {
-					// The task was killed.
+				if end, err := mm.awaitFaultLoad(mf, fr, &waits); end {
 					return err
-				}
-				if err != nil {
-					// Some of the pages will never be loaded: let mapASLocked
-					// fail as it does for them, if the fault still maps them.
-					waits = maxFaultLoadWaits
 				}
 				continue
 			}
@@ -109,6 +124,29 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
 		mm.activeMu.RUnlock()
 		return err
+	}
+}
+
+// awaitFaultLoad waits, holding none of mm's locks, for the pages fr of mf
+// that a fault maps to be loaded. It returns true, with the error that the
+// fault returns, if the fault must end without being handled:
+// linuxerr.EINTR if its wait was cut short (pgalloc.CancelAwaits) because
+// its task was killed. Otherwise, the fault is
+// handled again; if some of its pages will never be loaded, it no longer
+// waits unlocked for them, but lets mapASLocked fail as it does for them, if
+// the fault still maps them, by setting *waits to maxFaultLoadWaits.
+//
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) awaitFaultLoad(mf *pgalloc.MemoryFile, fr memmap.FileRange, waits *int) (bool, error) {
+	switch err := mf.AwaitLoad(fr); err {
+	case nil:
+		return false, nil
+	case linuxerr.EINTR:
+		return true, err
+	default:
+		*waits = maxFaultLoadWaits
+		return false, nil
 	}
 }
 
