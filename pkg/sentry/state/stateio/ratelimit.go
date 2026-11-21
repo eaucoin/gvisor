@@ -168,6 +168,14 @@ func (r *RateLimitedReader) Retrying() bool {
 	return ok && rr.Retrying()
 }
 
+// SetReadKind implements KindAsyncReader.SetReadKind: it passes the kind on to
+// the reader that r limits, if that reader takes it.
+func (r *RateLimitedReader) SetReadKind(id int, kind ReadKind) {
+	if kr, ok := r.AsyncReader.(KindAsyncReader); ok {
+		kr.SetReadKind(id, kind)
+	}
+}
+
 // RateLimitedWriter is an AsyncWriter that completes the writes of another no
 // sooner than a device storing a fixed number of bytes per second, in the
 // order the writes were issued, would: as a disk throttled by cgroup io.max,

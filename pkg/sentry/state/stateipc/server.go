@@ -121,6 +121,7 @@ func (s *AsyncFileServer) Open(req *OpenRequest, resp *OpenResponse) error {
 			wake: make(chan struct{}, 1),
 		}
 		rf.waitOr, _ = ar.(stateio.WaitOrAsyncReader)
+		rf.kinds, _ = ar.(stateio.KindAsyncReader)
 		if pr, ok := ar.(stateio.ParallelAsyncReader); ok {
 			resp.ParallelReads = uint32(min(max(pr.ParallelReads(), 0), maxParallel))
 		}
@@ -373,6 +374,10 @@ type readFile struct {
 	// otherwise. waitOr is immutable.
 	waitOr stateio.WaitOrAsyncReader
 
+	// kinds is ar if it implements stateio.KindAsyncReader, which is told
+	// the kind of each read, and nil otherwise. kinds is immutable.
+	kinds stateio.KindAsyncReader
+
 	// wake is notified by AsyncFileServer.Wake. wake is immutable.
 	wake chan struct{}
 
@@ -472,6 +477,9 @@ func (f *readFile) handleReadSubmission(cs []stateio.Completion) []stateio.Compl
 	if numRanges == 0 || numRanges > f.maxRanges {
 		log.Warningf("stateipc.readFile(%s): invalid NumRanges %d (max %d)", f.path, numRanges, f.maxRanges)
 		return appendErrnoCompletion(cs, id, unix.EINVAL)
+	}
+	if f.kinds != nil {
+		f.kinds.SetReadKind(int(id), stateio.ReadKind(subHdr.Kind))
 	}
 
 	if numRanges == 1 {
