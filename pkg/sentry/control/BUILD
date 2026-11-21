@@ -109,6 +109,7 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/control/controlapi",
         "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/ktime",
         "//pkg/sentry/pgalloc",

@@ -15,7 +15,9 @@
 package pgalloc
 
 import (
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -100,10 +102,14 @@ func (f *MemoryFile) StartPrecopy(pf *AsyncPagesFileSave) (*Precopy, error) {
 // known-committed ranges, and the data ranges of the backing file in the
 // others, so that holes are not read (and committed). It returns the number
 // of bytes enqueued for copying. CopyAll waits for async page loading to
-// complete first.
-func (p *Precopy) CopyAll() (uint64, error) {
+// complete first, until deadline if it is not zero, after which it fails with
+// ErrLoadWaitExpired; it awaits none of the pages (see awaitLoadingDone), so
+// that the tasks that run meanwhile fault theirs in first.
+func (p *Precopy) CopyAll(deadline time.Time) (uint64, error) {
 	f := p.amfs.f
-	if err := f.AwaitLoadAll(); err != nil {
+	if err := f.awaitLoadingDone(deadline); errors.Is(err, ErrLoadWaitExpired) {
+		return 0, err
+	} else if err != nil {
 		return 0, fmt.Errorf("previous async page loading failed: %w", err)
 	}
 	var (
@@ -140,8 +146,10 @@ func (p *Precopy) CopyAll() (uint64, error) {
 // as they loaded are (as decommitting them or a mark coarser than the writes
 // it records dirties them), are copied once they are loaded. If some will
 // never be loaded, Copy copies none of the pages of s, whose contents remain
-// unknown: the save reads them, and fails for those.
-func (p *Precopy) Copy(s *DirtySet) uint64 {
+// unknown: the save reads them, and fails for those. Copy waits for them
+// until deadline if it is not zero, after which it copies nothing and fails
+// with ErrLoadWaitExpired.
+func (p *Precopy) Copy(s *DirtySet, deadline time.Time) (uint64, error) {
 	var dirty []memmap.FileRange
 	s.ForEachRange(memmap.FileRange{Start: 0, End: p.limit}, func(fr memmap.FileRange) bool {
 		dirty = append(dirty, fr)
@@ -150,7 +158,10 @@ func (p *Precopy) Copy(s *DirtySet) uint64 {
 	f := p.amfs.f
 	loaded := true
 	if loads := f.asyncPageLoad.Load(); loads != nil {
-		_, err := f.awaitLoads(loads, dirty)
+		_, err := f.awaitLoads(loads, dirty, deadline)
+		if errors.Is(err, ErrLoadWaitExpired) {
+			return 0, err
+		}
 		loaded = err == nil
 	}
 	var n uint64
@@ -166,7 +177,7 @@ func (p *Precopy) Copy(s *DirtySet) uint64 {
 			return nil
 		})
 	}
-	return n
+	return n, nil
 }
 
 // forEachUnknown calls fn on each maximal range of pages of fr whose contents

@@ -18,6 +18,7 @@ package pgalloc
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -67,7 +68,7 @@ func TestPrecopy(t *testing.T) {
 	p, pw := startTestPrecopy(t, tf.f)
 
 	// Round 0 copies every committed page.
-	copied, err := p.CopyAll()
+	copied, err := p.CopyAll(time.Time{})
 	if err != nil {
 		t.Fatalf("CopyAll: %v", err)
 	}
@@ -81,8 +82,8 @@ func TestPrecopy(t *testing.T) {
 	}
 
 	// Round 1 copies the pages written during round 0.
-	if copied := p.Copy(tf.f.SwapDirty(false /* paused */)); copied != 3*page {
-		t.Errorf("round 1 copied %d bytes, want %d", copied, 3*page)
+	if copied, err := p.Copy(tf.f.SwapDirty(false /* paused */), time.Time{}); err != nil || copied != 3*page {
+		t.Errorf("round 1 copied %d bytes, error %v; want %d, nil", copied, err, 3*page)
 	}
 	precopyWait(t, p)
 	for _, i := range []uint64{2, 10} {
@@ -140,7 +141,7 @@ func TestPrecopyCopyAllSkipsHoles(t *testing.T) {
 	}
 	fillPage(f, fr.Start+5*page, 0)
 	p, _ := startTestPrecopy(t, f)
-	copied, err := p.CopyAll()
+	copied, err := p.CopyAll(time.Time{})
 	if err != nil {
 		t.Fatalf("CopyAll: %v", err)
 	}
@@ -172,9 +173,11 @@ func TestPrecopyReallocatedPage(t *testing.T) {
 			}
 			p, pw := startTestPrecopy(t, f)
 			if incremental {
-				p.Copy(f.SwapDirty(false /* paused */))
+				if _, err := p.Copy(f.SwapDirty(false /* paused */), time.Time{}); err != nil {
+					t.Fatalf("Copy: %v", err)
+				}
 			} else {
-				if _, err := p.CopyAll(); err != nil {
+				if _, err := p.CopyAll(time.Time{}); err != nil {
 					t.Fatalf("CopyAll: %v", err)
 				}
 				f.SwapDirty(false /* paused */)
@@ -188,7 +191,9 @@ func TestPrecopyReallocatedPage(t *testing.T) {
 			if !dirty.Contains(freed.Start) {
 				t.Fatalf("freed page %#x is not dirty", freed.Start)
 			}
-			p.Copy(dirty)
+			if _, err := p.Copy(dirty, time.Time{}); err != nil {
+				t.Fatalf("Copy: %v", err)
+			}
 			precopyWait(t, p)
 
 			// Allocate it again and read it, which commits it without
@@ -259,7 +264,10 @@ func TestPrecopyDuringLoadCopiesDirtyPagesLoaded(t *testing.T) {
 		}
 	}
 	copied := make(chan uint64, 1)
-	go func() { copied <- p.Copy(dirty) }()
+	go func() {
+		n, _ := p.Copy(dirty, time.Time{})
+		copied <- n
+	}()
 	select {
 	case <-copied:
 		t.Fatalf("Precopy.Copy returned before the pages it copies were loaded")
@@ -340,4 +348,35 @@ func TestPrecopyForEachUnclean(t *testing.T) {
 			t.Fatalf("round %d: unclean pages %v, want %v", round, got, want)
 		}
 	}
+}
+
+// TestPrecopyLoadWait checks that a pre-copy round whose wait for the dirty
+// pages it copies that are still loading reaches its deadline fails with
+// ErrLoadWaitExpired, copying nothing, and that a round once they have loaded
+// copies them; and that a first round's wait for every page fails likewise.
+func TestPrecopyLoadWait(t *testing.T) {
+	tf := newImageTestFile(t, 8)
+	parent := saveTestImage(t, tf.f, nil, nil)
+	pageAt := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: tf.fr.Start + i*page, End: tf.fr.Start + (i+1)*page}
+	}
+	gate := &gatedReader{r: bytes.NewReader(parent.layers[0]), gate: make(chan struct{})}
+	f2 := loadTestImage(t, parent, stateio.NewIOReader(gate, 64<<10, 16, 4))
+	var openGate sync.Once
+	defer openGate.Do(func() { close(gate.gate) })
+	p, _ := startTestPrecopy(t, f2)
+
+	if n, err := p.CopyAll(time.Now().Add(100 * time.Millisecond)); !errors.Is(err, ErrLoadWaitExpired) || n != 0 {
+		t.Errorf("CopyAll of a MemoryFile loading: copied %d bytes, error %v; want 0, ErrLoadWaitExpired", n, err)
+	}
+	f2.MarkDirty(pageAt(1))
+	dirty := f2.SwapDirty(false /* paused */)
+	if n, err := p.Copy(dirty, time.Now().Add(100*time.Millisecond)); !errors.Is(err, ErrLoadWaitExpired) || n != 0 {
+		t.Errorf("Copy of a dirty page loading: copied %d bytes, error %v; want 0, ErrLoadWaitExpired", n, err)
+	}
+	openGate.Do(func() { close(gate.gate) })
+	if n, err := p.Copy(dirty, time.Now().Add(10*time.Second)); err != nil || n != page {
+		t.Errorf("Copy once loaded: copied %d bytes, error %v; want %d, nil", n, err, page)
+	}
+	precopyWait(t, p)
 }

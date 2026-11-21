@@ -61,6 +61,11 @@ type PrecopyOpts struct {
 	// measure, the first round measures it.
 	Auto bool
 
+	// If LoadWaitDeadline is not zero, the rounds wait for the pages they copy
+	// that are still being loaded asynchronously until then, and fail with
+	// pgalloc.ErrLoadWaitExpired after.
+	LoadWaitDeadline time.Time
+
 	// If Throttle is true, a round that does not halve the bytes left to
 	// write does not stop the rounds the first time: instead, the tasks of
 	// all MemoryManagers together may then dirty memory at most at a quarter
@@ -373,13 +378,17 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 		for _, mf := range mfs {
 			pc := p.mfs[mf]
 			if round == 0 && whole[mf] {
-				c, err := pc.CopyAll()
+				c, err := pc.CopyAll(opts.LoadWaitDeadline)
 				if err != nil {
 					return err
 				}
 				n += c
 			} else {
-				n += pc.Copy(e.Sets[mf])
+				c, err := pc.Copy(e.Sets[mf], opts.LoadWaitDeadline)
+				if err != nil {
+					return fmt.Errorf("pre-copy round %d: %w", round, err)
+				}
+				n += c
 			}
 		}
 		for _, mf := range mfs {

@@ -82,6 +82,12 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 		ValidateMetadata:               o.ValidateMetadata,
 		GraphEngine:                    o.GraphEngine,
 	}
+	if o.LoadWait < 0 {
+		return nil, fmt.Errorf("invalid load wait %v", o.LoadWait)
+	}
+	if o.LoadWait > 0 {
+		saveOpts.LoadWaitDeadline = time.Now().Add(o.LoadWait)
+	}
 	if o.ParentImageDigest != "" {
 		d, err := checkpointimage.ParseDigest(o.ParentImageDigest)
 		if err != nil {
@@ -255,25 +261,79 @@ func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
 	}
 	defer saveOpts.Close()
 
-	if err := s.SaveWithOpts(saveOpts, &o.ExecOpts); err != nil {
-		return err
+	resume, err := SaveWithOpts(s.Kernel, s.Watchdog, saveOpts, &o.ExecOpts)
+	if resume != nil {
+		if perr := resume(); perr != nil {
+			if err != nil {
+				// The save's load wait ran out, and the sandbox runs on,
+				// but resuming it failed, as after a save that succeeded:
+				// the save is not one to try again later.
+				return fmt.Errorf("post resume work after a save whose load wait ran out: %w", perr)
+			}
+			return perr
+		}
 	}
-	if saveOpts.Resume {
-		return PostResume(s.Kernel, nil)
-	}
-	return nil
+	return err
 }
 
-// SaveWithOpts saves the running system with the given options. If
-// saveOpts.Resume is true, the caller must call PostResume afterwards.
-func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
-	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
-		return err
+// SaveWithOpts saves the running system, k, which w watches, with the given
+// options. It is a function rather than a method of State, all of whose
+// exported methods serve RPCs. If resume is not nil, the sandbox runs on, and
+// the caller must call it afterwards: it undoes what of the save's preparation
+// ran, as PostResume does, after a save with saveOpts.Resume set that
+// succeeded, and after a save whose load wait expired once the save/restore
+// binary had run (and, if the binary was the one waiting, before CUDA's
+// checkpoint, which then has nothing to undo).
+//
+// If saveOpts.LoadWaitDeadline is not zero, it bounds the save's waits for
+// pages that are still being loaded asynchronously (all of them, and the
+// pages dirtied as they loaded for an incremental save): before the
+// save/restore binary runs, the save waits, the sandbox running, for those it
+// will read; the save/restore binary's wait for pages stalled past it is cut
+// short, the binary killed (see waitWithin); pre-copy rounds, the sandbox
+// running, and the save in the pause wait for the pages they copy or save
+// until then. A save whose wait expires fails with pgalloc.ErrLoadWaitExpired
+// before it writes the kernel's state, or, in the pause, any of its memory
+// but what pre-copy rounds wrote, and leaves the sandbox running as it was,
+// whether or not saveOpts.Resume is set: what it wrote to its destination
+// before, such as the state file's header and metadata, is incomplete. What
+// the deadline does not bound is the save/restore binary's own run time, which
+// its timeout bounds, writing the save, and the pause: a task blocked in a
+// system call on pages still loading, as a read of a tmpfs file's may be,
+// stops only once they have loaded, which the wait before the binary runs
+// leaves none of for a save that is not incremental.
+func SaveWithOpts(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (resume func() error, err error) {
+	ctx := k.SupervisorContext()
+	if !saveOpts.LoadWaitDeadline.IsZero() && !saveOpts.TestOnlySkipRunningLoadWait {
+		if err := k.AwaitSaveLoads(ctx, saveOpts.Parent != nil, saveOpts.LoadWaitDeadline); err != nil {
+			return nil, err
+		}
+	}
+	if err := preSave(k, saveOpts, execOpts); err != nil {
+		if errors.Is(err, pgalloc.ErrLoadWaitExpired) {
+			// A save/restore binary that waited for pages past the load
+			// wait was killed: the sandbox runs on, to be resumed as after
+			// a save.
+			return resumeAfterBinaryExpired(k), err
+		}
+		return nil, err
 	}
 	// What the save allocates is garbage once it has ended; see
 	// collectAfterSave.
 	defer collectAfterSave()
-	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
+	err = saveOpts.Save(ctx, k, w)
+	if (err == nil && saveOpts.Resume) || errors.Is(err, pgalloc.ErrLoadWaitExpired) {
+		return func() error { return PostResume(k, nil) }, err
+	}
+	return nil, err
+}
+
+// resumeAfterBinaryExpired returns what undoes preSave once its save/restore
+// binary was killed for waiting for pages past the save's load wait: the
+// binary's resume, and the TPU checkpoint before it, but not CUDA's, which
+// runs after the binary and so never ran.
+func resumeAfterBinaryExpired(k *kernel.Kernel) func() error {
+	return func() error { return postResume(k, nil, false /* cuda */) }
 }
 
 // collectAfterSave collects, in the background, the garbage of the save that
@@ -320,7 +380,7 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Timeout, execOpts.ContainerID); err != nil {
 			return fmt.Errorf("failed to configure save/restore binary: %w", err)
 		}
-		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
+		if err := saveRestoreExec(k, SaveRestoreExecSave, o.LoadWaitDeadline); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
 	}
@@ -331,6 +391,12 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 //
 // Precondition: The kernel should be running.
 func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
+	return postResume(k, timeline, true /* cuda */)
+}
+
+// postResume is PostResume, which undoes CUDA's checkpoint only if cuda is
+// true.
+func postResume(k *kernel.Kernel, timeline *timing.Timeline, cuda bool) error {
 	if k.IsPaused() {
 		// The kernel is still paused (double-pause can happen with Docker which
 		// calls pause first and then checkpoint command). The final resume command
@@ -343,8 +409,10 @@ func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return nil
 	}
 	// Undo preSave in reverse order.
-	if err := postResumeCuda(k, timeline); err != nil {
-		return err
+	if cuda {
+		if err := postResumeCuda(k, timeline); err != nil {
+			return err
+		}
 	}
 
 	if err := SaveRestoreExec(k, SaveRestoreExecResume); err != nil {
@@ -386,8 +454,21 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 // ran out. It is a variable for tests.
 var saveRestoreExecTick = 100 * time.Millisecond
 
-// waitWithin waits for done to be closed for up to timeout, and returns true
-// if it was. Where async page loads have pages left to load as it begins
+// waitOutcome is how a wait of waitWithin ended.
+type waitOutcome int
+
+const (
+	// waitDone is a wait that ended as done was closed.
+	waitDone waitOutcome = iota
+	// waitTimedOut is a wait that ended as its timeout ran out.
+	waitTimedOut
+	// waitLoadWaitExpired is a wait that ended as async page loads stalled
+	// past its load wait's deadline.
+	waitLoadWaitExpired
+)
+
+// waitWithin waits for done to be closed for up to timeout, and returns how
+// the wait ended. Where async page loads have pages left to load as it begins
 // (progress says so), timeout counts none of the time in which progress finds
 // them stalled: tasks waiting for pages while a pages file's reader retries
 // reads that failed, as the reader of a store that is away for a while does.
@@ -396,11 +477,17 @@ var saveRestoreExecTick = 100 * time.Millisecond
 // back is not its own. Otherwise, as for a save, timeout counts all of the
 // time, as it always did.
 //
+// If loadWaitDeadline is not zero, it bounds the time not counted: the first
+// tick past it at which progress finds the loads stalled ends the wait
+// (waitLoadWaitExpired). A save with a load wait so bounds its wait for the
+// save/restore binary, which may touch pages that a store that is away keeps
+// from loading, by its load wait, as it bounds its own waits for pages.
+//
 // progress may take long to answer, or never answer, as when it asks a pages
 // file's reader in another process that is wedged: it is asked off the wait,
 // once at a time, and a tick with no answer since the one before counts, so
 // that timeout still bounds the wait.
-func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pgalloc.AsyncPageLoadProgress) bool {
+func waitWithin(done <-chan struct{}, timeout time.Duration, loadWaitDeadline time.Time, progress func() pgalloc.AsyncPageLoadProgress) waitOutcome {
 	start := time.Now()
 	answers := make(chan pgalloc.AsyncPageLoadProgress, 1)
 	asking := false
@@ -414,16 +501,16 @@ func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pga
 	stalled := false
 	select {
 	case <-done:
-		return true
+		return waitDone
 	case p := <-answers:
 		asking = false
 		stalled = p.Stalled
 		if !p.Loading {
 			select {
 			case <-done:
-				return true
+				return waitDone
 			case <-time.After(timeout - time.Since(start)):
-				return false
+				return waitTimedOut
 			}
 		}
 	case <-time.After(saveRestoreExecTick):
@@ -436,11 +523,19 @@ func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pga
 	for counted := time.Duration(0); counted < timeout; {
 		select {
 		case <-done:
-			return true
+			return waitDone
 		case p := <-answers:
 			asking = false
 			stalled = stalled || p.Stalled
 		case now := <-ticker.C:
+			if stalled && !loadWaitDeadline.IsZero() && now.After(loadWaitDeadline) {
+				select {
+				case <-done:
+					return waitDone
+				default:
+					return waitLoadWaitExpired
+				}
+			}
 			if !stalled {
 				counted += now.Sub(last)
 			}
@@ -453,9 +548,9 @@ func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pga
 	}
 	select {
 	case <-done:
-		return true
+		return waitDone
 	default:
-		return false
+		return waitTimedOut
 	}
 }
 
@@ -465,6 +560,14 @@ func waitWithin(done <-chan struct{}, timeout time.Duration, progress func() pga
 // Precondition: The kernel should be running; k.SetSaveRestoreExecConfig should
 // be setup with an argv, otherwise this function is a no-op.
 func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
+	return saveRestoreExec(k, mode, time.Time{})
+}
+
+// saveRestoreExec is SaveRestoreExec, whose wait for the binary
+// loadWaitDeadline bounds if it is not zero (see waitWithin): once async page
+// loads stall past it, the binary is killed, and saveRestoreExec fails with
+// pgalloc.ErrLoadWaitExpired.
+func saveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode, loadWaitDeadline time.Time) error {
 	if k.SaveRestoreExecConfig == nil {
 		return nil
 	}
@@ -535,9 +638,13 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 		tg.WaitExited()
 		close(waitC)
 	}()
-	if !waitWithin(waitC, timeout, pgalloc.CurrentAsyncPageLoadProgress) {
+	switch waitWithin(waitC, timeout, loadWaitDeadline, pgalloc.CurrentAsyncPageLoadProgress) {
+	case waitTimedOut:
 		tg.SendForcedSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		return fmt.Errorf("%s timed out after %v", argv[0], timeout)
+	case waitLoadWaitExpired:
+		tg.SendForcedSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+		return fmt.Errorf("%s waited for pages still loading past the save's load wait, killed: %w", argv[0], pgalloc.ErrLoadWaitExpired)
 	}
 	if tg.ExitStatus() != 0 {
 		return fmt.Errorf("%v exited with non-zero status %d", argv[0], tg.ExitStatus())

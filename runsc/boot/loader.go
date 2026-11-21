@@ -286,6 +286,12 @@ type Loader struct {
 	// Lock order: saveMu is taken before mu.
 	saveMu sync.Mutex
 
+	// resuming, if not nil, is closed once the post-resume work of the last
+	// save that left the sandbox running has ended, which runs once the
+	// save's caller has been answered (Loader.postResume): the next save
+	// waits for it. resuming is protected by saveMu.
+	resuming chan struct{}
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
