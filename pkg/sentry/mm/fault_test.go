@@ -1132,3 +1132,51 @@ func TestWriteFaultWaitingForLoadLeavesPageClean(t *testing.T) {
 		t.Errorf("dirty pages: got %v, want %v", got, want)
 	}
 }
+
+// stoppingContext is the context of a task that is required to stop, as for a
+// checkpoint, once stop is closed: its BlockKillable then returns
+// linuxerr.ErrInterrupted, as kernel.Task's does.
+type stoppingContext struct {
+	context.Context
+	stop chan struct{}
+}
+
+// BlockKillable implements killableBlocker.BlockKillable.
+func (c *stoppingContext) BlockKillable(C <-chan struct{}) error {
+	select {
+	case <-C:
+		return nil
+	case <-c.stop:
+		return linuxerr.ErrInterrupted
+	}
+}
+
+// TestFaultWaitingForLoadEndsForStop checks that a fault waiting for its pages
+// ends, without mapping them, once its task is required to stop, as a
+// checkpoint's pause requires every task to, so that the pause need not wait
+// for pages that may take long to load: the task faults again once it runs
+// on. The pages are not freed meanwhile, and load as before.
+func TestFaultWaitingForLoadEndsForStop(t *testing.T) {
+	ctx := &stoppingContext{Context: contexttest.Context(t), stop: make(chan struct{})}
+	rp := restorePages(ctx, t, restoreOpts{pages: 32})
+	defer rp.finish(ctx, t)
+
+	fault := startFault(ctx, t, rp.mm, rp.page(11), hostarch.Write)
+	close(ctx.stop)
+	if err := faultEnds(t, fault); err != nil {
+		t.Errorf("HandleUserFault of a task that must stop: got %v, want nil", err)
+	}
+	if _, ok := rp.as.mappedAs(rp.page(11)); ok {
+		t.Errorf("the page of the stopped task's fault is mapped")
+	}
+	if rp.mf.IsLoaded(pageFileRange(t, rp.mm, rp.page(11))) {
+		t.Errorf("the page of the stopped task's fault is loaded")
+	}
+	rp.letLoad()
+	if err := rp.mm.HandleUserFault(contexttest.Context(t), rp.page(11), hostarch.Write, 0 /* sp */); err != nil {
+		t.Fatalf("HandleUserFault once the task runs on: %v", err)
+	}
+	if got, want := readPage(ctx, t, rp.mm, rp.page(11)), restoredByte(11); got != want {
+		t.Errorf("the faulting page holds %d, want %d", got, want)
+	}
+}

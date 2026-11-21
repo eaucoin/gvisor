@@ -2513,21 +2513,49 @@ func (f *MemoryFile) IsLoaded(fr memmap.FileRange) bool {
 	return true
 }
 
-// AwaitLoad blocks until every page of fr has been loaded, or until the await
-// of the calling goroutine is cut short (CancelAwaits), in which case it
-// returns linuxerr.EINTR. It returns an error if pages of fr will never be
-// loaded. A caller that must not wait for pages while holding its own locks
-// waits for them with AwaitLoad first, then accesses them without waiting.
+// AwaitLoad blocks until every page of fr has been loaded, and returns an
+// error if pages of fr will never be loaded. A caller that must not wait for
+// pages while holding its own locks waits for them with AwaitLoad first, then
+// accesses them without waiting.
 //
 // The caller need hold no reference on the pages of fr: pages freed while it
 // waits end its wait as if they were loaded, as no contents of theirs remain
 // to wait for. It must hold none of its own locks that the pages' loading or
 // freeing may need.
-func (f *MemoryFile) AwaitLoad(fr memmap.FileRange) error {
-	if loads := f.asyncPageLoad.Load(); loads != nil {
+//
+// If block is not nil, AwaitLoad waits through it: block blocks until C is
+// ready, or until the caller is interrupted, in which case it returns an
+// error, which ends the wait at once and which AwaitLoad returns. Otherwise,
+// AwaitLoad's wait ends early only as the await of the calling goroutine is
+// cut short (CancelAwaits), in which case it returns linuxerr.EINTR.
+func (f *MemoryFile) AwaitLoad(fr memmap.FileRange, block func(C <-chan struct{}) error) error {
+	loads := f.asyncPageLoad.Load()
+	if loads == nil || f.IsLoaded(fr) {
+		return nil
+	}
+	if block == nil {
 		return loads.awaitLoad(fr)
 	}
-	return nil
+	// Wait on a goroutine of its own, whose await is cut short if block
+	// returns first.
+	var (
+		g    = make(chan int64, 1)
+		done = make(chan struct{})
+		err  error
+	)
+	go func() {
+		g <- goid.Get()
+		err = loads.awaitLoad(fr)
+		close(done)
+	}()
+	waiter := <-g
+	if berr := block(done); berr != nil {
+		CancelAwaits(waiter)
+		<-done
+		ForgetCanceledAwaits(waiter)
+		return berr
+	}
+	return err
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr, or until
