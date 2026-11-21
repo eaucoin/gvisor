@@ -16,11 +16,13 @@ package pgalloc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -1965,7 +1967,7 @@ func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) (uint64, err
 		amfl.pf.mu.Unlock()
 	}
 	var unclean []memmap.FileRange
-	for _, fr := range unloaded {
+	for _, fr := range mergeFileRanges(unloaded) {
 		for off := fr.Start; off < fr.End; off += hostarch.PageSize {
 			if clean(off) {
 				continue
@@ -1980,33 +1982,45 @@ func (f *MemoryFile) awaitUncleanLoads(clean func(off uint64) bool) (uint64, err
 	return f.awaitLoads(loads, unclean)
 }
 
+// mergeFileRanges sorts frs and merges those that overlap or abut, in place,
+// and returns the result.
+func mergeFileRanges(frs []memmap.FileRange) []memmap.FileRange {
+	slices.SortFunc(frs, func(a, b memmap.FileRange) int {
+		return cmp.Compare(a.Start, b.Start)
+	})
+	merged := frs[:0]
+	for _, fr := range frs {
+		if n := len(merged); n != 0 && merged[n-1].End >= fr.Start {
+			merged[n-1].End = max(merged[n-1].End, fr.End)
+		} else {
+			merged = append(merged, fr)
+		}
+	}
+	return merged
+}
+
 // awaitLoads blocks until every page of frs has been loaded by loads, holding
 // a reference on the pages that remain to be loaded while it waits for them,
 // as awaitLoad requires. It returns the number of bytes of frs that remained
 // to be loaded, which it waited for, and logs them with the time it waited:
 // a save waits for them while the sandbox is paused.
 //
-// Preconditions: f.mu must not be locked.
+// Preconditions:
+//   - frs are sorted by offset and do not overlap.
+//   - f.mu must not be locked.
 func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRange) (uint64, error) {
-	if len(frs) == 0 {
+	// Find the pages of frs that remain to be loaded without f.mu locked:
+	// frs may be many ranges, such as those of a dirty set, and allocations
+	// and frees wait for f.mu.
+	candidates := loads.unloadedIn(frs)
+	if len(candidates) == 0 {
 		return 0, nil
 	}
 	// With f.mu locked, the pages that remain to be loaded are in use: pages
-	// leave the unloaded sets as they become waste (cancelWasteLoad).
-	var held []memmap.FileRange
+	// leave the unloaded sets as they become waste (cancelWasteLoad). Pages
+	// never join them, so those that remain are among the candidates.
 	f.mu.Lock()
-	for _, amfl := range loads.amfls {
-		if amfl == nil {
-			continue
-		}
-		amfl.pf.mu.Lock()
-		for _, fr := range frs {
-			for ulseg := amfl.unloaded.LowerBoundSegment(fr.Start); ulseg.Ok() && ulseg.Start() < fr.End; ulseg = ulseg.NextSegment() {
-				held = append(held, ulseg.Range().Intersect(fr))
-			}
-		}
-		amfl.pf.mu.Unlock()
-	}
+	held := loads.unloadedIn(candidates)
 	var waited uint64
 	for _, fr := range held {
 		f.incRefLocked(fr)
@@ -2033,6 +2047,48 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 		log.Infof("MemoryFile(%p): waited %s for %d bytes of dirty pages still loading", f, dur, waited)
 	}
 	return waited, err
+}
+
+// unloadedIn returns the pages of frs that remain to be loaded by any of
+// loads' layers, sorted by offset and merged. It looks up each layer's
+// unloaded set no more than once per alternation between frs and the set's
+// segments, skipping the ranges that end below the layer's first unloaded
+// page without locking it.
+//
+// Preconditions: frs are sorted by offset and do not overlap.
+func (loads *asyncMemoryFileLoads) unloadedIn(frs []memmap.FileRange) []memmap.FileRange {
+	var out []memmap.FileRange
+	for _, amfl := range loads.amfls {
+		if amfl == nil {
+			continue
+		}
+		minUnloaded := amfl.minUnloaded.Load()
+		i := sort.Search(len(frs), func(i int) bool { return frs[i].End > minUnloaded })
+		if i == len(frs) {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		ulseg := amfl.unloaded.LowerBoundSegment(frs[i].Start)
+		for i < len(frs) && ulseg.Ok() {
+			fr := frs[i]
+			switch {
+			case ulseg.End() <= fr.Start:
+				ulseg = amfl.unloaded.LowerBoundSegment(fr.Start)
+			case fr.End <= ulseg.Start():
+				start := ulseg.Start()
+				i += sort.Search(len(frs)-i, func(j int) bool { return frs[i+j].End > start })
+			default:
+				out = append(out, fr.Intersect(ulseg.Range()))
+				if ulseg.End() < fr.End {
+					ulseg = ulseg.NextSegment()
+				} else {
+					i++
+				}
+			}
+		}
+		amfl.pf.mu.Unlock()
+	}
+	return mergeFileRanges(out)
 }
 
 // awaitLoad blocks until data has been loaded for all pages in fr.
