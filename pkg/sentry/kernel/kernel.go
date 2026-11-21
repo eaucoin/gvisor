@@ -1093,7 +1093,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		imageWriter = checkpointimage.NewWriter(pagesMetadata, image)
 		pmw = imageWriter
 		pmwCleanup.Add(func() { pagesMetadata.Close() })
-	} else if err := checkpointimage.WriteRecord(w, image); err != nil {
+	} else if err := checkpointimage.WriteStateRecord(w, image); err != nil {
 		return nil, fmt.Errorf("failed to write image metadata: %w", err)
 	}
 	defer pmwCleanup.Clean()

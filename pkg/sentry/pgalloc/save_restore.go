@@ -235,7 +235,9 @@ type SaveOpts struct {
 // If opts.PagesFile is not nil, SaveTo writes f's metadata to w as a
 // checkpointimage record, with the extents of its pages in the image's layers
 // (layer 0 is opts.PagesFile) and, if opts.PageHashes, their page hashes.
-// Otherwise, it writes the metadata followed by the pages.
+// Otherwise, it writes the metadata, as a record framed as data that is not
+// an object of the state file (checkpointimage.WriteStateRecord), followed by
+// the pages, framed likewise.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
 	if (opts.Base != nil || opts.Precopy != nil) && opts.PagesFile == nil {
 		return fmt.Errorf("saving a delta or completing a pre-copy requires a pages file")
@@ -625,7 +627,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		log.Infof("MemoryFile(%p): %d bytes written to the pages file, %d bytes in the base image (+ %d bytes found unchanged by hash), %d bytes pre-copied, %d bytes zero; %d extents; hashed in %s",
 			f, img.writtenBytes, img.baseBytes, img.refinedBytes, img.precopyBytes, img.zeroBytes, len(pb.Extents), time.Duration(gohacks.Nanotime()-timeMetadataStart))
 	}
-	if err := checkpointimage.WriteRecord(w, pb); err != nil {
+	writeRecord := checkpointimage.WriteRecord
+	if amfs == nil {
+		// The metadata precedes the pages in the state file.
+		writeRecord = checkpointimage.WriteStateRecord
+	}
+	if err := writeRecord(w, pb); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
@@ -1325,7 +1332,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		return fmt.Errorf("%d pages files for an image of %d layers", len(opts.PagesFiles), len(opts.Image.GetLayers()))
 	}
 	var pb pgallocpb.MemoryFileMetadataProto
-	if err := checkpointimage.ReadRecord(r, &pb, checkpointimage.MaxBodySize); err != nil {
+	readRecord := checkpointimage.ReadRecord
+	if inline {
+		readRecord = checkpointimage.ReadStateRecord
+	}
+	if err := readRecord(r, &pb, checkpointimage.MaxBodySize); err != nil {
 		return fmt.Errorf("failed to read metadata: %w", err)
 	}
 	if err := checkpointimage.ValidateMemoryFile(&pb, opts.Image, inline); err != nil {

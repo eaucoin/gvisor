@@ -20,6 +20,8 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/state",
+        "//pkg/state/wire",
         "@com_github_cespare_xxhash_v2//:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
     ],
