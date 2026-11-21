@@ -73,6 +73,17 @@ type Reader struct {
 	// since, as they wait to be made again (see read).
 	retrying atomic.Int32
 
+	// kinds holds the kind of each read ID that SetReadKind set, which the
+	// read that AddRead or AddReadv enqueue next takes. kinds is used by the
+	// goroutine that enqueues reads.
+	kinds []stateio.ReadKind
+
+	// If trace is true, each GET is logged as it ends, and gets and bytes
+	// count them (FileServerOptions.Trace). trace is set before r is used.
+	trace bool
+	gets  atomic.Uint64
+	bytes atomic.Uint64
+
 	// size is the object's size, once the store has said it in the
 	// Content-Range of an answer to a GET, or -1 before: a read that would
 	// begin at or past it then ends there, without a GET the store would
@@ -84,6 +95,7 @@ type Reader struct {
 
 type readSubmission struct {
 	id    int
+	kind  stateio.ReadKind
 	off   int64
 	total uint64
 	dst   stateio.LocalClientRanges
@@ -103,11 +115,12 @@ func newReader(ctx context.Context, client *s3.Client, obj object, policy retryP
 		subs:         make(chan readSubmission, maxParallel),
 		cmps:         make(chan stateio.Completion, maxParallel),
 		cancel:       cancel,
+		kinds:        make([]stateio.ReadKind, maxParallel),
 	}
 	r.size.Store(-1)
 	r.workers.Add(maxParallel)
-	for range maxParallel {
-		go r.workerMain(ctx)
+	for worker := range maxParallel {
+		go r.workerMain(ctx, worker)
 	}
 	return r
 }
@@ -223,6 +236,13 @@ func (r *Reader) Retrying() bool {
 func (r *Reader) Close() error {
 	r.cancel(fmt.Errorf("context canceled by Reader.Close"))
 	r.workers.Wait()
+	if r.trace {
+		var ru unix.Rusage
+		if err := unix.Getrusage(unix.RUSAGE_SELF, &ru); err != nil {
+			log.Warningf("Getrusage: %v", err)
+		}
+		log.Infof("S3 read trace: closed %s after %d GETs of %d bytes; process CPU user %v system %v", r.obj, r.gets.Load(), r.bytes.Load(), time.Duration(ru.Utime.Nano()), time.Duration(ru.Stime.Nano()))
+	}
 	return nil
 }
 
@@ -247,10 +267,24 @@ func (r *Reader) ParallelReads() int {
 	return cap(r.subs)
 }
 
+// SetReadKind implements stateio.KindAsyncReader.SetReadKind.
+func (r *Reader) SetReadKind(id int, kind stateio.ReadKind) {
+	r.kinds[id] = kind
+}
+
+// readKind returns the kind of the read with the given ID that SetReadKind
+// set, and forgets it.
+func (r *Reader) readKind(id int) stateio.ReadKind {
+	kind := r.kinds[id]
+	r.kinds[id] = stateio.ReadUnknown
+	return kind
+}
+
 // AddRead implements stateio.AsyncReader.AddRead.
 func (r *Reader) AddRead(id int, off int64, _ stateio.DestinationFile, _ memmap.FileRange, dstMap []byte) {
 	r.subs <- readSubmission{
 		id:    id,
+		kind:  r.readKind(id),
 		off:   off,
 		total: uint64(len(dstMap)),
 		dst:   stateio.LocalClientMapping(dstMap),
@@ -261,6 +295,7 @@ func (r *Reader) AddRead(id int, off int64, _ stateio.DestinationFile, _ memmap.
 func (r *Reader) AddReadv(id int, off int64, total uint64, _ stateio.DestinationFile, _ []memmap.FileRange, dstMaps []unix.Iovec) {
 	r.subs <- readSubmission{
 		id:    id,
+		kind:  r.readKind(id),
 		off:   off,
 		total: total,
 		dst:   stateio.LocalClientMappings(dstMaps),
@@ -277,14 +312,16 @@ func (r *Reader) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]statei
 	return stateio.CompletionChanWaitOr(r.cmps, cs, wake)
 }
 
-func (r *Reader) workerMain(ctx context.Context) {
+// workerMain makes the reads of r, as worker number worker, which the trace
+// names.
+func (r *Reader) workerMain(ctx context.Context, worker int) {
 	defer r.workers.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case sub := <-r.subs:
-			n, err := r.read(ctx, &sub)
+			n, err := r.read(ctx, &sub, worker)
 			r.cmps <- stateio.Completion{
 				ID:  sub.id,
 				N:   n,
@@ -304,7 +341,7 @@ func (r *Reader) workerMain(ctx context.Context) {
 // it) or that delivers nothing is made again after a backoff (backoffBefore),
 // for as long as ctx lasts, rather than failing the read: a store that is away
 // for a while delays the read, rather than failing it for good.
-func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) {
+func (r *Reader) read(ctx context.Context, sub *readSubmission, worker int) (uint64, error) {
 	var done uint64
 	dst := sub.dst
 	s := &readState{r: r}
@@ -316,7 +353,7 @@ func (r *Reader) read(ctx context.Context, sub *readSubmission) (uint64, error) 
 		if size := r.size.Load(); size >= 0 && sub.off+int64(done) >= size {
 			return done, io.EOF
 		}
-		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s)
+		n, err := r.readOnce(ctx, sub.off+int64(done), sub.total-done, &dst, s, sub.kind, worker)
 		done += n
 		if r.whileRunning && transient(err) {
 			if n != 0 {
@@ -401,12 +438,23 @@ func transient(err error) bool {
 	return retry.IsErrorRetryables(retry.DefaultRetryables).IsErrorRetryable(err) == aws.TrueTernary
 }
 
-// readOnce reads up to total bytes at off into dst with one GET. It returns
+// readOnce reads up to total bytes at off into dst with one GET, for a read of
+// the given kind made by the given worker, which the trace names. It returns
 // io.EOF if the object ends before them. Its errors are the client's, which
 // read maps.
-func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges, s *readState) (uint64, error) {
+func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *stateio.LocalClientRanges, s *readState, kind stateio.ReadKind, worker int) (n uint64, err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.retry.deadline(total))
 	defer cancel()
+	// answered is when the store answered the GET, if it did.
+	var answered time.Time
+	if r.trace {
+		begun := time.Now()
+		defer func() {
+			r.gets.Add(1)
+			r.bytes.Add(n)
+			log.Infof("S3 read trace: %s %s off %d bytes %d got %d worker %d begun %d answered %d ended %d err %v", r.obj, kind, off, total, n, worker, begun.UnixNano(), answered.UnixNano(), time.Now().UnixNano(), err)
+		}()
+	}
 	var optFns []func(*s3.Options)
 	if r.whileRunning {
 		// Made once by the client, as the read retries it after a backoff of
@@ -421,6 +469,7 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 		Key:    aws.String(r.obj.key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(total)-1)),
 	}, optFns...)
+	answered = time.Now()
 	if err != nil {
 		var respErr *awshttp.ResponseError
 		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
@@ -453,10 +502,10 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 			break
 		}
 		m = m[:min(uint64(len(m)), want-done)]
-		n, err := io.ReadFull(body, m)
-		done += uint64(n)
-		if err != nil {
-			bodyErr = err
+		read, readErr := io.ReadFull(body, m)
+		done += uint64(read)
+		if readErr != nil {
+			bodyErr = readErr
 			break
 		}
 	}

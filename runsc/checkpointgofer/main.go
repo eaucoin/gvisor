@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/runsc/checkpointgofer/s3"
 	"gvisor.dev/gvisor/runsc/cli"
 	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 )
@@ -213,7 +214,7 @@ func (cmd *checkpointGoferCmd) Execute(ctx context.Context, f *flag.FlagSet, arg
 		if err := s3.CheckFileMode("the S3 options file", fi, s3Opts.Credentials != nil); err != nil {
 			util.Fatalf("%v", err)
 		}
-		err = cmd.runS3(ctx, sock, &s3Opts)
+		err = cmd.runS3(ctx, sock, &s3Opts, args[0].(*config.Config).AsyncLoadTrace == config.AsyncLoadTraceAll)
 	}
 	if err != nil {
 		util.Fatalf("%v", err)
@@ -287,9 +288,9 @@ func (cmd *checkpointGoferCmd) runGCS(ctx context.Context, sock *unet.Socket, op
 }
 
 // runS3 runs the checkpoint gofer for access to an S3-compatible object store
-// on the given socket. It does not return until the client disconnects or a
-// fatal error occurs.
-func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opts *S3Options) error {
+// on the given socket, logging each GET of a pages file if trace is true. It
+// does not return until the client disconnects or a fatal error occurs.
+func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opts *S3Options, trace bool) error {
 	if len(opts.Bucket) == 0 {
 		return fmt.Errorf("bucket must be specified")
 	}
@@ -312,6 +313,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		PagesFileReadParallel:   opts.ReadParallel,
 		PagesFilePartBytes:      opts.WritePartBytes,
 		PagesFileWriteParallel:  opts.WriteParallel,
+		Trace:                   trace,
 	}
 	switch opts.Addressing {
 	case "":

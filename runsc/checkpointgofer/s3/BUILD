@@ -42,10 +42,12 @@ go_test(
     srcs = ["s3_test.go"],
     library = ":s3",
     deps = [
+        "//pkg/log",
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
+        "//pkg/sync",
         "//runsc/checkpointgofer/s3/s3test",
         "@com_github_aws_aws_sdk_go_v2_credentials//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
