@@ -84,14 +84,14 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		mm.activeMu.DowngradeLock()
 
 		if waits < maxFaultLoadWaits {
-			if mf, fr := mm.unloadedFaultRangeLocked(ctx, pseg, ar); mf != nil {
-				// Wait for the pages to be loaded unlocked, holding the
-				// reference unloadedFaultRangeLocked took on them. pseg and
-				// vseg are invalid once activeMu is unlocked: the fault is
-				// handled again from the start.
+			if mf, fr := mm.unloadedFaultRangeLocked(pseg, ar); mf != nil {
+				// Wait for the pages to be loaded unlocked, holding no
+				// reference on them, so that the fault does not keep other
+				// tasks' copy-on-write faults from taking them over. pseg
+				// and vseg are invalid once activeMu is unlocked: the fault
+				// is handled again from the start.
 				mm.activeMu.RUnlock()
 				err := mf.AwaitLoad(fr)
-				mf.DecRef(fr)
 				if err == linuxerr.EINTR {
 					// The task was killed.
 					return err
