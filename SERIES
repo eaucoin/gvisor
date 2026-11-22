@@ -47,3 +47,7 @@ series/29-parallel-reads on series/28-coalesced-page-loads
 series/30-sandbox-fixes on series/29-parallel-reads
 # A standby sandbox boots with its containers created, and takes one restore over a socket its shim serves (shim).
 series/31-standby on series/30-sandbox-fixes
+# A checkpoint's waits for pages still loading are bounded, and the sandbox runs on when they run out (--load-wait; pgalloc, kernel, control, runsc).
+series/32-save-load-wait on series/31-standby
+# A background restore's reads say whether a task awaits them, and can be traced (--async-load-trace; stateio, stateipc, pgalloc, s3 reader).
+series/33-async-load-trace on series/32-save-load-wait
