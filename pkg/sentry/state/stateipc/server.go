@@ -60,6 +60,14 @@ type AsyncFileServerImpl interface {
 	OpenWrite(path string) (stateio.AsyncWriter, error)
 }
 
+// CacheReporter is implemented by an AsyncFileServerImpl that keeps the files
+// it serves in a cache of its own as they are read.
+type CacheReporter interface {
+	// CacheStatus completes the cache, once its client is done reading the
+	// files it caches, and says what it holds.
+	CacheStatus() CacheStatus
+}
+
 // NewAsyncFileServer returns a new AsyncFileServer.
 func NewAsyncFileServer(impl AsyncFileServerImpl) (*AsyncFileServer, error) {
 	s := &AsyncFileServer{
@@ -319,6 +327,16 @@ func (s *AsyncFileServer) Retrying(req *RetryingRequest, resp *RetryingResponse)
 	}
 	if rr, ok := rf.ar.(stateio.RetryingAsyncReader); ok {
 		resp.Retrying = rr.Retrying()
+	}
+	return nil
+}
+
+// CacheStatus completes the cache of the files that the server serves, once
+// its client is done reading them, and says what it holds (CacheReporter); it
+// says the cache is not enabled if the server keeps none.
+func (s *AsyncFileServer) CacheStatus(req *CacheStatusRequest, resp *CacheStatusResponse) error {
+	if c, ok := s.impl.(CacheReporter); ok {
+		resp.Status = c.CacheStatus()
 	}
 	return nil
 }

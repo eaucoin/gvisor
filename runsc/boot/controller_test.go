@@ -164,11 +164,12 @@ func TestRestoreReadersForCheckpointGoferWaits(t *testing.T) {
 	o.Files = []*os.File{serveCheckpoint(t, &slowStore{files: files, delay: delay})}
 
 	start := time.Now()
-	stateFile, image, pagesFiles, err := getRestoreReadersForCheckpointGofer(o)
+	stateFile, image, pagesFiles, gofer, err := getRestoreReadersForCheckpointGofer(o)
 	if err != nil {
 		t.Fatalf("getRestoreReadersForCheckpointGofer: %v", err)
 	}
 	defer stateFile.Close()
+	defer gofer.DecRef()
 	defer func() {
 		for _, pagesFile := range pagesFiles {
 			pagesFile.Close()
@@ -245,9 +246,10 @@ func TestRestoreReadersForCheckpointGoferLayers(t *testing.T) {
 			tc.edit(files, layers)
 			o := &sentryapi.RestoreOpts{UseCheckpointGofer: true}
 			o.Files = []*os.File{serveCheckpoint(t, &slowStore{files: files})}
-			stateFile, _, pagesFiles, err := getRestoreReadersForCheckpointGofer(o)
+			stateFile, _, pagesFiles, gofer, err := getRestoreReadersForCheckpointGofer(o)
 			if err == nil {
 				stateFile.Close()
+				gofer.DecRef()
 				for _, pagesFile := range pagesFiles {
 					pagesFile.Close()
 				}

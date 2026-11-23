@@ -955,6 +955,22 @@ Gateway and others), the file is `s3_opts.json`:
     cannot, so configure the bucket to delete incomplete multipart uploads
     after a day, as stores allow with a lifecycle rule.
 
+A restore from an S3-compatible store can leave the node a copy of the pages
+files it reads, so that the node holds the image without downloading it again.
+Stage the image path with a directory `pages-cache` that holds, for each pages
+file to keep, a file of its size at the path the gofer reads it at
+(`pages-cache/pages.img`, `pages-cache/layers/<identity>/pages.img`), sparse as
+`truncate` makes it. The checkpoint gofer then writes the bytes of each read of
+a pages file into that file, at their offsets, from buffers of its own rather
+than the sandbox's memory, behind the read and with `O_DIRECT` (a write that
+does not fit its 64 MiB queue is skipped). It checks each page the image refers
+to against the page hashes of `pages_meta.img`, which it reads from the store
+itself. Once the restore has loaded every page, it reads from the store the
+pages not checked yet, syncs the files, and writes beside each file its marks
+(`pages.img.marks`): a bitmap of the pages checked, and a flag set where every
+page the image refers to is. `runsc wait --restore` returns once the marks are
+written; the restore's log says what the cache holds.
+
 ## Working sets
 
 With `--working-set-window` (a runsc flag, given when the sandbox is
