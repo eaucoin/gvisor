@@ -517,6 +517,10 @@ type Config struct {
 	// checkpoint saves for a restore to check them against.
 	SaveRemoteMetadata SaveRemoteMetadataPolicy `flag:"save-remote-metadata"`
 
+	// SaveDentryEviction is when a checkpoint evicts the gofer's cached
+	// dentries.
+	SaveDentryEviction SaveDentryEvictionPolicy `flag:"save-dentry-eviction"`
+
 	// WorkingSetWindow is how long after a restore, or after the first resume
 	// of a sandbox restored paused, the memory that the application touches
 	// is recorded as its working set, which the next checkpoint saves in its
@@ -2287,6 +2291,58 @@ func (p SaveRemoteMetadataPolicy) String() string {
 		return "validated"
 	default:
 		panic(fmt.Sprintf("invalid remote metadata save policy %d", p))
+	}
+}
+
+// SaveDentryEvictionPolicy is when a checkpoint evicts the dentries that the
+// gofer's dentry cache holds, which it does not save.
+type SaveDentryEvictionPolicy int
+
+// SaveDentryEvictionPolicy values.
+const (
+	// SaveDentryEvictionPaused evicts them with the sandbox paused, in the
+	// checkpoint's pause.
+	SaveDentryEvictionPaused SaveDentryEvictionPolicy = iota
+
+	// SaveDentryEvictionRunning evicts them while the sandbox runs, just
+	// before the checkpoint pauses it, which then evicts only those cached
+	// since.
+	SaveDentryEvictionRunning
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *SaveDentryEvictionPolicy) Set(v string) error {
+	switch v {
+	case "paused":
+		*p = SaveDentryEvictionPaused
+	case "running":
+		*p = SaveDentryEvictionRunning
+	default:
+		return fmt.Errorf("invalid dentry eviction policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p SaveDentryEvictionPolicy) Ptr() *SaveDentryEvictionPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *SaveDentryEvictionPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p SaveDentryEvictionPolicy) String() string {
+	switch p {
+	case SaveDentryEvictionPaused:
+		return "paused"
+	case SaveDentryEvictionRunning:
+		return "running"
+	default:
+		panic(fmt.Sprintf("invalid dentry eviction policy %d", p))
 	}
 }
 

@@ -64,6 +64,32 @@ type FilesystemImplSaveRestoreExtension interface {
 	CompleteRestore(ctx context.Context, opts CompleteRestoreOptions) error
 }
 
+// FilesystemImplPrepareSaveRunningExtension is an optional extension to
+// FilesystemImpl.
+type FilesystemImplPrepareSaveRunningExtension interface {
+	// PrepareSaveRunning does ahead of a save, while tasks run, what it can
+	// of the work that PrepareSave would otherwise do with tasks paused, so
+	// that the save's pause is shorter. PrepareSave must not depend on it.
+	PrepareSaveRunning(ctx context.Context)
+}
+
+// PrepareSaveRunning prepares all filesystems for a save as far as they can
+// while tasks run (FilesystemImplPrepareSaveRunningExtension), ahead of the
+// save's PrepareSave.
+func (vfs *VirtualFilesystem) PrepareSaveRunning(ctx context.Context) {
+	fss := vfs.GetFilesystems()
+	defer func() {
+		for _, fs := range fss {
+			fs.DecRef(ctx)
+		}
+	}()
+	for _, fs := range fss {
+		if ext, ok := fs.impl.(FilesystemImplPrepareSaveRunningExtension); ok {
+			ext.PrepareSaveRunning(ctx)
+		}
+	}
+}
+
 // PrepareSave prepares all filesystems for serialization.
 func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context, opts PrepareSaveOptions) error {
 	fss := vfs.GetFilesystems()
