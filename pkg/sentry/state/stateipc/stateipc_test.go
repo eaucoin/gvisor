@@ -992,3 +992,51 @@ func TestReadKinds(t *testing.T) {
 		t.Errorf("the server's reader was given reads of kinds %v, want %v", got, want)
 	}
 }
+
+// testCacheServer is a testReadServer that keeps a cache, which says status.
+type testCacheServer struct {
+	testReadServer
+	status CacheStatus
+}
+
+// CacheStatus implements CacheReporter.CacheStatus.
+func (s *testCacheServer) CacheStatus() CacheStatus {
+	return s.status
+}
+
+// TestCacheStatus checks that a client asking the server of its cache gets
+// what the server's implementation says, or that there is none.
+func TestCacheStatus(t *testing.T) {
+	want := CacheStatus{Enabled: true, Complete: true, Files: 2, Referenced: 8192, Held: 8192, Filled: 4096}
+	for _, tc := range []struct {
+		name string
+		impl AsyncFileServerImpl
+		want CacheStatus
+	}{
+		{name: "cache", impl: &testCacheServer{status: want}, want: want},
+		{name: "no cache", impl: &testReadServer{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usrv := urpc.NewServer()
+			server, err := NewAsyncFileServer(tc.impl)
+			if err != nil {
+				t.Fatalf("failed to create AsyncFileServer: %v", err)
+			}
+			usrv.Register(server)
+			clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+			if err != nil {
+				t.Fatalf("failed to create socketpair: %v", err)
+			}
+			client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+			if err != nil {
+				t.Fatalf("failed to create AsyncFileClient: %v", err)
+			}
+			defer client.DecRef()
+			usrv.StartHandling(serverSock)
+			got, err := client.CacheStatus()
+			if err != nil || got != tc.want {
+				t.Errorf("CacheStatus() = %+v, %v; want %+v, nil", got, err, tc.want)
+			}
+		})
+	}
+}

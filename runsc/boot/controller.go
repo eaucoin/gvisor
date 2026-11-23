@@ -434,10 +434,15 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		// limit.
 		readerCPUs = cm.l.root.applicationCores
 	}
-	stateFile, image, pagesFiles, err := getRestoreReaders(o, readerCPUs)
+	stateFile, image, pagesFiles, gofer, err := getRestoreReaders(o, readerCPUs)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if gofer != nil {
+			gofer.DecRef()
+		}
+	}()
 	if rate := cm.l.root.conf.TestOnlyRestoreReadRate; rate != 0 {
 		for i, pagesFile := range pagesFiles {
 			pagesFiles[i] = stateio.NewRateLimitedReader(pagesFile, rate)
@@ -459,7 +464,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		paused:     o.Paused,
 		timer:      timer,
 		start:      start,
+		gofer:      gofer,
 	}
+	gofer = nil
 
 	// Create the main MemoryFile.
 	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
@@ -547,13 +554,15 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 // getRestoreReaders returns the readers of the checkpoint files in o: the
 // state file and, if o.HavePagesFile, the image read from the pages metadata
 // file and the pages file of each of its layers (appropriate for `cpus`
-// CPUs). The pages metadata file and the identity of every layer are checked
-// before anything is loaded.
-func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
+// CPUs); and, if they are read through a checkpoint gofer, a reference on
+// its client. The pages metadata file and the identity of every layer are
+// checked before anything is loaded.
+func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, *stateipc.AsyncFileClient, error) {
 	if o.UseCheckpointGofer {
 		return getRestoreReadersForCheckpointGofer(o)
 	}
-	return getRestoreReadersForLocalCheckpointFiles(o, cpus)
+	stateFile, image, pagesFiles, err := getRestoreReadersForLocalCheckpointFiles(o, cpus)
+	return stateFile, image, pagesFiles, nil, err
 }
 
 func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
@@ -624,29 +633,29 @@ func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int
 	return stateFile, image, pagesFiles, nil
 }
 
-func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, error) {
+func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadCloser, *checkpointimage.Image, []stateio.AsyncReader, *stateipc.AsyncFileClient, error) {
 	clientFD, err := unix.Dup(int(o.Files[0].Fd()))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to dup checkpoint gofer client FD: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to dup checkpoint gofer client FD: %w", err)
 	}
 	clientSock, err := unet.NewSocket(clientFD)
 	if err != nil {
 		unix.Close(clientFD)
-		return nil, nil, nil, fmt.Errorf("failed to create unet.Socket for checkpoint gofer client FD: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create unet.Socket for checkpoint gofer client FD: %w", err)
 	}
 	afc, err := stateipc.NewAsyncFileClient(urpc.NewClient(clientSock) /* transfers ownership */)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create stateipc client: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create stateipc client: %w", err)
 	}
 	defer afc.DecRef()
 
 	stateFileAsync, err := afc.OpenRead(checkpointfiles.StateFileName)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to open state file: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to open state file: %w", err)
 	}
 	stateFile, err := stateio.NewBufReader(stateFileAsync /* transfers ownership */, 8<<20 /* size = 8 MiB */)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to buffer state file: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to buffer state file: %w", err)
 	}
 	cu := cleanup.Make(func() { stateFile.Close() })
 	defer cu.Clean()
@@ -663,11 +672,11 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 		log.Infof("Failed to open pages metadata file: %v", err)
 		o.HavePagesFile = false
 		cu.Release()
-		return stateFile, nil, nil, nil
+		return stateFile, nil, nil, nil, nil
 	}
 	image, err := readImage(pagesMetadata /* transfers ownership */, checkpointfiles.PagesMetadataFileName, true /* hashes */)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	var pagesFiles []stateio.AsyncReader
 	cu.Add(func() {
@@ -702,19 +711,22 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	for _, name := range names {
 		pagesFile, err := afc.OpenRead(name)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to open pages file %s: %w", name, err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to open pages file %s: %w", name, err)
 		}
 		pagesFiles = append(pagesFiles, pagesFile)
 	}
 	o.HavePagesFile = true
 	cu.Release()
-	return stateFile, image, pagesFiles, nil
+	// The caller asks the checkpoint gofer of its cache once the pages are
+	// loaded (restorer.postRestore).
+	afc.IncRef()
+	return stateFile, image, pagesFiles, afc, nil
 }
 
 // checkLayer checks that the pages metadata file of layer i of an image,
@@ -798,6 +810,11 @@ func readImage(f stateio.AsyncReader, name string, hashes bool) (*checkpointimag
 }
 
 func (cm *containerManager) onRestoreFailed(err error) {
+	if cm.restorer != nil {
+		if gofer := cm.restorer.takeGofer(); gofer != nil {
+			gofer.DecRef()
+		}
+	}
 	cm.l.lifecycleCPUs.releaseForRestore()
 	cm.l.mu.Lock()
 	cm.l.state = restoreFailed

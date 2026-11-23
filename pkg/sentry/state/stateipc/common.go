@@ -153,6 +153,45 @@ type RetryingResponse struct {
 	Retrying bool `json:"retrying"`
 }
 
+// CacheStatusRequest is the request type for AsyncFileServer.CacheStatus.
+type CacheStatusRequest struct {
+	// empty
+}
+
+// CacheStatusResponse is the response type for AsyncFileServer.CacheStatus.
+type CacheStatusResponse struct {
+	// Status is what the server's cache says of itself (CacheReporter), its
+	// zero value if the server keeps no cache.
+	Status CacheStatus `json:"status"`
+}
+
+// CacheStatus is what an AsyncFileServer that keeps the files it serves in a
+// cache of its own, as they are read, says of that cache once the files' reads
+// are done (CacheReporter).
+type CacheStatus struct {
+	// Enabled is true if the server keeps a cache.
+	Enabled bool `json:"enabled"`
+
+	// Complete is true if the cache holds every part of the files that it
+	// must hold, each checked.
+	Complete bool `json:"complete"`
+
+	// Files is the number of files cached.
+	Files int `json:"files"`
+
+	// Referenced is the number of bytes that the cache must hold; Held of
+	// them it holds, checked; Filled of those it read for itself, as their
+	// reads' bytes were not kept (Dropped) or did not check out (Mismatched).
+	Referenced uint64 `json:"referenced"`
+	Held       uint64 `json:"held"`
+	Filled     uint64 `json:"filled"`
+	Dropped    uint64 `json:"dropped"`
+	Mismatched uint64 `json:"mismatched"`
+
+	// Error, if not empty, is why the cache is not complete.
+	Error string `json:"error,omitzero"`
+}
+
 // The following types are used on per-file Flipcall I/O connections.
 //
 // For connections serving reads, the datagram sent from client to server

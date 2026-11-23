@@ -78,6 +78,11 @@ type Reader struct {
 	// goroutine that enqueues reads.
 	kinds []stateio.ReadKind
 
+	// If cacheFile is not nil, the bytes read are written to it by cache
+	// (FileServerOptions.CacheDir). These fields are set before r is used.
+	cache     *pagesCache
+	cacheFile *cacheFile
+
 	// etag, if not empty, is the ETag that the object's every GET asks for
 	// (FileServerOptions.ETags). etag is set before r is used.
 	etag string
@@ -505,17 +510,10 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	}
 	var done uint64
 	var bodyErr error
-	for _, m := range dst.Mappings {
-		if done == want {
-			break
-		}
-		m = m[:min(uint64(len(m)), want-done)]
-		read, readErr := io.ReadFull(body, m)
-		done += uint64(read)
-		if readErr != nil {
-			bodyErr = readErr
-			break
-		}
+	if r.cacheFile != nil {
+		done, bodyErr = r.readCached(body, dst, off, want)
+	} else {
+		done, bodyErr = readInto(body, dst, 0, want)
 	}
 	switch done {
 	case total:
@@ -525,4 +523,72 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	default:
 		return done, fmt.Errorf("%w after %d of %d bytes: %v", errShortBody, done, want, bodyErr)
 	}
+}
+
+// readInto reads n bytes of body into dst, from its byte at, and returns the
+// number read.
+func readInto(body io.Reader, dst *stateio.LocalClientRanges, at, n uint64) (uint64, error) {
+	var pos, done uint64
+	for _, m := range dst.Mappings {
+		end := pos + uint64(len(m))
+		if done < n && at+done < end {
+			m = m[at+done-pos:]
+			m = m[:min(uint64(len(m)), n-done)]
+			read, err := io.ReadFull(body, m)
+			done += uint64(read)
+			if err != nil {
+				return done, err
+			}
+		}
+		pos = end
+	}
+	return done, nil
+}
+
+// copyAt copies src into dst, from its byte at.
+func copyAt(dst *stateio.LocalClientRanges, at uint64, src []byte) {
+	var pos uint64
+	for _, m := range dst.Mappings {
+		end := pos + uint64(len(m))
+		if len(src) != 0 && at < end {
+			n := copy(m[at-pos:], src)
+			src = src[n:]
+			at += uint64(n)
+		}
+		pos = end
+	}
+}
+
+// readCached reads want bytes of body, those of r's object at off, into dst
+// through buffers of r's cache, which writes each to r's cached file once its
+// bytes are copied to dst: the cache never holds bytes from dst, which the
+// client may change. Where the cache has no buffer free, the bytes are read
+// into dst alone, and not cached.
+func (r *Reader) readCached(body io.Reader, dst *stateio.LocalClientRanges, off int64, want uint64) (uint64, error) {
+	var done uint64
+	for done < want {
+		k := min(want-done, cacheChunkBytes)
+		buf := r.cache.buffer()
+		if buf == nil {
+			n, err := readInto(body, dst, done, k)
+			r.cache.dropped.Add(n)
+			done += n
+			if err != nil {
+				return done, err
+			}
+			continue
+		}
+		n, err := io.ReadFull(body, buf[:k])
+		copyAt(dst, done, buf[:n])
+		if uint64(n) == k {
+			r.cache.write(r.cacheFile, off+int64(done), buf[:n])
+		} else {
+			r.cache.drop(buf[:n])
+		}
+		done += uint64(n)
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
 }

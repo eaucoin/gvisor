@@ -193,6 +193,12 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", etag)
+		if r.Header.Get("Range") == "" {
+			// The whole object.
+			w.Header().Set("Content-Length", strconv.Itoa(len(obj)))
+			w.Write(obj)
+			return
+		}
 		var start, end int
 		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
 			s.t.Errorf("GetObject %s: Range %q: %v", key, r.Header.Get("Range"), err)

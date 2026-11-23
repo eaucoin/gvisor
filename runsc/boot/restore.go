@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -274,6 +275,11 @@ type restorer struct {
 	// asyncMFLoader is used to load the MemoryFile pages. It handles the
 	// asynchronous loading of the memory pages.
 	asyncMFLoader *kernel.AsyncMFLoader
+
+	// gofer, if not nil, is the client of the checkpoint gofer that the
+	// checkpoint is read through, held to ask it of its cache once the pages
+	// are loaded (reportCache). gofer is protected by mu.
+	gofer *stateipc.AsyncFileClient
 
 	// deviceFile is the required to start the platform.
 	deviceFile *fd.FD
@@ -835,6 +841,8 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		}
 	}
 
+	r.reportCache()
+
 	var s sentryapi.Savings
 	if err := r.calculateCPUSavings(&s); err != nil {
 		log.Warningf("Failed to calculate CPU savings: %v", err)
@@ -876,6 +884,33 @@ func (r *restorer) summarize() *summary.WaitRestore {
 		}
 	}
 	return sum
+}
+
+// reportCache asks the checkpoint gofer that the restore read its checkpoint
+// through, if any, to complete its cache of the image's pages files, now that
+// they are loaded, says what it holds, and releases the gofer.
+func (r *restorer) reportCache() {
+	gofer := r.takeGofer()
+	if gofer == nil {
+		return
+	}
+	defer gofer.DecRef()
+	st, err := gofer.CacheStatus()
+	switch {
+	case err != nil:
+		log.Warningf("Asking the checkpoint gofer of its cache failed: %v", err)
+	case st.Enabled:
+		log.Infof("Checkpoint gofer's cache of %d pages files: complete %t, %d of %d referenced bytes held, %d of them read for the cache alone; %d bytes not written, %d pages mismatched %s", st.Files, st.Complete, st.Held, st.Referenced, st.Filled, st.Dropped, st.Mismatched, st.Error)
+	}
+}
+
+// takeGofer returns r's checkpoint gofer client, which r holds no longer.
+func (r *restorer) takeGofer() *stateipc.AsyncFileClient {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gofer := r.gofer
+	r.gofer = nil
+	return gofer
 }
 
 // startWorkingSetRecording starts recording the working set of the restored

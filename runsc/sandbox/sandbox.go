@@ -2807,6 +2807,13 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 	}, extraFlags...)
 }
 
+// PagesCacheDir is the directory of an image path, read through a checkpoint
+// gofer, that holds a file for each pages file of the image, at the path the
+// checkpoint gofer serves it at, into which the checkpoint gofer of a restore
+// writes the bytes of the pages file that it reads (the S3 gofer's cache, see
+// runsc/checkpointgofer/s3).
+const PagesCacheDir = "pages-cache"
+
 // StartCheckpointGofer checks if use of a checkpoint gofer is specified by
 // configuration files in imagePath. If so, it starts the checkpoint gofer, in
 // cg unless cg is nil, with extraFlags and its debug log named after logOpts,
@@ -2863,6 +2870,19 @@ func StartCheckpointGofer(conf *config.Config, cg cgroup.Cgroup, imagePath strin
 
 		argv = append(argv, "checkpointgofer", "-sock-fd=3", store.optsFDFlag+"=4")
 		argv = append(argv, extraFlags...)
+		// A restore's pages files are cached in the image path's pages
+		// cache directory, where it has one.
+		if slices.Contains(extraFlags, "-allow-checkpoint-reads") {
+			cacheDir, err := os.OpenFile(path.Join(imagePath, PagesCacheDir), os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+			switch {
+			case err == nil:
+				defer cacheDir.Close()
+				extraFiles = append(extraFiles, cacheDir.Fd())
+				argv = append(argv, fmt.Sprintf("-pages-cache-fd=%d", len(extraFiles)-1))
+			case !errors.Is(err, fs.ErrNotExist):
+				return fmt.Errorf("opening the pages cache of %q: %w", imagePath, err)
+			}
+		}
 		// Don't forward GOMAXPROCS defaults that apply to this process (in
 		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
 		// v1.service.newCommand()).
