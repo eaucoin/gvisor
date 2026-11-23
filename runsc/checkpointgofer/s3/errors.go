@@ -27,7 +27,8 @@ import (
 
 // mapError returns the error of the operation op on obj, with the errno that
 // stateipc conveys to the Sentry: ENOENT if the bucket or object does not
-// exist, EACCES if the credentials may not access it, and EIO otherwise.
+// exist, ESTALE if the object is not the version that was asked for (If-Match),
+// EACCES if the credentials may not access it, and EIO otherwise.
 func mapError(err error, op string, obj object) error {
 	errno := unix.EIO
 	var apiErr smithy.APIError
@@ -35,6 +36,9 @@ func mapError(err error, op string, obj object) error {
 	switch {
 	case errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NoSuchBucket"):
 		errno = unix.ENOENT
+	case errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed",
+		errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusPreconditionFailed:
+		errno = unix.ESTALE
 	case errors.As(err, &apiErr) && apiErr.ErrorCode() == "AccessDenied":
 		errno = unix.EACCES
 	case errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound:

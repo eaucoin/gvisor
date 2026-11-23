@@ -78,6 +78,10 @@ type Reader struct {
 	// goroutine that enqueues reads.
 	kinds []stateio.ReadKind
 
+	// etag, if not empty, is the ETag that the object's every GET asks for
+	// (FileServerOptions.ETags). etag is set before r is used.
+	etag string
+
 	// If trace is true, each GET is logged as it ends, and gets and bytes
 	// count them (FileServerOptions.Trace). trace is set before r is used.
 	trace bool
@@ -464,11 +468,15 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 		s.watch(pagesRetryWatchdogTimeout)
 		defer s.unwatch()
 	}
-	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
+	in := &s3.GetObjectInput{
 		Bucket: aws.String(r.obj.bucket),
 		Key:    aws.String(r.obj.key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(total)-1)),
-	}, optFns...)
+	}
+	if r.etag != "" {
+		in.IfMatch = aws.String(r.etag)
+	}
+	out, err := r.client.GetObject(ctx, in, optFns...)
 	answered = time.Now()
 	if err != nil {
 		var respErr *awshttp.ResponseError
