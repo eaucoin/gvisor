@@ -19,6 +19,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -34,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
@@ -352,7 +355,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 
 	// Restore remaining dentries.
-	if err := fs.root.restoreDescendantsRecursive(ctx, &opts); err != nil {
+	if err := fs.restoreDescendants(ctx, &opts); err != nil {
 		return err
 	}
 
@@ -424,6 +427,99 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.savedDentryRW = nil
 
 	return nil
+}
+
+// restoreDescendants restores the descendants of fs.root, each after its
+// parent, opts.Parallelism at once.
+//
+// Preconditions: fs.root has been restored.
+func (fs *filesystem) restoreDescendants(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
+	if opts.Parallelism <= 1 {
+		return fs.root.restoreDescendantsRecursive(ctx, opts)
+	}
+	return restoreTree(fs.root, opts.Parallelism, (*dentry).restorableChildren, func(d *dentry) error {
+		return d.restoreFile(ctx, opts)
+	}, func(d *dentry) string {
+		return genericDebugPathname(fs, d)
+	})
+}
+
+// restorableChildren returns the children of d that a restore restores: those
+// that are neither negative nor synthetic.
+func (d *dentry) restorableChildren() []*dentry {
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
+	children := make([]*dentry, 0, len(d.children))
+	for _, child := range d.children {
+		if child != nil && !child.inode.isSynthetic() {
+			children = append(children, child)
+		}
+	}
+	return children
+}
+
+// restoreTree restores the nodes of the tree below root, root excluded,
+// each with restore once its parent's restore succeeded, as many as
+// parallelism at once; children returns those of a node. If restores fail, it
+// returns the error of the one whose node's path is the least, having
+// restored every node whose ancestors' restores succeeded, so that the error
+// does not depend on the order of the restores.
+func restoreTree[N any](root N, parallelism int, children func(N) []N, restore func(N) error, path func(N) string) error {
+	type failure struct {
+		path string
+		err  error
+	}
+	var (
+		mu sync.Mutex
+		// ready holds the nodes whose parent has been restored, and pending
+		// counts them with those being restored.
+		ready    = children(root)
+		pending  = len(ready)
+		failures []failure
+		wg       sync.WaitGroup
+	)
+	cond := sync.NewCond(&mu)
+	if pending == 0 {
+		return nil
+	}
+	for range parallelism {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			for {
+				for len(ready) == 0 && pending != 0 {
+					cond.Wait()
+				}
+				if pending == 0 {
+					mu.Unlock()
+					return
+				}
+				n := ready[len(ready)-1]
+				ready = ready[:len(ready)-1]
+				mu.Unlock()
+				err := restore(n)
+				var below []N
+				if err == nil {
+					below = children(n)
+				}
+				mu.Lock()
+				if err != nil {
+					failures = append(failures, failure{path(n), err})
+				}
+				ready = append(ready, below...)
+				pending += len(below) - 1
+				cond.Broadcast()
+			}
+		}()
+	}
+	wg.Wait()
+	if len(failures) == 0 {
+		return nil
+	}
+	return slices.MinFunc(failures, func(a, b failure) int {
+		return strings.Compare(a.path, b.path)
+	}).err
 }
 
 // Preconditions: d is not synthetic.
