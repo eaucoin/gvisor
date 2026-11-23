@@ -189,6 +189,15 @@ type FileServerOptions struct {
 	PagesFilePartBytes     int
 	PagesFileWriteParallel int
 
+	// ETags, if not nil, holds the ETag of each file to read that has one,
+	// by the path the file is opened at (e.g. "pages.img", or
+	// "layers/<digest>/pages.img" for a layer's): every GET of the file asks
+	// the store for that version of its object (If-Match), so that a read
+	// fails, without being retried, where the store holds another version
+	// (ESTALE) or none (ENOENT), as it does where the object was lost or
+	// written over since its ETag was taken.
+	ETags map[string]string
+
 	// If Trace is true, each GET of a pages file is logged as it ends, as a
 	// line beginning "S3 read trace:", with the kind of the read it serves,
 	// and each pages file's reader logs its GETs and the process's CPU time
@@ -457,6 +466,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	obj := s.object(path)
 	log.Infof("Opening %s for reading", obj)
 	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
+	r.etag = s.opts.ETags[path]
 	r.trace = s.opts.Trace && path == checkpointfiles.PagesFileName
 	return r, nil
 }

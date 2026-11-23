@@ -17,6 +17,8 @@
 package s3test
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -61,6 +63,9 @@ type Request struct {
 	// Range is the Range header.
 	Range string
 
+	// IfMatch is the If-Match header.
+	IfMatch string
+
 	// Bytes is the length of the body.
 	Bytes int
 }
@@ -87,6 +92,13 @@ func (s *Store) SetObject(key string, obj []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.objects[key] = obj
+}
+
+// ETag returns the ETag of an object with the given bytes, as S3 makes it
+// for an object written in one part, and as a Store answers GetObject with.
+func ETag(obj []byte) string {
+	sum := md5.Sum(obj)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
 // Requests returns the requests that s received.
@@ -159,7 +171,7 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			n++
 		}
 	}
-	s.requests = append(s.requests, Request{Op: op, Key: key, Range: r.Header.Get("Range"), Bytes: len(body)})
+	s.requests = append(s.requests, Request{Op: op, Key: key, Range: r.Header.Get("Range"), IfMatch: r.Header.Get("If-Match"), Bytes: len(body)})
 	s.mu.Unlock()
 	if s.Fault != nil && s.Fault(w, r, op, n) {
 		return
@@ -175,6 +187,12 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			WriteError(w, http.StatusNotFound, "NoSuchKey")
 			return
 		}
+		etag := ETag(obj)
+		if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && ifMatch != "*" && ifMatch != etag {
+			WriteError(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		w.Header().Set("ETag", etag)
 		var start, end int
 		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
 			s.t.Errorf("GetObject %s: Range %q: %v", key, r.Header.Get("Range"), err)
