@@ -326,6 +326,14 @@ func (fs *Filesystem) Release(ctx context.Context) {
 	root.DecRef(ctx)
 }
 
+// CachedDentries returns the number of dentries in fs's dentry cache, for a
+// measurement build.
+func (fs *Filesystem) CachedDentries() uint64 {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.cachedDentriesLen
+}
+
 // EvictCachedDentries evicts all dentries that are only kept alive by the
 // dentry cache, except for dentries with inotify watches.
 func (fs *Filesystem) EvictCachedDentries(ctx context.Context) {

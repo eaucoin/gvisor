@@ -16,6 +16,7 @@ package gofer
 
 import (
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -609,12 +610,27 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 //   - !d.isSynthetic().
 //   - d.parent != nil and has been restored.
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
+	stats := &d.inode.fs.restoreStats
+	restoreStatsMu.Lock()
+	switch {
+	case d.isDir():
+		stats.dirs++
+	case d.inode.isRegularFile():
+		stats.regular++
+	default:
+		stats.others++
+	}
+	restoreStatsMu.Unlock()
 	// With inode sharing, we may have multiple references to the same inode.
 	// The first restore of one of its dentries, which may be concurrent with
 	// another's, restores it.
 	if !d.inode.restoreClaimed.CompareAndSwap(false, true) {
+		restoreStatsMu.Lock()
+		stats.shared++
+		restoreStatsMu.Unlock()
 		return nil
 	}
+	start := time.Now()
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
 		controlFD := d.parent.Load().inode.impl.(*lisafsInode).controlFD
@@ -631,7 +647,14 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 				return fmt.Errorf("failed to create mountpoint directory at %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 		}
-		return it.restoreInode(ctx, &inode, opts, d)
+		walk := time.Since(start)
+		start = time.Now()
+		err = it.restoreInode(ctx, &inode, opts, d)
+		restoreStatsMu.Lock()
+		stats.walk += walk
+		stats.inode += time.Since(start)
+		restoreStatsMu.Unlock()
+		return err
 
 	case *directfsInode:
 		controlFD := d.parent.Load().inode.impl.(*directfsInode).controlFD
@@ -658,7 +681,14 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 				return fmt.Errorf("failed to open %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 		}
-		return it.restoreFile(ctx, childFD, opts, d)
+		walk := time.Since(start)
+		start = time.Now()
+		err = it.restoreFile(ctx, childFD, opts, d)
+		restoreStatsMu.Lock()
+		stats.walk += walk
+		stats.inode += time.Since(start)
+		restoreStatsMu.Unlock()
+		return err
 
 	default:
 		panic("unknown inode implementation")
