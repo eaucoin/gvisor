@@ -90,6 +90,13 @@ type SaveOpts struct {
 	// can validate file sizes and/or modification timestamps.
 	ValidateMetadata bool
 
+	// If PrepareFilesystemsRunning is true, the save prepares filesystems
+	// for itself as far as they can while the sandbox runs, before pausing it
+	// (vfs.FilesystemImplPrepareSaveRunningExtension), so that its pause does
+	// less: filesystems backed by remote filesystems evict their cached
+	// dentries then.
+	PrepareFilesystemsRunning bool
+
 	// If RestoreValidatesFile is not nil, filesystems backed by remote
 	// filesystems save the remote metadata of only the regular files for
 	// which it returns true, those that the restore will validate. See
@@ -181,6 +188,12 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		if err != nil {
 			return fmt.Errorf("pre-copy: %w", err)
 		}
+	}
+
+	if opts.PrepareFilesystemsRunning {
+		prepareStart := time.Now()
+		k.VFS().PrepareSaveRunning(ctx)
+		log.Infof("Filesystems prepared for save while tasks run in [%s].", time.Since(prepareStart))
 	}
 
 	log.Infof("Sandbox save started, pausing all tasks.")
