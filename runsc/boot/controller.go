@@ -30,11 +30,13 @@ import (
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
@@ -648,6 +650,10 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 	}
 	cu := cleanup.Make(func() { stateFile.Close() })
 	defer cu.Clean()
+	// Each read below waits for its first byte, which from an object store
+	// takes as long as reading many pages: read the state file, which the
+	// caller reads first, while the pages metadata is read.
+	stateFile.Prefetch()
 
 	pagesMetadata, err := afc.OpenRead(checkpointfiles.PagesMetadataFileName)
 	if err != nil {
@@ -669,24 +675,37 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 			pagesFile.Close()
 		}
 	})
-	for i, layer := range image.Layers() {
-		name := checkpointfiles.PagesFileName
+	// Before any page is loaded, check the identity of every layer but the
+	// image itself, and that every layer's pages file can be read to its end,
+	// all at once, so that a chain's depth adds no read to wait for, and a
+	// restore whose files are not all there fails before it starts.
+	layers := image.Layers()
+	names := make([]string, len(layers))
+	var checks []func() error
+	for i, layer := range layers {
+		names[i] = checkpointfiles.PagesFileName
 		if i != 0 {
-			// Check the layer's identity before reading its pages.
-			metaName := checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesMetadataFileName)
-			layerMetadata, err := afc.OpenRead(metaName)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("layer %d (%v): failed to open %s: %w", i, layer.Digest, metaName, err)
-			}
-			layerImage, err := readImage(layerMetadata /* transfers ownership */, metaName, false /* hashes */)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("layer %d (%v): %w", i, layer.Digest, err)
-			}
-			if layerImage.Digest != layer.Digest {
-				return nil, nil, nil, fmt.Errorf("layer %d: %s has digest %v", i, metaName, layerImage.Digest)
-			}
-			name = checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesFileName)
+			names[i] = checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesFileName)
+			checks = append(checks, func() error { return checkLayer(afc, i, layer) })
 		}
+		checks = append(checks, func() error { return checkPagesFile(afc, i, names[i], layer.PagesSize) })
+	}
+	errs := make([]error, len(checks))
+	var wg sync.WaitGroup
+	for j, check := range checks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[j] = check()
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	for _, name := range names {
 		pagesFile, err := afc.OpenRead(name)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to open pages file %s: %w", name, err)
@@ -696,6 +715,65 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 	o.HavePagesFile = true
 	cu.Release()
 	return stateFile, image, pagesFiles, nil
+}
+
+// checkLayer checks that the pages metadata file of layer i of an image,
+// served by afc, is the layer's.
+func checkLayer(afc *stateipc.AsyncFileClient, i int, layer checkpointimage.Layer) error {
+	metaName := checkpointimage.LayerPath(layer.Digest, checkpointfiles.PagesMetadataFileName)
+	layerMetadata, err := afc.OpenRead(metaName)
+	if err != nil {
+		return fmt.Errorf("layer %d (%v): failed to open %s: %w", i, layer.Digest, metaName, err)
+	}
+	layerImage, err := readImage(layerMetadata /* transfers ownership */, metaName, false /* hashes */)
+	if err != nil {
+		return fmt.Errorf("layer %d (%v): %w", i, layer.Digest, err)
+	}
+	if layerImage.Digest != layer.Digest {
+		return fmt.Errorf("layer %d: %s has digest %v", i, metaName, layerImage.Digest)
+	}
+	return nil
+}
+
+// checkPagesFile checks that the pages file of layer i of an image, named name
+// and of size bytes, served by afc, can be read to its end, by reading its last
+// byte: one read, which fails where the checkpoint gofer lacks the file, holds
+// a shorter one, or knows it to be another version of the file (as an object
+// store's does that is given the files' ETags).
+func checkPagesFile(afc *stateipc.AsyncFileClient, i int, name string, size uint64) error {
+	if size == 0 {
+		return nil
+	}
+	ar, err := afc.OpenRead(name)
+	if err != nil {
+		return fmt.Errorf("layer %d: failed to open %s: %w", i, name, err)
+	}
+	defer ar.Close()
+	memfd, buf, err := stateio.CreateMappedMemoryFD("runsc.checkPagesFile", hostarch.PageSize)
+	if err != nil {
+		return err
+	}
+	defer unix.Munmap(buf)
+	df, err := ar.RegisterDestinationFD(memfd, hostarch.PageSize, 0 /* discard */, nil)
+	unix.Close(int(memfd))
+	if err != nil {
+		return fmt.Errorf("layer %d: %s: failed to register a buffer: %w", i, name, err)
+	}
+	ar.AddRead(0 /* id */, int64(size-1), df, memmap.FileRange{Start: 0, End: 1}, buf[:1])
+	cs, err := ar.Wait(nil, 1 /* minCompletions */)
+	switch {
+	case err != nil:
+	case len(cs) != 1:
+		err = fmt.Errorf("%d completions", len(cs))
+	case cs[0].Err != nil && cs[0].Err != io.EOF:
+		err = cs[0].Err
+	case cs[0].N != 1:
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		return fmt.Errorf("layer %d: %s: reading its last byte, at %d: %w", i, name, size-1, err)
+	}
+	return nil
 }
 
 // readImage reads the metadata of the pages metadata file f, named name, and if

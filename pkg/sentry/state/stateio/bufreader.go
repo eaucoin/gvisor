@@ -169,26 +169,7 @@ func (r *BufReader) Read(dst []byte) (int, error) {
 			*chunk = bufReaderChunk{}
 		}
 		// Invariant: r.waitErr == nil.
-		// Enqueue reads to fill empty chunks.
-		enqueuedAny := false
-		if !r.stopReading && r.chunksRefillable != 0 {
-			chunkToRefill := r.curChunk - r.chunksRefillable
-			if chunkToRefill < 0 {
-				chunkToRefill += r.numChunks
-			}
-			for range r.chunksRefillable {
-				chunkStart := r.chunkLen * chunkToRefill
-				chunkEnd := chunkStart + r.chunkLen
-				r.ar.AddRead(chunkToRefill, r.refillOffset, r.df, memmap.FileRange{uint64(chunkStart), uint64(chunkEnd)}, r.buf[chunkStart:chunkEnd])
-				chunkToRefill++
-				if chunkToRefill >= r.numChunks {
-					chunkToRefill = 0
-				}
-				r.refillOffset += int64(r.chunkLen)
-			}
-			r.chunksRefillable = 0
-			enqueuedAny = true
-		}
+		enqueuedAny := r.refill()
 		// Submit reads, and wait for the current chunk to complete if dst still
 		// needs data.
 		if len(dst) == 0 {
@@ -212,6 +193,39 @@ func (r *BufReader) Read(dst []byte) (int, error) {
 			}
 		}
 	}
+}
+
+// Prefetch starts reading as much of the data that the following Reads return
+// as r's buffer holds, without waiting for any of it, so that a caller that
+// reads later finds it read or being read.
+func (r *BufReader) Prefetch() {
+	if r.refill() {
+		r.wait(0)
+	}
+}
+
+// refill enqueues reads to fill the chunks that have been read, if r is still
+// reading, and returns whether it enqueued any.
+func (r *BufReader) refill() bool {
+	if r.stopReading || r.chunksRefillable == 0 {
+		return false
+	}
+	chunkToRefill := r.curChunk - r.chunksRefillable
+	if chunkToRefill < 0 {
+		chunkToRefill += r.numChunks
+	}
+	for range r.chunksRefillable {
+		chunkStart := r.chunkLen * chunkToRefill
+		chunkEnd := chunkStart + r.chunkLen
+		r.ar.AddRead(chunkToRefill, r.refillOffset, r.df, memmap.FileRange{uint64(chunkStart), uint64(chunkEnd)}, r.buf[chunkStart:chunkEnd])
+		chunkToRefill++
+		if chunkToRefill >= r.numChunks {
+			chunkToRefill = 0
+		}
+		r.refillOffset += int64(r.chunkLen)
+	}
+	r.chunksRefillable = 0
+	return true
 }
 
 func (r *BufReader) wait(minCompletions int) {

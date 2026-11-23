@@ -295,7 +295,11 @@ runsc restore --image-path=<path> --layer-path=<parent image path> <container id
 
 Images read through a checkpoint gofer (such as `gs://` image paths) find their
 layers under the image's prefix, as objects `layers/<identity>/pages_meta.img`
-and `layers/<identity>/pages.img`.
+and `layers/<identity>/pages.img`. The identities of all layers, and that each
+layer's `pages.img` can be read to its end, are checked at once, while the
+state file is read, so that before it loads anything such a restore waits for
+two round trips to the store however many layers the image has, and fails if
+any file is missing.
 
 With `--background`, pages are loaded from every layer in parallel, each
 layer's `pages.img` read from start to end, and an access to a page that is not

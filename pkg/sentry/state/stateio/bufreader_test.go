@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/rand"
 )
@@ -62,5 +63,49 @@ func TestBufReader(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// signalingReaderAt is an io.ReaderAt that signals each of its reads on read,
+// where read has room.
+type signalingReaderAt struct {
+	r    io.ReaderAt
+	read chan<- struct{}
+}
+
+// ReadAt implements io.ReaderAt.ReadAt.
+func (r signalingReaderAt) ReadAt(dst []byte, off int64) (int, error) {
+	select {
+	case r.read <- struct{}{}:
+	default:
+	}
+	return r.r.ReadAt(dst, off)
+}
+
+// TestBufReaderPrefetch checks that Prefetch reads before any Read, and that
+// Reads after it return the data in order.
+func TestBufReaderPrefetch(t *testing.T) {
+	const dataLen = 32 << 10 // 32 KiB
+	data := make([]byte, dataLen)
+	_, _ = rand.Read(data)
+	read := make(chan struct{}, 1)
+	r, err := NewBufReader(NewIOReader(signalingReaderAt{bytes.NewReader(data), read}, dataLen/8 /* maxReadBytes */, 1 /* maxRanges */, 4 /* maxParallel */), 0 /* size */)
+	if err != nil {
+		t.Fatalf("NewBufReader failed: %v", err)
+	}
+	defer r.Close()
+
+	r.Prefetch()
+	select {
+	case <-read:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Prefetch read nothing")
+	}
+	var w bytesBufferWriter
+	if n, err := io.Copy(&w, r); n != dataLen || err != nil {
+		t.Fatalf("io.Copy: got (%d, %v), want (%d, nil)", n, err, dataLen)
+	}
+	if !bytes.Equal(data, w.b.Bytes()) {
+		t.Errorf("Bytes differ")
 	}
 }
