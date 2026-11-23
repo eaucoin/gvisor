@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
@@ -88,6 +89,12 @@ type SaveOpts struct {
 	// remote filesystems should refresh metadata during save so that restore
 	// can validate file sizes and/or modification timestamps.
 	ValidateMetadata bool
+
+	// If RestoreValidatesFile is not nil, filesystems backed by remote
+	// filesystems save the remote metadata of only the regular files for
+	// which it returns true, those that the restore will validate. See
+	// vfs.PrepareSaveOptions.RestoreValidatesFile.
+	RestoreValidatesFile func(fsID checkpoint.ResourceID, path string) bool
 
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
@@ -233,7 +240,8 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.Destination = nil
 		// Save the kernel.
 		vfsOpts := vfs.PrepareSaveOptions{
-			ValidateMetadata: opts.ValidateMetadata,
+			ValidateMetadata:     opts.ValidateMetadata,
+			RestoreValidatesFile: opts.RestoreValidatesFile,
 		}
 		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine, opts.Parent, precopy, opts.LoadWaitDeadline) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
 		opts.PagesMetadata = nil

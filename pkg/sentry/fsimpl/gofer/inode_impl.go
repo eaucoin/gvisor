@@ -226,15 +226,19 @@ func (i *inode) remoteSizeAndMtime(ctx context.Context) (uint64, int64, error) {
 }
 
 // savedRemoteSizeAndMtime returns the size and modification time that the
-// remote file had when i was saved.
+// remote file had when i was saved, or an error if that save did not read
+// them (see vfs.PrepareSaveOptions.RestoreValidatesFile).
 //
 // Preconditions: i.isRegularFile().
-func (i *inode) savedRemoteSizeAndMtime() (uint64, int64) {
+func (i *inode) savedRemoteSizeAndMtime() (uint64, int64, error) {
+	if i.remoteMetadataSave != i.fs.saves {
+		return 0, 0, fmt.Errorf("the checkpoint holds no metadata of the remote file to validate it against: it saved only that of the files that the restore it was taken for validates")
+	}
 	if i.cachedMetadataAuthoritative() {
-		return i.savedHostSize, i.savedHostMtime
+		return i.savedHostSize, i.savedHostMtime, nil
 	}
 	// i's metadata was updated from the remote file's before saving.
-	return i.size.RacyLoad(), i.mtime.RacyLoad()
+	return i.size.RacyLoad(), i.mtime.RacyLoad(), nil
 }
 
 // Preconditions:

@@ -90,6 +90,20 @@ type PrepareSaveOptions struct {
 	// remote filesystems should refresh metadata during save in case
 	// metadata validation will be performed during restore.
 	ValidateMetadata bool
+
+	// If RestoreValidatesFile is not nil, filesystem implementations backed
+	// by remote filesystems save the remote metadata of only the regular
+	// files for which it returns true, given the unique ID of their
+	// filesystem and their path relative to its root, as
+	// CompleteRestoreOptions.ValidateFile takes them: those that the restore
+	// will validate. Otherwise they save that of every regular file.
+	RestoreValidatesFile func(fsID checkpoint.ResourceID, path string) bool
+}
+
+// SavesRemoteMetadata returns true if filesystems save the remote metadata of
+// the regular file at path in the filesystem with unique ID fsID.
+func (opts *PrepareSaveOptions) SavesRemoteMetadata(fsID checkpoint.ResourceID, path string) bool {
+	return opts.RestoreValidatesFile == nil || opts.RestoreValidatesFile(fsID, path)
 }
 
 // BeforeResume is called before the kernel is resumed after save and allows
