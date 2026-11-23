@@ -15,6 +15,7 @@
 package gofer
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -263,7 +264,9 @@ func TestPrepareSaveRunningEvictsCachedDentries(t *testing.T) {
 	// f is referenced again, as by an open, after it was cached.
 	dentries["f"].IncRef()
 
-	fs.PrepareSaveRunning(ctx)
+	if err := fs.PrepareSaveRunning(ctx, vfs.PrepareSaveRunningOptions{EvictCachedDentries: true}); err != nil {
+		t.Errorf("fs.PrepareSaveRunning(): %v", err)
+	}
 
 	fs.dentryCache.mu.Lock()
 	cached := fs.dentryCache.dentriesLen
@@ -281,6 +284,48 @@ func TestPrepareSaveRunningEvictsCachedDentries(t *testing.T) {
 	}
 	if got := root.refs.Load(); got != 2 {
 		t.Errorf("root: refs %d, want 2 (the mount's and f's)", got)
+	}
+}
+
+// TestPrepareSaveRunningSyncs checks that PrepareSaveRunning syncs the
+// filesystem when its options ask, and only then, reporting what fails: here
+// the sync of a file whose write handle cannot be synced (a pipe's).
+func TestPrepareSaveRunningSyncs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(): %v", err)
+	}
+	fs := &filesystem{
+		mf:          pgalloc.MemoryFileFromContext(ctx),
+		inoByKey:    make(map[inoKey]uint64),
+		inodeByKey:  make(map[inoKey]*inode),
+		clock:       ktime.RealtimeClockFromContext(ctx),
+		opts:        filesystemOptions{virtualInodeNumbers: true},
+		dentryCache: &dentryCache{maxCachedDentries: 0},
+	}
+	fd, err := unix.Open(filepath.Join(dir, "f"), unix.O_PATH, 0)
+	if err != nil {
+		t.Fatalf("unix.Open(): %v", err)
+	}
+	d, err := fs.newDirectfsDentry(fd)
+	if err != nil {
+		t.Fatalf("fs.newDirectfsDentry(): %v", err)
+	}
+	var pipe [2]int
+	if err := unix.Pipe(pipe[:]); err != nil {
+		t.Fatalf("unix.Pipe(): %v", err)
+	}
+	defer unix.Close(pipe[0])
+	defer unix.Close(pipe[1])
+	d.inode.writeFD.Store(int32(pipe[1]))
+	defer d.inode.writeFD.Store(-1)
+
+	if err := fs.PrepareSaveRunning(ctx, vfs.PrepareSaveRunningOptions{EvictCachedDentries: true}); err != nil {
+		t.Errorf("PrepareSaveRunning() without Sync: %v, want no sync and no error", err)
+	}
+	if err := fs.PrepareSaveRunning(ctx, vfs.PrepareSaveRunningOptions{Sync: true}); !errors.Is(err, unix.EINVAL) {
+		t.Errorf("PrepareSaveRunning() with Sync: %v, want the sync of the pipe's EINVAL", err)
 	}
 }
 
@@ -372,7 +417,9 @@ func TestPrepareSaveRunningEndsWhileTasksCache(t *testing.T) {
 	}()
 	prepared := make(chan struct{})
 	go func() {
-		fs.PrepareSaveRunning(ctx)
+		if err := fs.PrepareSaveRunning(ctx, vfs.PrepareSaveRunningOptions{EvictCachedDentries: true}); err != nil {
+			t.Errorf("fs.PrepareSaveRunning(): %v", err)
+		}
 		close(prepared)
 	}()
 	select {

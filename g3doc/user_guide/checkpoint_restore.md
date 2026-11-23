@@ -807,6 +807,13 @@ once, the files of a directory once the directory is reopened, so that the
 restore takes about as many lookups as the tree of files is deep. A parallel
 restore that fails to reopen several files reports the first of them by path.
 
+Before it saves, a checkpoint also flushes what the sandbox wrote to these files
+to the host and has the host make it durable, in its pause. With
+`--save-file-sync=running` it does so while the sandbox runs too, just before
+the pause, which then flushes only what was written since: the pause of a
+sandbox that writes files steadily no longer waits for all of their data to
+reach the disk.
+
 ## Checkpoint images in object stores
 
 `runsc checkpoint` and `runsc restore` can keep an image in an object store

@@ -49,15 +49,29 @@ type savedDentryRW struct {
 }
 
 // PrepareSaveRunning implements
-// vfs.FilesystemImplPrepareSaveRunningExtension.PrepareSaveRunning. It evicts
-// the dentries that the dentry cache holds as it is called, which PrepareSave
-// would otherwise evict in the save's pause, and the ancestors that their
-// eviction leaves cached in turn, the least recently used first, locking the
-// filesystem of each for its eviction alone, so that tasks wait for no more
-// than one eviction at a time. A dentry that tasks cache meanwhile is left to
-// PrepareSave, and so is one that they reference again before its eviction,
-// which leaves the cache without being destroyed.
-func (fs *filesystem) PrepareSaveRunning(ctx context.Context) {
+// vfs.FilesystemImplPrepareSaveRunningExtension.PrepareSaveRunning: it evicts
+// cached dentries (evictCachedDentriesRunning) and syncs the filesystem, as
+// opts asks. A sync now leaves the save's own, in its pause, only what tasks
+// write since to flush and make durable.
+func (fs *filesystem) PrepareSaveRunning(ctx context.Context, opts vfs.PrepareSaveRunningOptions) error {
+	if opts.EvictCachedDentries {
+		fs.evictCachedDentriesRunning(ctx)
+	}
+	if opts.Sync {
+		return fs.Sync(ctx)
+	}
+	return nil
+}
+
+// evictCachedDentriesRunning evicts the dentries that the dentry cache holds
+// as it is called, which PrepareSave would otherwise evict in the save's
+// pause, and the ancestors that their eviction leaves cached in turn, the
+// least recently used first, locking the filesystem of each for its eviction
+// alone, so that tasks wait for no more than one eviction at a time. A dentry
+// that tasks cache meanwhile is left to PrepareSave, and so is one that they
+// reference again before its eviction, which leaves the cache without being
+// destroyed.
+func (fs *filesystem) evictCachedDentriesRunning(ctx context.Context) {
 	fs.dentryCache.mu.Lock()
 	n := fs.dentryCache.dentriesLen
 	fs.dentryCache.mu.Unlock()

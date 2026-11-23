@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -483,6 +484,33 @@ func TestCheckpointRestoreFileParallelism(t *testing.T) {
 			testCheckpointRestore(t, conf, statefile.CompressionLevelNone, func(script string) *specs.Spec {
 				// The tree is on the mount of the test's temporary directory.
 				return testutil.NewSpecWithArgs("bash", "-c", fmt.Sprintf(`for f in %s/*/*/*; do exec {fd}<"$f"; done; `, tree)+script)
+			})
+		})
+	}
+}
+
+// TestCheckpointRestoreFileSyncRunning checks a checkpoint that also flushes
+// what the sandbox wrote through the gofer while it runs, before pausing it
+// (--save-file-sync=running), of a container that writes a file on a mount
+// all the while: the restored container goes on from what the checkpoint
+// saved.
+func TestCheckpointRestoreFileSyncRunning(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			conf.SaveFileSync = config.SaveFileSyncRunning
+			conf.SaveDentryEviction = config.SaveDentryEvictionRunning
+			testCheckpointRestore(t, conf, statefile.CompressionLevelNone, func(script string) *specs.Spec {
+				// Beside the output file, on the test's temporary directory's mount.
+				output := regexp.MustCompile(`>> ("[^"]+")`).FindStringSubmatch(script)
+				if output == nil {
+					t.Fatalf("no output file in %q", script)
+				}
+				churn, err := strconv.Unquote(output[1])
+				if err != nil {
+					t.Fatalf("strconv.Unquote(%s): %v", output[1], err)
+				}
+				churn = filepath.Join(filepath.Dir(churn), "churn")
+				return testutil.NewSpecWithArgs("bash", "-c", fmt.Sprintf("(while true; do head -c 65536 /dev/urandom >> %q; done) & ", churn)+script)
 			})
 		})
 	}

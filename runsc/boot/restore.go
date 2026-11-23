@@ -1069,7 +1069,10 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	if l.root.conf.SaveRemoteMetadata == config.SaveRemoteMetadataValidated {
 		saveOpts.RestoreValidatesFile = restoreValidatesFile(l.root.conf, containerSpecs)
 	}
-	saveOpts.PrepareFilesystemsRunning = l.root.conf.SaveDentryEviction == config.SaveDentryEvictionRunning
+	saveOpts.PrepareFilesystemsRunning = vfs.PrepareSaveRunningOptions{
+		EvictCachedDentries: l.root.conf.SaveDentryEviction == config.SaveDentryEvictionRunning,
+		Sync:                l.root.conf.SaveFileSync == config.SaveFileSyncRunning,
+	}
 
 	// Save start time of the runsc process.
 	saveOpts.StartTime = starttime.Get()

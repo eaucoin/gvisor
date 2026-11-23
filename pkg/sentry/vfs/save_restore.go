@@ -67,27 +67,51 @@ type FilesystemImplSaveRestoreExtension interface {
 // FilesystemImplPrepareSaveRunningExtension is an optional extension to
 // FilesystemImpl.
 type FilesystemImplPrepareSaveRunningExtension interface {
-	// PrepareSaveRunning does ahead of a save, while tasks run, what it can
-	// of the work that PrepareSave would otherwise do with tasks paused, so
-	// that the save's pause is shorter. PrepareSave must not depend on it.
-	PrepareSaveRunning(ctx context.Context)
+	// PrepareSaveRunning does ahead of a save, while tasks run, what opts
+	// asks of the work that PrepareSave would otherwise do with tasks
+	// paused, so that the save's pause is shorter. PrepareSave must not
+	// depend on it.
+	PrepareSaveRunning(ctx context.Context, opts PrepareSaveRunningOptions) error
 }
 
-// PrepareSaveRunning prepares all filesystems for a save as far as they can
-// while tasks run (FilesystemImplPrepareSaveRunningExtension), ahead of the
-// save's PrepareSave.
-func (vfs *VirtualFilesystem) PrepareSaveRunning(ctx context.Context) {
+// PrepareSaveRunningOptions says what filesystems do ahead of a save, while
+// tasks run (FilesystemImplPrepareSaveRunningExtension).
+type PrepareSaveRunningOptions struct {
+	// If EvictCachedDentries is true, filesystems evict the dentries that
+	// they cache and do not save.
+	EvictCachedDentries bool
+
+	// If Sync is true, filesystems backed by remote filesystems flush the
+	// file data and metadata that they hold to the remote filesystem, and
+	// have it make them durable, as Sync does.
+	Sync bool
+}
+
+// Any returns true if opts asks filesystems to do anything.
+func (opts PrepareSaveRunningOptions) Any() bool {
+	return opts.EvictCachedDentries || opts.Sync
+}
+
+// PrepareSaveRunning prepares all filesystems for a save as opts asks, while
+// tasks run (FilesystemImplPrepareSaveRunningExtension), ahead of the save's
+// PrepareSave. It prepares every filesystem whatever fails, and returns the
+// first error.
+func (vfs *VirtualFilesystem) PrepareSaveRunning(ctx context.Context, opts PrepareSaveRunningOptions) error {
 	fss := vfs.GetFilesystems()
 	defer func() {
 		for _, fs := range fss {
 			fs.DecRef(ctx)
 		}
 	}()
+	var retErr error
 	for _, fs := range fss {
 		if ext, ok := fs.impl.(FilesystemImplPrepareSaveRunningExtension); ok {
-			ext.PrepareSaveRunning(ctx)
+			if err := ext.PrepareSaveRunning(ctx, opts); err != nil && retErr == nil {
+				retErr = fmt.Errorf("filesystem type %q: %w", fs.fsType.Name(), err)
+			}
 		}
 	}
+	return retErr
 }
 
 // PrepareSave prepares all filesystems for serialization.

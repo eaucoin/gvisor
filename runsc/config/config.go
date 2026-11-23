@@ -521,6 +521,10 @@ type Config struct {
 	// dentries.
 	SaveDentryEviction SaveDentryEvictionPolicy `flag:"save-dentry-eviction"`
 
+	// SaveFileSync is when a checkpoint flushes what the sandbox wrote
+	// through the gofer to the host.
+	SaveFileSync SaveFileSyncPolicy `flag:"save-file-sync"`
+
 	// RestoreFileParallelism is how many files of each filesystem backed by
 	// a gofer a restore reopens at once.
 	RestoreFileParallelism int `flag:"restore-file-parallelism"`
@@ -2350,6 +2354,59 @@ func (p SaveDentryEvictionPolicy) String() string {
 		return "running"
 	default:
 		panic(fmt.Sprintf("invalid dentry eviction policy %d", p))
+	}
+}
+
+// SaveFileSyncPolicy is when a checkpoint flushes the file data that the
+// sandbox wrote through the gofer, which it caches, to the host's files, and
+// has the host make them durable (fsync).
+type SaveFileSyncPolicy int
+
+// SaveFileSyncPolicy values.
+const (
+	// SaveFileSyncPaused flushes them with the sandbox paused, in the
+	// checkpoint's pause.
+	SaveFileSyncPaused SaveFileSyncPolicy = iota
+
+	// SaveFileSyncRunning also flushes them while the sandbox runs, just
+	// before the checkpoint pauses it, which then flushes only what the
+	// sandbox wrote since.
+	SaveFileSyncRunning
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *SaveFileSyncPolicy) Set(v string) error {
+	switch v {
+	case "paused":
+		*p = SaveFileSyncPaused
+	case "running":
+		*p = SaveFileSyncRunning
+	default:
+		return fmt.Errorf("invalid file sync policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p SaveFileSyncPolicy) Ptr() *SaveFileSyncPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *SaveFileSyncPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p SaveFileSyncPolicy) String() string {
+	switch p {
+	case SaveFileSyncPaused:
+		return "paused"
+	case SaveFileSyncRunning:
+		return "running"
+	default:
+		panic(fmt.Sprintf("invalid file sync policy %d", p))
 	}
 }
 
