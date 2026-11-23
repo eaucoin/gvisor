@@ -48,6 +48,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -284,6 +285,11 @@ type filesystem struct {
 	// inodes whose remote metadata the last of them saved hold its count in
 	// remoteMetadataSave.
 	saves uint64
+
+	// saveStats and restoreStats count and time the last PrepareSave and
+	// CompleteRestore, for a measurement build.
+	saveStats    saveStats    `state:"nosave"`
+	restoreStats restoreStats `state:"nosave"`
 
 	// released is nonzero once filesystem.Release has been called.
 	released atomicbitops.Int32
@@ -1150,8 +1156,12 @@ func (i *inode) destroy(ctx context.Context, d *dentry) {
 	if i.isWriteHandleOk() {
 		// Write dirty pages back to the remote filesystem.
 		h := i.writeHandle()
+		start := time.Now()
 		if err := fsutil.SyncDirtyAll(ctx, &i.cache, &i.dirty, i.size.Load(), mf, h.writeFromBlocksAt); err != nil {
 			log.Warningf("gofer.dentry.destroyLocked: failed to write dirty data back: %v", err)
+		}
+		if s := evictionStats; s != nil {
+			s.writeback += time.Since(start)
 		}
 	}
 	// Discard cached data.
@@ -2132,8 +2142,12 @@ func (d *dentry) evictLocked(ctx context.Context) {
 	// resolution since it was inserted into fs.dentryCache.dentries.
 	if d.refs.Load() != 0 || d.inode.watches.Size() != 0 {
 		d.cachingMu.Unlock()
+		if s := evictionStats; s != nil {
+			s.kept++
+		}
 		return
 	}
+	start := time.Now()
 	if parent := d.parent.Load(); parent != nil {
 		parent.opMu.Lock()
 		if !d.vfsd.IsDead() {
@@ -2159,6 +2173,18 @@ func (d *dentry) evictLocked(ctx context.Context) {
 	// try to acquire fs.renameMu (which we have already acquiredd). Hence,
 	// fs.renameMu will synchronize the destroy attempts.
 	d.cachingMu.Unlock()
+	if s := evictionStats; s != nil {
+		s.invalidate += time.Since(start)
+		s.evicted++
+		switch {
+		case d.isDir():
+			s.evictedDirs++
+		case d.inode.isRegularFile():
+			s.evictedRegular++
+		}
+		start = time.Now()
+		defer func() { s.destroy += time.Since(start) }()
+	}
 	d.destroyLocked(ctx) // +checklocksforce: owned as precondition.
 }
 
@@ -2226,15 +2252,25 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.inode.fs.renameMu.Unlock()
 
 	// No locks need to be held during destoryDisconnected.
+	s := evictionStats
+	start := time.Now()
 	d.destroyDisconnected(ctx, destroyInode)
+	if s != nil && destroyInode {
+		s.inodesDestroyed++
+		s.inodeDestroy += time.Since(start)
+	}
 
 	d.inode.fs.renameMu.Lock()
 
 	// Drop the reference held by d on its parent without recursively locking
 	// d.inode.fs.renameMu.
 
+	start = time.Now()
 	if parent := d.parent.Load(); parent != nil && parent.decRefNoCaching() == 0 {
 		parent.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+	}
+	if s != nil {
+		s.parent += time.Since(start)
 	}
 }
 

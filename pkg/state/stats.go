@@ -47,6 +47,65 @@ type graphStats struct {
 	byType  map[*typeInfo]*statEntry
 	stack   []*typeInfo
 	last    int64
+
+	// read is the time a load took to read the stream; phases the times of
+	// its phases after; callbacks the time of its objects' callbacks by
+	// their type (measurement build).
+	read      int64
+	phases    []phase
+	callbacks map[*typeInfo]*statEntry
+}
+
+// phase is a named phase of a load and its time.
+type phase struct {
+	name string
+	ns   int64
+}
+
+// callback counts an object of type ti whose callbacks took ns.
+func (s *graphStats) callback(ti *typeInfo, ns int64) {
+	if s.callbacks == nil {
+		s.callbacks = make(map[*typeInfo]*statEntry)
+	}
+	e, ok := s.callbacks[ti]
+	if !ok {
+		e = &statEntry{}
+		s.callbacks[ti] = e
+	}
+	e.count++
+	e.total += time.Duration(ns)
+}
+
+// phasesString returns a load's phases and its 12 costliest types of
+// callbacks.
+func (s *graphStats) phasesString() string {
+	if len(s.phases) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "; read %v", time.Duration(s.read))
+	for _, p := range s.phases {
+		fmt.Fprintf(&buf, ", %s %v", p.name, time.Duration(p.ns))
+	}
+	ss := make([]sliceEntry, 0, len(s.callbacks))
+	for ti, e := range s.callbacks {
+		name := "state.default"
+		if ti != nil {
+			name = ti.typ.String()
+		}
+		ss = append(ss, sliceEntry{name: name, entry: e})
+	}
+	sort.Slice(ss, func(i, j int) bool {
+		return ss[i].entry.total > ss[j].entry.total
+	})
+	if len(ss) > 12 {
+		ss = ss[:12]
+	}
+	buf.WriteString("; callbacks by type:")
+	for _, se := range ss {
+		fmt.Fprintf(&buf, " %s %d in %v,", se.name, se.entry.count, se.entry.total)
+	}
+	return buf.String()
 }
 
 func (s *graphStats) init() {
@@ -79,7 +138,7 @@ func (s *graphStats) done() {
 }
 
 func (s *graphStats) String() string {
-	summary := fmt.Sprintf("%d objects, %d bytes, %v", s.objects, s.bytes, time.Duration(s.elapsed))
+	summary := fmt.Sprintf("%d objects, %d bytes, %v", s.objects, s.bytes, time.Duration(s.elapsed)) + s.phasesString()
 	if len(s.byType) == 0 {
 		return summary
 	}

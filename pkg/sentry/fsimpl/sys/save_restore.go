@@ -16,8 +16,10 @@ package sys
 
 import (
 	"path"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -29,7 +31,10 @@ var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
 func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions) error {
 	// Cached dentries can be recreated on demand after restore, so
 	// do not save them.
+	cached := fs.CachedDentries()
+	start := time.Now()
 	fs.EvictCachedDentries(ctx)
+	log.Infof("sys PrepareSave: evicted cached dentries in [%s], %d cached before, %d after", time.Since(start), cached, fs.CachedDentries())
 	return nil
 }
 

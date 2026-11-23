@@ -21,6 +21,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -75,7 +76,15 @@ func (fs *filesystem) evictCachedDentriesRunning(ctx context.Context) {
 	fs.dentryCache.mu.Lock()
 	n := fs.dentryCache.dentriesLen
 	fs.dentryCache.mu.Unlock()
+	start, cached, evictions := time.Now(), n, 0
+	defer func() {
+		fs.dentryCache.mu.Lock()
+		left := fs.dentryCache.dentriesLen
+		fs.dentryCache.mu.Unlock()
+		log.Infof("gofer PrepareSaveRunning for mount %q: %d evictions of %d cached in [%s], %d cached after", fs.iopts.UniqueID, evictions, cached, time.Since(start), left)
+	}()
 	for ; n > 0; n-- {
+		evictions++
 		fs.dentryCache.mu.Lock()
 		victim := fs.dentryCache.dentries.Back()
 		fs.dentryCache.mu.Unlock()
@@ -102,12 +111,21 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	}
 	fs.saves++
 
+	fs.saveStats = saveStats{}
+	start := time.Now()
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
+	fs.dentryCache.mu.Lock()
+	fs.saveStats.cached = fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	evictionStats = &fs.saveStats
 	fs.renameMu.Lock()
 	fs.evictAllCachedDentriesLocked(ctx)
 	fs.renameMu.Unlock()
+	evictionStats = nil
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
+	fs.saveStats.evict = time.Since(start)
+	start = time.Now()
 
 	// Buffer pipe data so that it's available for reading after restore. (This
 	// is a legacy VFS1 feature.)
@@ -131,13 +149,20 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 		}
 	}
 	fs.syncMu.Unlock()
+	fs.saveStats.special = time.Since(start)
+	start = time.Now()
 
 	// Flush local state to the remote filesystem.
 	if err := fs.Sync(ctx); err != nil {
 		return err
 	}
+	fs.saveStats.sync = time.Since(start)
+	start = time.Now()
 
-	return fs.root.prepareSaveRecursive(ctx, opts)
+	err := fs.root.prepareSaveRecursive(ctx, opts)
+	fs.saveStats.walk = time.Since(start)
+	log.Infof("gofer save stats for mount %q (directfs %t): %s", fs.iopts.UniqueID, fs.opts.directfs.enabled, &fs.saveStats)
+	return err
 }
 
 // Preconditions:
@@ -241,14 +266,21 @@ func (d *dentry) saveRemoteMetadata(ctx context.Context) error {
 		d.inode.remoteMetadataSave = d.inode.fs.saves
 		return nil
 	}
+	stats := &d.inode.fs.saveStats
+	start := time.Now()
 	if !d.inode.cachedMetadataAuthoritative() {
-		if err := d.inode.updateMetadata(ctx); err != nil {
+		err := d.inode.updateMetadata(ctx)
+		stats.refreshed++
+		stats.refresh += time.Since(start)
+		if err != nil {
 			return err
 		}
 		d.inode.remoteMetadataSave = d.inode.fs.saves
 		return nil
 	}
 	size, mtime, err := d.inode.remoteSizeAndMtime(ctx)
+	stats.statted++
+	stats.stat += time.Since(start)
 	if err != nil {
 		return fmt.Errorf("failed to stat %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
@@ -262,6 +294,10 @@ func (d *dentry) prepareSaveRecursive(ctx context.Context, opts vfs.PrepareSaveO
 	// (vfs.CompleteRestoreOptions.ValidateFileSizes), so it saves the remote
 	// metadata of those the restore validates, or of all, whatever
 	// opts.ValidateMetadata says.
+	d.inode.fs.saveStats.dentries++
+	if d.inode.isRegularFile() {
+		d.inode.fs.saveStats.regular++
+	}
 	if d.inode.isRegularFile() && opts.SavesRemoteMetadata(d.inode.fs.iopts.UniqueID, genericDebugPathname(d.inode.fs, d)) {
 		if err := d.saveRemoteMetadata(ctx); err != nil {
 			return err
@@ -363,15 +399,20 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.inodeByKey = make(map[inoKey]*inode)
 	prevDevMinors := fs.devMinorByHostDev
 	fs.devMinorByHostDev = make(map[uint64]uint32, len(prevDevMinors))
+	fs.restoreStats = restoreStats{}
+	stats := &fs.restoreStats
+	restoreStart := time.Now()
 
 	if err := fs.restoreRoot(ctx, &opts); err != nil {
 		return vfs.PrependErrMsg("failed to restore root", err)
 	}
+	stats.root = time.Since(restoreStart)
 
 	// Restore remaining dentries.
 	if err := fs.restoreDescendants(ctx, &opts); err != nil {
 		return err
 	}
+	start := time.Now()
 
 	// Restore deleted files which are still accessible via open application FDs.
 	filesToDelete := make(map[*dentry]string)
@@ -380,7 +421,10 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 		if err := d.restoreDeleted(ctx, &opts, filesToDelete, dirsToDelete); err != nil {
 			return err
 		}
+		stats.deleted++
 	}
+	stats.deletedTime = time.Since(start)
+	start = time.Now()
 
 	// Re-open handles for specialFileFDs. Unlike the initial open
 	// (dentry.openSpecialFile()), pipes are always opened without blocking;
@@ -396,6 +440,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 		if err := fd.completeRestore(ctx); err != nil {
 			return err
 		}
+		stats.specials++
 	}
 	if haveWriteOnlyPipes {
 		for fd := fs.specialFileFDs.Front(); fd != nil; fd = fd.Next() {
@@ -403,9 +448,12 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 				if err := fd.completeRestore(ctx); err != nil {
 					return err
 				}
+				stats.specials++
 			}
 		}
 	}
+	stats.specialTime = time.Since(start)
+	start = time.Now()
 
 	for leafD, name := range filesToDelete {
 		if err := leafD.parent.Load().inode.unlink(ctx, name, 0 /* flags */); err != nil {
@@ -439,6 +487,8 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	// Discard state only required during restore.
 	fs.savedDeletedOpenDentries = nil
 	fs.savedDentryRW = nil
+	stats.cleanup = time.Since(start)
+	log.Infof("gofer restore stats for mount %q (directfs %t, validate size %t mtime %t): %s; total %v", fs.iopts.UniqueID, fs.opts.directfs.enabled, opts.ValidateFileSizes, opts.ValidateFileModificationTimestamps, stats, time.Since(restoreStart))
 
 	return nil
 }
@@ -449,7 +499,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 // Preconditions: fs.root has been restored.
 func (fs *filesystem) restoreDescendants(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	if opts.Parallelism <= 1 {
-		return fs.root.restoreDescendantsRecursive(ctx, opts)
+		return fs.root.restoreDescendantsRecursive(ctx, opts, 1)
 	}
 	return restoreTree(fs.root, opts.Parallelism, (*dentry).restorableChildren, func(d *dentry) error {
 		return d.restoreFile(ctx, opts)
@@ -537,7 +587,7 @@ func restoreTree[N any](root N, parallelism int, children func(N) []N, restore f
 }
 
 // Preconditions: d is not synthetic.
-func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
+func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.CompleteRestoreOptions, depth int) error {
 	d.childrenMu.Lock()
 	defer d.childrenMu.Unlock()
 	for _, child := range d.children {
@@ -547,10 +597,13 @@ func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.Comp
 		if child.inode.isSynthetic() {
 			continue
 		}
+		if stats := &child.inode.fs.restoreStats; depth > stats.maxDepth {
+			stats.maxDepth = depth
+		}
 		if err := child.restoreFile(ctx, opts); err != nil {
 			return err
 		}
-		if err := child.restoreDescendantsRecursive(ctx, opts); err != nil {
+		if err := child.restoreDescendantsRecursive(ctx, opts, depth+1); err != nil {
 			return err
 		}
 	}
