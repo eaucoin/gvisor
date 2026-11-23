@@ -180,6 +180,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	pauseStart := time.Now()
 	k.Pause()
 	k.ReceiveTaskStates()
+	log.Infof("Tasks paused in [%s].", time.Since(pauseStart))
 	defer func() {
 		k.Unpause()
 		pause := time.Since(pauseStart)

@@ -34,15 +34,20 @@ func (ds *graphDecodeState) load(root unsafe.Pointer, ti *typeInfo) {
 	if f := d.uint64(); f != schemaFingerprint() {
 		Failf("the state was saved by a binary with different types (fingerprint %#x, want %#x)", f, schemaFingerprint())
 	}
+	t0 := gohacks.Nanotime()
 	ds.readTypes()
 	ds.readObjects(root, ti)
 	ds.readTargets()
+	t1 := gohacks.Nanotime()
 	ds.decodeObjects()
 	setHints(ti, len(d.b), len(ds.targets))
 	if d.pos != len(d.b) {
 		Failf("%d bytes of trailing data", len(d.b)-d.pos)
 	}
+	t2 := gohacks.Nanotime()
 	ds.runCallbacks()
+	t3 := gohacks.Nanotime()
+	ds.stats.phases = []phase{{"objects", t1 - t0}, {"decode", t2 - t1}, {"callbacks", t3 - t2}}
 }
 
 // decodeObjects decodes the data of all objects.
@@ -225,6 +230,10 @@ func (ds *graphDecodeState) runCallbacks() {
 			if ds.stats.enabled && o.cbHead >= 0 && ds.objs[cur].ti != nil {
 				ds.stats.start(ds.objs[cur].ti)
 			}
+			var cbStart int64
+			if o.cbHead >= 0 {
+				cbStart = gohacks.Nanotime()
+			}
 			for c := o.cbHead; c >= 0; c = ds.cbs[c].next {
 				cb := &ds.cbs[c]
 				if cb.waiter >= 0 {
@@ -241,6 +250,9 @@ func (ds *graphDecodeState) runCallbacks() {
 			}
 			if ds.stats.enabled && o.cbHead >= 0 && ds.objs[cur].ti != nil {
 				ds.stats.done()
+			}
+			if o.cbHead >= 0 {
+				ds.stats.callback(ds.objs[cur].ti, gohacks.Nanotime()-cbStart)
 			}
 			o = &ds.ods[cur]
 			o.complete = true
@@ -420,9 +432,11 @@ func loadGraph(ctx context.Context, r io.Reader, rootPtr any, length uint64, sta
 		return Stats{graph: ds.stats}, fmt.Errorf("invalid object graph length %d", length)
 	}
 	data := make([]byte, length)
+	readStart := gohacks.Nanotime()
 	if _, err := io.ReadFull(r, data); err != nil {
 		return Stats{graph: ds.stats}, err
 	}
+	ds.stats.read = gohacks.Nanotime() - readStart
 	ds.in = decBuf{b: data}
 	err := safely(func() {
 		e := efaceOf(&rootPtr)

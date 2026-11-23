@@ -790,8 +790,10 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	defer k.resumeTimeLocked(ctx)
 
 	// Evict all evictable MemoryFile allocations.
+	evictStart := time.Now()
 	k.mf.StartEvictions()
 	k.mf.WaitForEvictions()
+	log.Infof("Kernel quiesced, MemoryFile evictions in [%s].", time.Since(evictStart))
 
 	return f()
 }
@@ -952,6 +954,8 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if err := k.invalidateUnsavableMappings(ctx); err != nil {
 		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
 	}
+	log.Infof("Unsavable mappings invalidated in [%s].", time.Since(saveStart))
+	prepareStart := time.Now()
 
 	// Capture all private memory files.
 	mfsToSave := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
@@ -962,6 +966,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if err := k.vfs.PrepareSave(vfsCtx, vfsOpts); err != nil {
 		return err
 	}
+	log.Infof("Filesystems prepared for save in [%s].", time.Since(prepareStart))
 	// Mark all to-be-saved MemoryFiles as savable to inform kernel save below.
 	k.mf.MarkSavable()
 	for _, mf := range mfsToSave {
@@ -1348,11 +1353,14 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 			return fmt.Errorf("network configuration cannot be nil during restore")
 		}
 		log.Infof("Reconfiguring network for restore")
+		netStart := time.Now()
 		s.ResetConfig()
 		if err := networkArgs.ConfigureNetwork(s); err != nil {
 			return fmt.Errorf("configuring network: %w", err)
 		}
+		configured := time.Since(netStart)
 		s.Restore()
+		log.Infof("Network stack restore: configured in [%s], restored in [%s]", configured, time.Since(netStart)-configured)
 		timeline.Reached("Network stack restored")
 	}
 

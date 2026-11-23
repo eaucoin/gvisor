@@ -15,7 +15,10 @@
 package proc
 
 import (
+	"time"
+
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -27,7 +30,10 @@ func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions)
 	// and are often only kept alive by the dentry cache. Evict
 	// cached dentries so that these inodes are recreated on demand
 	// after restore instead of being saved.
+	cached := fs.CachedDentries()
+	start := time.Now()
 	fs.EvictCachedDentries(ctx)
+	log.Infof("proc PrepareSave: evicted cached dentries in [%s], %d cached before, %d after", time.Since(start), cached, fs.CachedDentries())
 	return nil
 }
 
