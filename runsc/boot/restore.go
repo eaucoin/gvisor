@@ -392,6 +392,22 @@ func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*spec
 	if conf.RestoreValidateFiles == config.RestoreValidateFilesNone {
 		return &vfs.CompleteRestoreOptions{}
 	}
+	return &vfs.CompleteRestoreOptions{
+		ValidateFileSizes:                  true,
+		ValidateFileModificationTimestamps: true,
+		ValidateFile:                       restoreValidatesFile(conf, containerSpecs),
+	}
+}
+
+// restoreValidatesFile returns whether a restore under conf checks a regular
+// file for changes since the checkpoint, given the unique ID of its
+// filesystem and its path relative to the filesystem's root: one that
+// conf.RestoreValidateFiles selects in the containers that containerSpecs
+// holds by name.
+func restoreValidatesFile(conf *config.Config, containerSpecs map[string]*specs.Spec) func(fsID checkpoint.ResourceID, p string) bool {
+	if conf.RestoreValidateFiles == config.RestoreValidateFilesNone {
+		return func(checkpoint.ResourceID, string) bool { return false }
+	}
 	// A container's filesystems have the unique ID {container name, mount
 	// destination} (createMountNamespace), "/" for its root filesystem.
 	//
@@ -406,16 +422,12 @@ func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*spec
 		}
 	}
 	rootfsOnly := conf.RestoreValidateFiles == config.RestoreValidateFilesRootfs
-	return &vfs.CompleteRestoreOptions{
-		ValidateFileSizes:                  true,
-		ValidateFileModificationTimestamps: true,
-		ValidateFile: func(fsID checkpoint.ResourceID, p string) bool {
-			if rootfsOnly && fsID.Path != "/" {
-				return false
-			}
-			_, isMountPoint := mountPoints[checkpoint.ResourceID{ContainerName: fsID.ContainerName, Path: path.Join(fsID.Path, p)}]
-			return !isMountPoint
-		},
+	return func(fsID checkpoint.ResourceID, p string) bool {
+		if rootfsOnly && fsID.Path != "/" {
+			return false
+		}
+		_, isMountPoint := mountPoints[checkpoint.ResourceID{ContainerName: fsID.ContainerName, Path: path.Join(fsID.Path, p)}]
+		return !isMountPoint
 	}
 }
 
@@ -1052,6 +1064,12 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 		return err
 	}
 	saveOpts.Metadata[ContainerSpecsKey] = specsStr
+
+	// The remote metadata of the files that the restore checks, under this
+	// sandbox's configuration, or of all.
+	if l.root.conf.SaveRemoteMetadata == config.SaveRemoteMetadataValidated {
+		saveOpts.RestoreValidatesFile = restoreValidatesFile(l.root.conf, containerSpecs)
+	}
 
 	// Save start time of the runsc process.
 	saveOpts.StartTime = starttime.Get()

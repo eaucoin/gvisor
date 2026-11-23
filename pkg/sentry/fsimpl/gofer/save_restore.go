@@ -49,6 +49,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	if len(fs.iopts.UniqueID.Path) == 0 {
 		return fmt.Errorf("gofer.filesystem with no UniqueID cannot be saved")
 	}
+	fs.saves++
 
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
@@ -121,6 +122,8 @@ func (d *dentry) prepareSaveDead(ctx context.Context) error {
 		return fmt.Errorf("gofer.dentry(%q).prepareSaveDead: invalidated dentries can't be saved", genericDebugPathname(d.inode.fs, d))
 	}
 	if d.inode.isRegularFile() {
+		// Whatever opts says: the size of the deleted file's data saved below
+		// is that of the remote file.
 		if err := d.saveRemoteMetadata(ctx); err != nil {
 			return err
 		}
@@ -175,29 +178,40 @@ func (d *dentry) prepareSaveDeletedRegularFile(ctx context.Context) error {
 
 // saveRemoteMetadata gets the remote file's metadata in case we need to
 // perform metadata validation during restore: d's cached metadata, unless it
-// is authoritative. Synthetic files have no remote file.
+// is authoritative. Synthetic files have no remote file. An inode that
+// several dentries share is read once per save.
 //
 // Preconditions: d.inode.isRegularFile().
 func (d *dentry) saveRemoteMetadata(ctx context.Context) error {
+	if d.inode.remoteMetadataSave == d.inode.fs.saves {
+		return nil
+	}
 	if d.inode.isSynthetic() {
+		d.inode.remoteMetadataSave = d.inode.fs.saves
 		return nil
 	}
 	if !d.inode.cachedMetadataAuthoritative() {
-		return d.inode.updateMetadata(ctx)
+		if err := d.inode.updateMetadata(ctx); err != nil {
+			return err
+		}
+		d.inode.remoteMetadataSave = d.inode.fs.saves
+		return nil
 	}
 	size, mtime, err := d.inode.remoteSizeAndMtime(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to stat %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
 	d.inode.savedHostSize, d.inode.savedHostMtime = size, mtime
+	d.inode.remoteMetadataSave = d.inode.fs.saves
 	return nil
 }
 
 func (d *dentry) prepareSaveRecursive(ctx context.Context, opts vfs.PrepareSaveOptions) error {
-	// The fork validates every restored regular file against its saved state
+	// The fork validates restored regular files against their saved state
 	// (vfs.CompleteRestoreOptions.ValidateFileSizes), so it saves the remote
-	// metadata whatever opts.ValidateMetadata says.
-	if d.inode.isRegularFile() {
+	// metadata of those the restore validates, or of all, whatever
+	// opts.ValidateMetadata says.
+	if d.inode.isRegularFile() && opts.SavesRemoteMetadata(d.inode.fs.iopts.UniqueID, genericDebugPathname(d.inode.fs, d)) {
 		if err := d.saveRemoteMetadata(ctx); err != nil {
 			return err
 		}

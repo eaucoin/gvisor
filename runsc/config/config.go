@@ -513,6 +513,10 @@ type Config struct {
 	// changes since the checkpoint.
 	RestoreValidateFiles RestoreValidateFilesPolicy `flag:"restore-validate-files"`
 
+	// SaveRemoteMetadata selects the files whose remote metadata a
+	// checkpoint saves for a restore to check them against.
+	SaveRemoteMetadata SaveRemoteMetadataPolicy `flag:"save-remote-metadata"`
+
 	// WorkingSetWindow is how long after a restore, or after the first resume
 	// of a sandbox restored paused, the memory that the application touches
 	// is recorded as its working set, which the next checkpoint saves in its
@@ -2229,6 +2233,60 @@ func (p RestoreValidateFilesPolicy) String() string {
 		return "all"
 	default:
 		panic(fmt.Sprintf("invalid restore file validation policy %d", p))
+	}
+}
+
+// SaveRemoteMetadataPolicy selects the regular files of the filesystems backed
+// by a gofer whose remote size and modification time a checkpoint reads and
+// saves, in its pause, for a restore to check them against
+// (RestoreValidateFilesPolicy).
+type SaveRemoteMetadataPolicy int
+
+// SaveRemoteMetadataPolicy values.
+const (
+	// SaveRemoteMetadataAll saves the remote metadata of every regular file.
+	SaveRemoteMetadataAll SaveRemoteMetadataPolicy = iota
+
+	// SaveRemoteMetadataValidated saves the remote metadata of only the
+	// regular files that a restore under the sandbox's own configuration
+	// checks. A restore that checks a file whose metadata the checkpoint did
+	// not save, as one under another RestoreValidateFilesPolicy may, fails.
+	SaveRemoteMetadataValidated
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *SaveRemoteMetadataPolicy) Set(v string) error {
+	switch v {
+	case "all":
+		*p = SaveRemoteMetadataAll
+	case "validated":
+		*p = SaveRemoteMetadataValidated
+	default:
+		return fmt.Errorf("invalid remote metadata save policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p SaveRemoteMetadataPolicy) Ptr() *SaveRemoteMetadataPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *SaveRemoteMetadataPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p SaveRemoteMetadataPolicy) String() string {
+	switch p {
+	case SaveRemoteMetadataAll:
+		return "all"
+	case SaveRemoteMetadataValidated:
+		return "validated"
+	default:
+		panic(fmt.Sprintf("invalid remote metadata save policy %d", p))
 	}
 }
 

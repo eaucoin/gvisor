@@ -776,6 +776,15 @@ and restore: Kubernetes writes `/etc/hosts`, `/etc/hostname` and
 containers, pods or the host while the sandbox is checkpointed. `all` suits
 sandboxes whose mounts do not change, such as read-only volumes.
 
+To compare them, a checkpoint reads the size and modification time of each file
+it holds from the host, a `stat` each while the sandbox is paused. By default
+(`--save-remote-metadata=all`) it reads them for every file, whatever a restore
+will check. With `--save-remote-metadata=validated`, it reads them only for the
+files that a restore under the sandbox's own `--restore-validate-files` checks,
+which shortens the pause of a sandbox holding many files that it does not
+check; a restore under another `--restore-validate-files` that checks a file
+whose metadata the checkpoint did not read fails.
+
 The files that a checkpoint holds are those that something in the sandbox
 pins as it is saved: an open file, a mapped one (such as a running
 executable, even with its file descriptor closed), a working or root
