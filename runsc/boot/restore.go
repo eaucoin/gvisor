@@ -387,16 +387,15 @@ func (r *restoreMounts) String() string {
 // completeRestoreOptions returns the options with which the restored
 // filesystems complete their restore, checking the files that
 // conf.RestoreValidateFiles selects in the containers that containerSpecs
-// holds by name.
+// holds by name, and reopening conf.RestoreFileParallelism files at once.
 func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*specs.Spec) *vfs.CompleteRestoreOptions {
-	if conf.RestoreValidateFiles == config.RestoreValidateFilesNone {
-		return &vfs.CompleteRestoreOptions{}
+	opts := &vfs.CompleteRestoreOptions{Parallelism: conf.RestoreFileParallelism}
+	if conf.RestoreValidateFiles != config.RestoreValidateFilesNone {
+		opts.ValidateFileSizes = true
+		opts.ValidateFileModificationTimestamps = true
+		opts.ValidateFile = restoreValidatesFile(conf, containerSpecs)
 	}
-	return &vfs.CompleteRestoreOptions{
-		ValidateFileSizes:                  true,
-		ValidateFileModificationTimestamps: true,
-		ValidateFile:                       restoreValidatesFile(conf, containerSpecs),
-	}
+	return opts
 }
 
 // restoreValidatesFile returns whether a restore under conf checks a regular

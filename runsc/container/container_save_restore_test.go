@@ -448,6 +448,46 @@ func TestCheckpointRestoreDentryEvictionRunning(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreFileParallelism checks a restore that reopens files
+// in parallel (--restore-file-parallelism), and validates them, of a
+// container holding open every file of a tree of directories on a mount.
+func TestCheckpointRestoreFileParallelism(t *testing.T) {
+	tree, err := os.MkdirTemp(testutil.TmpDir(), "tree")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(tree)
+	if err := os.Chmod(tree, 0755); err != nil {
+		t.Fatalf("os.Chmod(%q) failed: %v", tree, err)
+	}
+	for i := range 4 {
+		for j := range 4 {
+			dir := filepath.Join(tree, fmt.Sprintf("d%d", i), fmt.Sprintf("d%d", j))
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatalf("os.MkdirAll(%q) failed: %v", dir, err)
+			}
+			for k := range 4 {
+				f := filepath.Join(dir, fmt.Sprintf("f%d", k))
+				if err := os.WriteFile(f, []byte(f), 0644); err != nil {
+					t.Fatalf("os.WriteFile(%q) failed: %v", f, err)
+				}
+			}
+		}
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			conf.RestoreFileParallelism = 8
+			if err := conf.RestoreValidateFiles.Set("all"); err != nil {
+				t.Fatalf("error setting restore-validate-files: %v", err)
+			}
+			testCheckpointRestore(t, conf, statefile.CompressionLevelNone, func(script string) *specs.Spec {
+				// The tree is on the mount of the test's temporary directory.
+				return testutil.NewSpecWithArgs("bash", "-c", fmt.Sprintf(`for f in %s/*/*/*; do exec {fd}<"$f"; done; `, tree)+script)
+			})
+		})
+	}
+}
+
 // TestCheckpointRestoreLayers restores an image whose pages are partly in
 // another image: a checkpoint rebased by "runsc image rebase" onto an earlier
 // checkpoint of the same container.
