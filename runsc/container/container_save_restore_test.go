@@ -4969,7 +4969,9 @@ func TestCheckpointRestoreCrossEngineChained(t *testing.T) {
 // TestCheckpointRestoreValidateFiles checks that a restore fails when a file
 // that the sandbox had looked up changed since the checkpoint, in the
 // filesystems that --restore-validate-files selects, as when a sandbox is
-// restored onto another version of its image.
+// restored onto another version of its image, whichever files'
+// metadata the checkpoint saved (--save-remote-metadata); and that a restore
+// that checks a file whose metadata the checkpoint did not save fails.
 func TestCheckpointRestoreValidateFiles(t *testing.T) {
 	app, err := testutil.FindFile("test/cmd/test_app/test_app")
 	if err != nil {
@@ -4978,6 +4980,9 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		policy string
+		// restorePolicy is the restore's --restore-validate-files, policy's
+		// if empty.
+		restorePolicy string
 		// change is the file changed after the checkpoint: the executable on
 		// the root filesystem, the placeholder of a file mount on the root
 		// filesystem, or an executable on a mount. Only the files that the
@@ -4987,6 +4992,10 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 		// wantErr is a substring of the expected restore error, or empty if the
 		// restore must succeed.
 		wantErr string
+		// wantErrValidated is wantErr for a checkpoint that saved the
+		// metadata of only the files that its own policy validates
+		// (--save-remote-metadata=validated), if it differs.
+		wantErrValidated string
 	}{
 		{
 			name:    "rootfs, rootfs changed",
@@ -5015,110 +5024,132 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 			change:  "mnt/test_app",
 			wantErr: "file size validation failed",
 		},
+		{
+			name:             "rootfs then all, mount changed",
+			policy:           "rootfs",
+			restorePolicy:    "all",
+			change:           "mnt/test_app",
+			wantErr:          "file size validation failed",
+			wantErrValidated: "the checkpoint holds no metadata of the remote file",
+		},
 	} {
-		for name, conf := range configs(t, true /* noOverlay */) {
-			t.Run(tc.name+"/"+name, func(t *testing.T) {
-				if err := conf.RestoreValidateFiles.Set(tc.policy); err != nil {
-					t.Fatalf("error setting restore-validate-files: %v", err)
-				}
-				dir, err := os.MkdirTemp(testutil.TmpDir(), "validate-files")
-				if err != nil {
-					t.Fatalf("os.MkdirTemp() failed: %v", err)
-				}
-				defer os.RemoveAll(dir)
-				rootfs := filepath.Join(dir, "rootfs")
-				mnt := filepath.Join(dir, "mnt")
-				imagePath := filepath.Join(dir, "image")
-				for _, d := range []string{rootfs, filepath.Join(rootfs, "mnt"), mnt, imagePath} {
-					if err := os.Mkdir(d, 0777); err != nil {
-						t.Fatalf("os.Mkdir(%q) failed: %v", d, err)
+		for _, saveMetadata := range []string{"all", "validated"} {
+			for name, conf := range configs(t, true /* noOverlay */) {
+				t.Run(tc.name+"/save "+saveMetadata+"/"+name, func(t *testing.T) {
+					if err := conf.RestoreValidateFiles.Set(tc.policy); err != nil {
+						t.Fatalf("error setting restore-validate-files: %v", err)
 					}
-					if err := os.Chmod(d, 0777); err != nil {
-						t.Fatalf("os.Chmod(%q) failed: %v", d, err)
+					if err := conf.SaveRemoteMetadata.Set(saveMetadata); err != nil {
+						t.Fatalf("error setting save-remote-metadata: %v", err)
 					}
-				}
-				for _, d := range []string{rootfs, mnt} {
-					if err := copyFile(app, filepath.Join(d, "test_app")); err != nil {
-						t.Fatalf("error copying test_app: %v", err)
+					wantErr := tc.wantErr
+					if saveMetadata == "validated" && tc.wantErrValidated != "" {
+						wantErr = tc.wantErrValidated
 					}
-				}
-				// The mount point of a file mount, as a container manager
-				// creates it for /etc/hosts.
-				for _, f := range []string{filepath.Join(rootfs, "hosts"), filepath.Join(dir, "hosts")} {
-					if err := os.WriteFile(f, nil, 0666); err != nil {
-						t.Fatalf("os.WriteFile(%q) failed: %v", f, err)
+					dir, err := os.MkdirTemp(testutil.TmpDir(), "validate-files")
+					if err != nil {
+						t.Fatalf("os.MkdirTemp() failed: %v", err)
 					}
-				}
+					defer os.RemoveAll(dir)
+					rootfs := filepath.Join(dir, "rootfs")
+					mnt := filepath.Join(dir, "mnt")
+					imagePath := filepath.Join(dir, "image")
+					for _, d := range []string{rootfs, filepath.Join(rootfs, "mnt"), mnt, imagePath} {
+						if err := os.Mkdir(d, 0777); err != nil {
+							t.Fatalf("os.Mkdir(%q) failed: %v", d, err)
+						}
+						if err := os.Chmod(d, 0777); err != nil {
+							t.Fatalf("os.Chmod(%q) failed: %v", d, err)
+						}
+					}
+					for _, d := range []string{rootfs, mnt} {
+						if err := copyFile(app, filepath.Join(d, "test_app")); err != nil {
+							t.Fatalf("error copying test_app: %v", err)
+						}
+					}
+					// The mount point of a file mount, as a container manager
+					// creates it for /etc/hosts.
+					for _, f := range []string{filepath.Join(rootfs, "hosts"), filepath.Join(dir, "hosts")} {
+						if err := os.WriteFile(f, nil, 0666); err != nil {
+							t.Fatalf("os.WriteFile(%q) failed: %v", f, err)
+						}
+					}
 
-				spec := testutil.NewSpecWithArgs("/test_app", "reaper")
-				spec.Root = &specs.Root{Path: rootfs, Readonly: true}
-				spec.Mounts = []specs.Mount{
-					{
-						Type:        "bind",
-						Source:      mnt,
-						Destination: "/mnt",
-					},
-					{
-						Type:        "bind",
-						Source:      filepath.Join(dir, "hosts"),
-						Destination: "/hosts",
-					},
-				}
-				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
-				if err != nil {
-					t.Fatalf("error setting up container: %v", err)
-				}
-				defer cleanup()
-				args := Args{
-					ID:        testutil.RandomContainerID(),
-					Spec:      spec,
-					BundleDir: bundleDir,
-				}
-				cont, err := New(conf, args)
-				if err != nil {
-					t.Fatalf("error creating container: %v", err)
-				}
-				defer cont.Destroy()
-				if err := cont.Start(conf); err != nil {
-					t.Fatalf("error starting container: %v", err)
-				}
-				// Run a process from the mount, as the root process runs
-				// from the root filesystem.
-				if _, err := cont.Execute(conf, &controlapi.ExecArgs{Filename: "/mnt/test_app", Argv: []string{"/mnt/test_app", "reaper"}}); err != nil {
-					t.Fatalf("error executing /mnt/test_app: %v", err)
-				}
+					spec := testutil.NewSpecWithArgs("/test_app", "reaper")
+					spec.Root = &specs.Root{Path: rootfs, Readonly: true}
+					spec.Mounts = []specs.Mount{
+						{
+							Type:        "bind",
+							Source:      mnt,
+							Destination: "/mnt",
+						},
+						{
+							Type:        "bind",
+							Source:      filepath.Join(dir, "hosts"),
+							Destination: "/hosts",
+						},
+					}
+					_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+					if err != nil {
+						t.Fatalf("error setting up container: %v", err)
+					}
+					defer cleanup()
+					args := Args{
+						ID:        testutil.RandomContainerID(),
+						Spec:      spec,
+						BundleDir: bundleDir,
+					}
+					cont, err := New(conf, args)
+					if err != nil {
+						t.Fatalf("error creating container: %v", err)
+					}
+					defer cont.Destroy()
+					if err := cont.Start(conf); err != nil {
+						t.Fatalf("error starting container: %v", err)
+					}
+					// Run a process from the mount, as the root process runs
+					// from the root filesystem.
+					if _, err := cont.Execute(conf, &controlapi.ExecArgs{Filename: "/mnt/test_app", Argv: []string{"/mnt/test_app", "reaper"}}); err != nil {
+						t.Fatalf("error executing /mnt/test_app: %v", err)
+					}
 
-				if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
-					t.Fatalf("error checkpointing container: %v", err)
-				}
-				cont.Destroy()
+					if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
+						t.Fatalf("error checkpointing container: %v", err)
+					}
+					cont.Destroy()
 
-				changed := filepath.Join(dir, tc.change)
-				f, err := os.OpenFile(changed, os.O_WRONLY|os.O_APPEND, 0)
-				if err != nil {
-					t.Fatalf("error opening %q: %v", changed, err)
-				}
-				_, err = f.Write([]byte("changed"))
-				f.Close()
-				if err != nil {
-					t.Fatalf("error changing %q: %v", changed, err)
-				}
+					changed := filepath.Join(dir, tc.change)
+					f, err := os.OpenFile(changed, os.O_WRONLY|os.O_APPEND, 0)
+					if err != nil {
+						t.Fatalf("error opening %q: %v", changed, err)
+					}
+					_, err = f.Write([]byte("changed"))
+					f.Close()
+					if err != nil {
+						t.Fatalf("error changing %q: %v", changed, err)
+					}
 
-				cont2, err := New(conf, args)
-				if err != nil {
-					t.Fatalf("error creating container: %v", err)
-				}
-				defer cont2.Destroy()
-				err = cont2.Restore(conf, imagePath, sandbox.RestoreOpts{})
-				switch {
-				case tc.wantErr == "" && err != nil:
-					t.Fatalf("restore after changing %q failed: %v", changed, err)
-				case tc.wantErr != "" && err == nil:
-					t.Fatalf("restore after changing %q succeeded, want an error containing %q", changed, tc.wantErr)
-				case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
-					t.Fatalf("restore after changing %q: got error %v, want it to contain %q", changed, err, tc.wantErr)
-				}
-			})
+					if tc.restorePolicy != "" {
+						if err := conf.RestoreValidateFiles.Set(tc.restorePolicy); err != nil {
+							t.Fatalf("error setting restore-validate-files: %v", err)
+						}
+					}
+					cont2, err := New(conf, args)
+					if err != nil {
+						t.Fatalf("error creating container: %v", err)
+					}
+					defer cont2.Destroy()
+					err = cont2.Restore(conf, imagePath, sandbox.RestoreOpts{})
+					switch {
+					case wantErr == "" && err != nil:
+						t.Fatalf("restore after changing %q failed: %v", changed, err)
+					case wantErr != "" && err == nil:
+						t.Fatalf("restore after changing %q succeeded, want an error containing %q", changed, wantErr)
+					case wantErr != "" && !strings.Contains(err.Error(), wantErr):
+						t.Fatalf("restore after changing %q: got error %v, want it to contain %q", changed, err, wantErr)
+					}
+				})
+			}
 		}
 	}
 }
