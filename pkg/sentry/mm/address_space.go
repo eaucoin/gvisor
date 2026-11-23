@@ -215,6 +215,20 @@ func (mm *MemoryManager) unloadedFaultRangeLocked(pseg pmaIterator, ar hostarch.
 	return mf, fr
 }
 
+// UnmapAddressSpace removes every AddressSpace mapping of mm, keeping its
+// pmas: the application's next access to each page faults, and maps it again
+// without allocating or copying anything. A MemoryFile recording its working
+// set (pgalloc.MemoryFile.StartWorkingSetRecording) so sees every page that
+// the application touches from then on, as after a restore, whose
+// AddressSpaces start empty.
+//
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) UnmapAddressSpace() {
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	mm.unmapASLocked(mm.applicationAddrRange())
+}
+
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
 //
 // +checklocksread:mm.activeMu

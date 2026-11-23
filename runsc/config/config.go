@@ -543,6 +543,10 @@ type Config struct {
 	// saved in the image before the rest of its memory.
 	WorkingSetPrefetch WorkingSetPrefetch `flag:"working-set-prefetch"`
 
+	// WorkingSetAfterSave is whether a save that leaves the sandbox running
+	// records its working set as a restore does, for WorkingSetWindow.
+	WorkingSetAfterSave WorkingSetAfterSave `flag:"working-set-after-save"`
+
 	// AsyncLoadTrace is what of a background restore's reads is logged, for
 	// debugging.
 	AsyncLoadTrace AsyncLoadTrace `flag:"async-load-trace"`
@@ -2503,6 +2507,58 @@ func (p WorkingSetPrefetch) String() string {
 		return "off"
 	default:
 		panic(fmt.Sprintf("invalid working set prefetch policy %d", p))
+	}
+}
+
+// WorkingSetAfterSave is whether a save that leaves the sandbox running
+// records its working set.
+type WorkingSetAfterSave int
+
+// WorkingSetAfterSave values.
+const (
+	// WorkingSetAfterSaveOff records none: only a restore does.
+	WorkingSetAfterSaveOff WorkingSetAfterSave = iota
+
+	// WorkingSetAfterSaveIfNone records the working set once the sandbox is
+	// resumed, as a restore does, if the sandbox holds none to save: one
+	// never restored, or restored from an image that carries none. The next
+	// image then carries what the application touched first after the save.
+	WorkingSetAfterSaveIfNone
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (s *WorkingSetAfterSave) Set(v string) error {
+	switch v {
+	case "off":
+		*s = WorkingSetAfterSaveOff
+	case "if-none":
+		*s = WorkingSetAfterSaveIfNone
+	default:
+		return fmt.Errorf("invalid working set after save policy %q: must be off or if-none", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `s`.
+// Useful in flag declaration line.
+func (s WorkingSetAfterSave) Ptr() *WorkingSetAfterSave {
+	return &s
+}
+
+// Get implements flag.Get.
+func (s *WorkingSetAfterSave) Get() any {
+	return *s
+}
+
+// String implements flag.String.
+func (s WorkingSetAfterSave) String() string {
+	switch s {
+	case WorkingSetAfterSaveOff:
+		return "off"
+	case WorkingSetAfterSaveIfNone:
+		return "if-none"
+	default:
+		panic(fmt.Sprintf("invalid working set after save policy %d", s))
 	}
 }
 

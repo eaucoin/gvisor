@@ -1156,6 +1156,27 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 	k.vfs.BeforeResume(ctx)
 }
 
+// RecordWorkingSetAfterSave starts recording the working set of the
+// application MemoryFile, in units of unit bytes for window, as after a
+// restore, if the MemoryFile holds none: a sandbox that a save leaves running
+// then saves in its next image what its application touches first once
+// resumed, which a restore of that image loads first. Every AddressSpace
+// mapping is removed first, so that the application's touches of the memory
+// it mapped before the save fault, and are recorded. It returns whether it
+// started recording.
+//
+// Preconditions: The kernel must be paused.
+func (k *Kernel) RecordWorkingSetAfterSave(unit uint64, window time.Duration) bool {
+	if k.mf.WorkingSet() != nil {
+		return false
+	}
+	for _, memMgr := range k.memoryManagersPaused() {
+		memMgr.UnmapAddressSpace()
+	}
+	k.mf.StartWorkingSetRecording(unit, window)
+	return true
+}
+
 // saveMemoryFiles saves both the application memory file and all MemoryFiles
 // in mfsToSave. If w is non-nil, then pagesMetadata and pagesFile must be nil,
 // and MemoryFile state will be saved to w. Otherwise, pagesMetadata and
