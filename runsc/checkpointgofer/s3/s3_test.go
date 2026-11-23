@@ -323,6 +323,73 @@ func TestReadFailures(t *testing.T) {
 	}
 }
 
+// TestReadETags checks that every GET of a file whose ETag the options give
+// asks the store for that version of its object, and that a read of an object
+// written over since, or lost, fails at once, whether or not its pages reads
+// retry while the sandbox runs.
+func TestReadETags(t *testing.T) {
+	layerPages := checkpointimage.LayerPath(checkpointimage.Digest{1}, checkpointfiles.PagesFileName)
+	obj := testObject(4096)
+	for _, tc := range []struct {
+		name         string
+		path         string
+		whileRunning bool
+		// stored is what the store holds of the object, if anything.
+		stored []byte
+		want   error
+	}{
+		{name: "as it was", path: checkpointfiles.StateFileName, stored: obj},
+		{name: "a layer's as it was", path: layerPages, whileRunning: true, stored: obj},
+		{name: "written over", path: checkpointfiles.StateFileName, stored: testObject(4095), want: unix.ESTALE},
+		{name: "a layer's written over", path: layerPages, whileRunning: true, stored: testObject(4095), want: unix.ESTALE},
+		{name: "a layer's lost", path: layerPages, whileRunning: true, want: unix.ENOENT},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := s3test.NewStore(t)
+			if tc.stored != nil {
+				s.SetObject("image/"+tc.path, tc.stored)
+			}
+			etag := s3test.ETag(obj)
+			srv := newTestFileServer(t, s, FileServerOptions{
+				AllowCheckpointReads:   true,
+				ObjectPrefix:           "image/",
+				PagesRetryWhileRunning: tc.whileRunning,
+				ETags:                  map[string]string{tc.path: etag},
+			})
+			buf := make([]byte, len(obj))
+			c := read(t, openRead(t, srv, tc.path), 0, buf)
+			if tc.want == nil {
+				if c.N != uint64(len(obj)) || c.Err != nil || !bytes.Equal(buf, obj) {
+					t.Errorf("read: %d bytes, %v; want the object", c.N, c.Err)
+				}
+			} else if c.N != 0 || !errors.Is(c.Err, tc.want) {
+				t.Errorf("read: %d bytes, %v; want 0 bytes, %v", c.N, c.Err, tc.want)
+			}
+			reqs := s.Requests()
+			if tc.want != nil && len(reqs) != 1 {
+				t.Errorf("%d requests, want 1", len(reqs))
+			}
+			for _, req := range reqs {
+				if req.IfMatch != etag {
+					t.Errorf("%s %s with If-Match %q, want %q", req.Op, req.Key, req.IfMatch, etag)
+				}
+			}
+		})
+	}
+	// Files whose ETags the options do not give are read as they are.
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, obj)
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, ETags: map[string]string{checkpointfiles.StateFileName: `"other"`}})
+	if c := read(t, openRead(t, srv, checkpointfiles.PagesFileName), 0, make([]byte, len(obj))); c.N != uint64(len(obj)) || c.Err != nil {
+		t.Errorf("read of a file without an ETag: %d bytes, %v; want the object", c.N, c.Err)
+	}
+	for _, req := range s.Requests() {
+		if req.IfMatch != "" {
+			t.Errorf("%s %s with If-Match %q, want none", req.Op, req.Key, req.IfMatch)
+		}
+	}
+}
+
 func TestReadDeadline(t *testing.T) {
 	s := s3test.NewStore(t)
 	s.SetObject(checkpointfiles.PagesFileName, testObject(4096))

@@ -117,6 +117,14 @@ type S3Options struct {
 	// time to transfer its bytes at 1 MiB/s (default 30).
 	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitzero"`
 
+	// ETags, if not empty, holds the ETag of each file to read that has one,
+	// by the path the gofer serves it at ("checkpoint.img", "pages_meta.img",
+	// "pages.img", or "layers/<digest>/<file>" for a layer's): reads of the
+	// file then fail, without being retried, where the store holds another
+	// version of its object or none, which ends a restore before it loads
+	// anything (see s3.FileServerOptions.ETags).
+	ETags map[string]string `json:"etags,omitzero"`
+
 	// ReadBytes and ReadParallel are the size of reads of the pages file and
 	// the number of reads in flight (default 16 MiB and 8).
 	ReadBytes    uint64 `json:"read_bytes,omitzero"`
@@ -305,6 +313,7 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		Bucket:                  opts.Bucket,
 		ObjectPrefix:            opts.ObjectPrefix,
 		LayersPrefix:            opts.LayersPrefix,
+		ETags:                   opts.ETags,
 		SharedCredentialsFile:   opts.CredentialsFile,
 		Profile:                 opts.Profile,
 		MaxAttempts:             opts.MaxAttempts,

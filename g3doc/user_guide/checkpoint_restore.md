@@ -299,7 +299,7 @@ and `layers/<identity>/pages.img`. The identities of all layers, and that each
 layer's `pages.img` can be read to its end, are checked at once, while the
 state file is read, so that before it loads anything such a restore waits for
 two round trips to the store however many layers the image has, and fails if
-any file is missing.
+any file is missing (or, with `etags`, another version of it is found).
 
 With `--background`, pages are loaded from every layer in parallel, each
 layer's `pages.img` read from start to end, and an access to a page that is not
@@ -895,6 +895,12 @@ Gateway and others), the file is `s3_opts.json`:
     that keeps each image once, as `<layers_prefix><identity>/`, restores any
     of them with `object_prefix` set to its directory and `layers_prefix` to
     their parent.
+-   `etags`: the ETag of each file to read that has one, by its path in the
+    image (`"pages.img"`, `"layers/<identity>/pages.img"`, ...), as the store
+    answered its upload. Every read of such a file asks the store for that
+    version of its object (`If-Match`), and fails without retrying where the
+    store holds another version or none, so that a restore whose files were
+    lost or written over fails before it loads anything.
 -   `addressing`: `path` (`https://host/bucket/key`, the default with an
     `endpoint`, as most stores other than Amazon S3 require) or `virtual`
     (`https://bucket.host/key`).

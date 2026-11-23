@@ -78,6 +78,7 @@ error rather than ignored:
   "bucket": "checkpoints",
   "object_prefix": "my-sandbox/",
   "layers_prefix": "my-images/",
+  "etags": {"pages.img": "\"<etag>\"", "layers/<digest>/pages.img": "\"<etag>\""},
   "addressing": "path",
   "credentials": {"access_key_id": "...", "secret_access_key": "...", "session_token": "..."},
   "credentials_file": "/etc/runsc/s3-credentials",
