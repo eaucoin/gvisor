@@ -609,14 +609,14 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 //   - !d.isSynthetic().
 //   - d.parent != nil and has been restored.
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
+	// With inode sharing, we may have multiple references to the same inode.
+	// The first restore of one of its dentries, which may be concurrent with
+	// another's, restores it.
+	if !d.inode.restoreClaimed.CompareAndSwap(false, true) {
+		return nil
+	}
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
-		// With inode sharing, we may have multiple references to the same inode.
-		// There is a possibility we try to restore the same inode multiple times.
-		// If we already have a controlFD, we don't need to do anything.
-		if it.controlFD.Ok() {
-			return nil
-		}
 		controlFD := d.parent.Load().inode.impl.(*lisafsInode).controlFD
 		inode, err := controlFD.Walk(ctx, d.name)
 		if err != nil {
@@ -634,12 +634,6 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 		return it.restoreInode(ctx, &inode, opts, d)
 
 	case *directfsInode:
-		// With inode sharing, we may have multiple references to the same inode.
-		// There is a possibility we try to restore the same inode multiple times.
-		// If we already have a controlFD, we don't need to do anything.
-		if it.controlFD >= 0 {
-			return nil
-		}
 		controlFD := d.parent.Load().inode.impl.(*directfsInode).controlFD
 		childFD, err := tryOpen(func(flags int) (int, error) {
 			n, err := unix.Openat(controlFD, d.name, flags, 0)

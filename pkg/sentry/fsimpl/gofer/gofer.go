@@ -1048,6 +1048,11 @@ type inode struct {
 	savedHostSize  uint64
 	savedHostMtime int64
 
+	// restoreClaimed is set by the first restore of a dentry of this inode
+	// (dentry.restoreFile), which restores the inode for every dentry that
+	// shares it.
+	restoreClaimed atomicbitops.Bool `state:"nosave"`
+
 	// remoteMetadataSave is the count of fs's saves (filesystem.saves) at the
 	// last save that saved the remote metadata of this regular file, which a
 	// restore validates it against: its savedHostSize and savedHostMtime, or

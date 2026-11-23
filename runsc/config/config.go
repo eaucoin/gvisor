@@ -521,6 +521,10 @@ type Config struct {
 	// dentries.
 	SaveDentryEviction SaveDentryEvictionPolicy `flag:"save-dentry-eviction"`
 
+	// RestoreFileParallelism is how many files of each filesystem backed by
+	// a gofer a restore reopens at once.
+	RestoreFileParallelism int `flag:"restore-file-parallelism"`
+
 	// WorkingSetWindow is how long after a restore, or after the first resume
 	// of a sandbox restored paused, the memory that the application touches
 	// is recorded as its working set, which the next checkpoint saves in its
@@ -668,6 +672,9 @@ func (c *Config) Validate() error {
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
+	}
+	if c.RestoreFileParallelism <= 0 {
+		return fmt.Errorf("restore-file-parallelism must be > 0, got: %d", c.RestoreFileParallelism)
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
