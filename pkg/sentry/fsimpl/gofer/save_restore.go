@@ -37,11 +37,45 @@ import (
 )
 
 var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
+var _ vfs.FilesystemImplPrepareSaveRunningExtension = (*filesystem)(nil)
 
 // +stateify savable
 type savedDentryRW struct {
 	read  bool
 	write bool
+}
+
+// PrepareSaveRunning implements
+// vfs.FilesystemImplPrepareSaveRunningExtension.PrepareSaveRunning. It evicts
+// the dentries that the dentry cache holds as it is called, which PrepareSave
+// would otherwise evict in the save's pause, and the ancestors that their
+// eviction leaves cached in turn, the least recently used first, locking the
+// filesystem of each for its eviction alone, so that tasks wait for no more
+// than one eviction at a time. A dentry that tasks cache meanwhile is left to
+// PrepareSave, and so is one that they reference again before its eviction,
+// which leaves the cache without being destroyed.
+func (fs *filesystem) PrepareSaveRunning(ctx context.Context) {
+	fs.dentryCache.mu.Lock()
+	n := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	for ; n > 0; n-- {
+		fs.dentryCache.mu.Lock()
+		victim := fs.dentryCache.dentries.Back()
+		fs.dentryCache.mu.Unlock()
+		if victim == nil {
+			return
+		}
+		// The dentry cache may be shared with other filesystems, whose
+		// dentries d.evict evicts as well. A dentry evicted or destroyed since
+		// it was found is left as it is (evictLocked).
+		d := victim.d
+		parent := d.parent.Load()
+		parentCached := parent != nil && parent.isCached()
+		d.evict(ctx)
+		if parent != nil && !parentCached && parent.isCached() {
+			n++
+		}
+	}
 }
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.

@@ -15,11 +15,13 @@
 package gofer
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -184,6 +186,201 @@ func TestPrepareSaveRemoteMetadataOfValidatedFiles(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPrepareSaveRunningEvictsCachedDentries checks that PrepareSaveRunning
+// evicts the dentries cached as it is called and the ancestors that their
+// eviction caches in turn, leaving PrepareSave none to evict in the pause,
+// and that it does not destroy a cached dentry that was referenced again.
+func TestPrepareSaveRunningEvictsCachedDentries(t *testing.T) {
+	ctx := contexttest.Context(t)
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0755); err != nil {
+		t.Fatalf("os.MkdirAll(): %v", err)
+	}
+	for _, name := range []string{"a/b/c", "a/d", "e", "f"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0644); err != nil {
+			t.Fatalf("os.WriteFile(%q): %v", name, err)
+		}
+	}
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("vfs.VirtualFilesystem.Init(): %v", err)
+	}
+	fs := &filesystem{
+		mf:          pgalloc.MemoryFileFromContext(ctx),
+		inoByKey:    make(map[inoKey]uint64),
+		inodeByKey:  make(map[inoKey]*inode),
+		clock:       ktime.RealtimeClockFromContext(ctx),
+		opts:        filesystemOptions{virtualInodeNumbers: true},
+		dentryCache: &dentryCache{maxCachedDentries: 100},
+	}
+	fs.vfsfs.Init(vfsObj, &FilesystemType{}, fs)
+	rootFD, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("unix.Open(%q): %v", dir, err)
+	}
+	root, err := fs.newDirectfsDentry(rootFD)
+	if err != nil {
+		t.Fatalf("fs.newDirectfsDentry(%q): %v", dir, err)
+	}
+	// The reference that a mount holds on its root.
+	root.IncRef()
+	fs.root = root
+	dentries := map[string]*dentry{"": root}
+	// Looked up in this order, each after its parent, as path resolution
+	// would; each is cached once nothing references it: the leaves, as
+	// their children reference the directories.
+	for _, p := range []string{"a", "a/b", "a/b/c", "a/d", "e", "f"} {
+		parent := dentries[path.Dir(p)]
+		if path.Dir(p) == "." {
+			parent = root
+		}
+		fd, err := unix.Openat(int(parent.inode.impl.(*directfsInode).controlFD), path.Base(p), unix.O_PATH, 0)
+		if err != nil {
+			t.Fatalf("unix.Openat(%q): %v", p, err)
+		}
+		d, err := fs.newDirectfsDentry(fd)
+		if err != nil {
+			t.Fatalf("fs.newDirectfsDentry(%q): %v", p, err)
+		}
+		parent.opMu.Lock()
+		parent.childrenMu.Lock()
+		parent.cacheNewChildLocked(d, path.Base(p))
+		parent.childrenMu.Unlock()
+		parent.opMu.Unlock()
+		dentries[p] = d
+	}
+	for _, p := range []string{"a/b/c", "a/d", "e", "f"} {
+		dentries[p].checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+		if !dentries[p].isCached() {
+			t.Fatalf("%q is not cached", p)
+		}
+	}
+	// f is referenced again, as by an open, after it was cached.
+	dentries["f"].IncRef()
+
+	fs.PrepareSaveRunning(ctx)
+
+	fs.dentryCache.mu.Lock()
+	cached := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	if cached != 0 {
+		t.Errorf("%d dentries still cached, want none for PrepareSave to evict", cached)
+	}
+	for _, p := range []string{"a", "a/b", "a/b/c", "a/d", "e"} {
+		if got := dentries[p].refs.Load(); got != -1 {
+			t.Errorf("%q: refs %d, want -1 (destroyed)", p, got)
+		}
+	}
+	if got := dentries["f"].refs.Load(); got != 1 {
+		t.Errorf("f: refs %d, want 1 (referenced, not destroyed)", got)
+	}
+	if got := root.refs.Load(); got != 2 {
+		t.Errorf("root: refs %d, want 2 (the mount's and f's)", got)
+	}
+}
+
+// TestPrepareSaveRunningEndsWhileTasksCache checks that PrepareSaveRunning
+// runs beside tasks that cache dentries as it evicts them, as tasks that look
+// files up do, and ends.
+func TestPrepareSaveRunningEndsWhileTasksCache(t *testing.T) {
+	ctx := contexttest.Context(t)
+	dir := t.TempDir()
+	const files = 200
+	for i := 0; i < files; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d", i)), nil, 0644); err != nil {
+			t.Fatalf("os.WriteFile(): %v", err)
+		}
+	}
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("vfs.VirtualFilesystem.Init(): %v", err)
+	}
+	fs := &filesystem{
+		mf:          pgalloc.MemoryFileFromContext(ctx),
+		inoByKey:    make(map[inoKey]uint64),
+		inodeByKey:  make(map[inoKey]*inode),
+		clock:       ktime.RealtimeClockFromContext(ctx),
+		opts:        filesystemOptions{virtualInodeNumbers: true},
+		dentryCache: &dentryCache{maxCachedDentries: 2 * files},
+	}
+	fs.vfsfs.Init(vfsObj, &FilesystemType{}, fs)
+	rootFD, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("unix.Open(%q): %v", dir, err)
+	}
+	root, err := fs.newDirectfsDentry(rootFD)
+	if err != nil {
+		t.Fatalf("fs.newDirectfsDentry(%q): %v", dir, err)
+	}
+	root.IncRef()
+	fs.root = root
+	// lookUp caches the dentry of file i, as path resolution leaves it once
+	// nothing references it, unless root holds it already.
+	lookUp := func(i int) error {
+		name := fmt.Sprintf("f%d", i)
+		root.opMu.Lock()
+		root.childrenMu.Lock()
+		if _, ok := root.children[name]; ok {
+			root.childrenMu.Unlock()
+			root.opMu.Unlock()
+			return nil
+		}
+		fd, err := unix.Openat(rootFD, name, unix.O_PATH, 0)
+		if err != nil {
+			root.childrenMu.Unlock()
+			root.opMu.Unlock()
+			return err
+		}
+		d, err := fs.newDirectfsDentry(fd)
+		if err != nil {
+			root.childrenMu.Unlock()
+			root.opMu.Unlock()
+			return err
+		}
+		root.cacheNewChildLocked(d, name)
+		root.childrenMu.Unlock()
+		root.opMu.Unlock()
+		d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+		return nil
+	}
+	for i := 0; i < files/2; i++ {
+		if err := lookUp(i); err != nil {
+			t.Fatalf("lookUp(%d): %v", i, err)
+		}
+	}
+
+	stop := make(chan struct{})
+	tasks := make(chan error, 1)
+	go func() {
+		for i := 0; ; i = (i + 1) % files {
+			select {
+			case <-stop:
+				tasks <- nil
+				return
+			default:
+			}
+			if err := lookUp(i); err != nil {
+				tasks <- err
+				return
+			}
+		}
+	}()
+	prepared := make(chan struct{})
+	go func() {
+		fs.PrepareSaveRunning(ctx)
+		close(prepared)
+	}()
+	select {
+	case <-prepared:
+	case <-time.After(30 * time.Second):
+		t.Errorf("PrepareSaveRunning did not end within 30s while tasks cached dentries")
+	}
+	close(stop)
+	if err := <-tasks; err != nil {
+		t.Fatalf("lookUp(): %v", err)
 	}
 }
 
