@@ -967,6 +967,16 @@ since, or that was restored without recording, keeps the set it was restored
 with. A sandbox restored with `--paused` starts recording when it is first
 resumed, since its application runs nothing before.
 
+A sandbox that was never restored, or restored from an image without a set,
+has no set to save, so a restore of its image reads its memory in file order
+alone, and every first touch waits for its own read. With
+`--working-set-after-save=if-none`, a checkpoint that leaves such a sandbox
+running (`--leave-running`) records its set as it resumes, as a restore does,
+so that its next image carries what the application touched first after the
+checkpoint. Its memory stays where it is; the checkpoint unmaps it from the
+application as it resumes, so that each first touch takes a page fault and is
+seen.
+
 Recording is off by default (`--working-set-window=0`), since it costs every
 restore some speed: while it lasts, gVisor maps memory into the application in
 units of `--working-set-unit`, so that the set holds no more than was touched,

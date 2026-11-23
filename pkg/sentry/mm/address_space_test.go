@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // recordingAddressSpace is a platform.AddressSpace that records the calls
@@ -68,8 +69,12 @@ func (as *recordingAddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr m
 // Unmap implements platform.AddressSpace.Unmap.
 func (as *recordingAddressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	as.unmaps++
-	for off := uint64(0); off < length; off += hostarch.PageSize {
-		delete(as.pages, addr+hostarch.Addr(off))
+	// Over the pages mapped rather than those of the range, which may be the
+	// whole application address range.
+	for page := range as.pages {
+		if page >= addr && uint64(page-addr) < length {
+			delete(as.pages, page)
+		}
 	}
 }
 
@@ -293,5 +298,66 @@ func TestMapUnitWhileLoading(t *testing.T) {
 				t.Errorf("after loading, a touch mapped %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// TestUnmapAddressSpace checks that UnmapAddressSpace leaves nothing mapped in
+// the AddressSpace and keeps the memory mapped before: the next touch of a
+// page faults, maps the page again with its contents, and is recorded in the
+// working set being recorded.
+func TestUnmapAddressSpace(t *testing.T) {
+	ctx := contexttest.Context(t)
+	p := platform.FromContext(ctx)
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	mm, err := NewMemoryManager(recordingPlatform{p}, mf)
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	defer mm.DecUsers(ctx)
+	mm.layout = arch.MmapLayout{
+		MinAddr:          p.MinUserAddress(),
+		MaxAddr:          p.MaxUserAddress(),
+		BottomUpBase:     p.MinUserAddress(),
+		TopDownBase:      p.MaxUserAddress(),
+		DefaultDirection: arch.MmapBottomUp,
+	}
+	as := mm.as.(*recordingAddressSpace)
+
+	const pages = 4
+	ar := mmap(t, ctx, mm, pages, true /* private */)
+	data := bytes.Repeat([]byte("touched before the save "), pages*hostarch.PageSize/24+1)[:pages*hostarch.PageSize]
+	if _, err := mm.CopyOut(ctx, ar.Start, data, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyOut: %v", err)
+	}
+	for i := uint64(0); i < pages; i++ {
+		fault(t, ctx, mm, page(ar, i), hostarch.Read)
+	}
+	if len(as.pages) != pages {
+		t.Fatalf("%d pages mapped, want %d", len(as.pages), pages)
+	}
+
+	mm.UnmapAddressSpace()
+	if len(as.pages) != 0 {
+		t.Errorf("%d pages mapped after UnmapAddressSpace, want none", len(as.pages))
+	}
+	mf.StartWorkingSetRecording(hostarch.PageSize, time.Hour)
+	fault(t, ctx, mm, page(ar, 2), hostarch.Read)
+	mf.StopWorkingSetRecording()
+	if _, ok := as.pages[page(ar, 2)]; !ok || len(as.pages) != 1 {
+		t.Errorf("a touch after UnmapAddressSpace mapped %v, want page 2 alone", as.pages)
+	}
+	mm.activeMu.RLock()
+	touched := mm.pmas.FindSegment(page(ar, 2)).fileRangeOf(hostarch.AddrRange{Start: page(ar, 2), End: page(ar, 3)})
+	mm.activeMu.RUnlock()
+	ws := mf.WorkingSet()
+	if got := ws.GetExtents(); len(got) != 1 || got[0].GetStart() != touched.Start || got[0].GetEnd() != touched.End {
+		t.Errorf("working set %v, want the touched page alone, %v", got, touched)
+	}
+	got := make([]byte, len(data))
+	if _, err := mm.CopyIn(ctx, ar.Start, got, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyIn: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("memory changed by UnmapAddressSpace")
 	}
 }

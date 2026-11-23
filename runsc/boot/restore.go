@@ -1043,6 +1043,9 @@ func (l *Loader) save(o *controlapi.SaveOpts, sum *summary.Checkpoint) error {
 	}
 	saveOpts.TestOnlySkipRunningLoadWait = l.root.conf.TestOnlySaveRunningLoadWait == config.SaveRunningLoadWaitSkip
 	saveOpts.Summary = sum
+	if conf := l.root.conf; conf.WorkingSetAfterSave == config.WorkingSetAfterSaveIfNone && conf.WorkingSetWindow > 0 {
+		saveOpts.WorkingSetAfterResume = &state.WorkingSetRecording{Unit: uint64(conf.WorkingSetUnit), Window: conf.WorkingSetWindow}
+	}
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }

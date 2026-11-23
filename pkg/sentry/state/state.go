@@ -135,11 +135,27 @@ type SaveOpts struct {
 	// caller describes once the image is complete.
 	Summary *summary.Checkpoint
 
+	// If WorkingSetAfterResume is not nil, a save that resumes the sandbox
+	// records the application's working set once it is resumed, as a restore
+	// does, if the sandbox holds none: see
+	// kernel.Kernel.RecordWorkingSetAfterSave.
+	WorkingSetAfterResume *WorkingSetRecording
+
 	// If TestOnlySkipRunningLoadWait is true, a save with a load wait does
 	// not wait for the pages still loading before the save/restore binary
 	// runs (control.SaveWithOpts), so that tests reach its waits in
 	// the binary and in the pause.
 	TestOnlySkipRunningLoadWait bool
+}
+
+// WorkingSetRecording configures the recording of a working set.
+type WorkingSetRecording struct {
+	// Unit is the recording granularity in bytes, a power of 2 multiple of
+	// the page size.
+	Unit uint64
+
+	// Window is how long the recording lasts.
+	Window time.Duration
 }
 
 // Close releases resources owned by opts.
@@ -293,6 +309,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		// save that waited for pages too long, so that it can save it
 		// again later.
 		k.BeforeResume(ctx)
+		if ws := opts.WorkingSetAfterResume; err == nil && opts.Resume && ws != nil && k.RecordWorkingSetAfterSave(ws.Unit, ws.Window) {
+			log.Infof("Recording the working set from the resume after the save, the sandbox holding none.")
+		}
 	} else {
 		// Kill the sandbox. An autosave that dirty tracking verification
 		// failed fails the test that made it: the image is complete, and the
