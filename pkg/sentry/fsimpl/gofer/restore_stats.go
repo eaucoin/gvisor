@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -58,6 +59,60 @@ func (s *saveStats) String() string {
 // paused.
 var evictionStats *saveStats
 
+// lazyEstimate returns what a lazy restore (one that restored eagerly only
+// the dentries held open, the regular files that opts validates, the mount
+// points and their ancestors) would have restored of fs's tree, and the
+// longest chain of restores (the time of a restore parallel enough) of the
+// whole tree and of that part, from the restore just done.
+//
+// Preconditions: fs's restore has restored its descendants, and has not
+// discarded fs.savedDentryRW.
+func (fs *filesystem) lazyEstimate(opts *vfs.CompleteRestoreOptions) string {
+	durs := fs.restoreStats.durs
+	var n, eager, held, validated, mounts int
+	var serialAll, serialEager time.Duration
+	var walk func(d *dentry) (time.Duration, time.Duration, bool)
+	walk = func(d *dentry) (time.Duration, time.Duration, bool) {
+		var cpAll, cpEager time.Duration
+		anyEager := false
+		for _, c := range d.restorableChildren() {
+			a, e, ce := walk(c)
+			cpAll = max(cpAll, a)
+			if ce {
+				anyEager = true
+				cpEager = max(cpEager, e)
+			}
+		}
+		if d == fs.root {
+			return cpAll, cpEager, true
+		}
+		n++
+		self := durs[d]
+		_, h := fs.savedDentryRW[d]
+		v := d.inode.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(fs.iopts.UniqueID, genericDebugPathname(fs, d))
+		m := d.forMountpoint
+		if h {
+			held++
+		}
+		if v {
+			validated++
+		}
+		if m {
+			mounts++
+		}
+		ce := h || v || m || anyEager
+		serialAll += self
+		if ce {
+			eager++
+			serialEager += self
+		}
+		return self + cpAll, self + cpEager, ce
+	}
+	cpAll, cpEager, _ := walk(fs.root)
+	return fmt.Sprintf("%d dentries: %d eager (%d held open, %d validated, %d mount points), %d lazy; critical path %v all, %v eager; serial %v all, %v eager",
+		n, eager, held, validated, mounts, n-eager, cpAll, cpEager, serialAll, serialEager)
+}
+
 // restoreStatsMu serializes the updates of restoreStats by restores that
 // may run in parallel (restoreTree).
 var restoreStatsMu sync.Mutex
@@ -83,6 +138,8 @@ type restoreStats struct {
 	specials    int
 	specialTime time.Duration
 	cleanup     time.Duration
+	// durs is each restored dentry's restoreFile time.
+	durs map[*dentry]time.Duration
 }
 
 func (s *restoreStats) String() string {

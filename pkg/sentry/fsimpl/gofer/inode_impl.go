@@ -653,6 +653,9 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 		restoreStatsMu.Lock()
 		stats.walk += walk
 		stats.inode += time.Since(start)
+		if stats.durs != nil {
+			stats.durs[d] = walk + time.Since(start)
+		}
 		restoreStatsMu.Unlock()
 		return err
 
@@ -687,6 +690,9 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 		restoreStatsMu.Lock()
 		stats.walk += walk
 		stats.inode += time.Since(start)
+		if stats.durs != nil {
+			stats.durs[d] = walk + time.Since(start)
+		}
 		restoreStatsMu.Unlock()
 		return err
 

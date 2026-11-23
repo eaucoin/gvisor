@@ -59,7 +59,10 @@ func (fs *filesystem) PrepareSaveRunning(ctx context.Context, opts vfs.PrepareSa
 		fs.evictCachedDentriesRunning(ctx)
 	}
 	if opts.Sync {
-		return fs.Sync(ctx)
+		start := time.Now()
+		err := fs.Sync(ctx)
+		log.Infof("gofer PrepareSaveRunning sync for mount %q in [%s]", fs.iopts.UniqueID, time.Since(start))
+		return err
 	}
 	return nil
 }
@@ -399,7 +402,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.inodeByKey = make(map[inoKey]*inode)
 	prevDevMinors := fs.devMinorByHostDev
 	fs.devMinorByHostDev = make(map[uint64]uint32, len(prevDevMinors))
-	fs.restoreStats = restoreStats{}
+	fs.restoreStats = restoreStats{durs: make(map[*dentry]time.Duration)}
 	stats := &fs.restoreStats
 	restoreStart := time.Now()
 
@@ -412,6 +415,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	if err := fs.restoreDescendants(ctx, &opts); err != nil {
 		return err
 	}
+	log.Infof("gofer lazy restore estimate for mount %q: %s", fs.iopts.UniqueID, fs.lazyEstimate(&opts))
 	start := time.Now()
 
 	// Restore deleted files which are still accessible via open application FDs.
