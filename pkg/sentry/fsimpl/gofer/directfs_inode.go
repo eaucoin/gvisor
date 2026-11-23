@@ -936,7 +936,10 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
 	if i.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(i.fs.iopts.UniqueID, genericDebugPathname(i.fs, d)) {
-		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
+		savedSize, savedMtime, err := i.savedRemoteSizeAndMtime()
+		if err != nil {
+			return fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: %w", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, err)
+		}
 		if opts.ValidateFileSizes {
 			if savedSize != uint64(stat.Size) {
 				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, savedSize, stat.Size)}

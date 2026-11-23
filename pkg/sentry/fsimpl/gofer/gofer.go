@@ -280,6 +280,11 @@ type filesystem struct {
 	// save/restore. These are still accessible via open application FDs.
 	savedDeletedOpenDentries map[*dentry]struct{}
 
+	// saves counts the saves that fs was prepared for (PrepareSave). The
+	// inodes whose remote metadata the last of them saved hold its count in
+	// remoteMetadataSave.
+	saves uint64
+
 	// released is nonzero once filesystem.Release has been called.
 	released atomicbitops.Int32
 }
@@ -1042,6 +1047,12 @@ type inode struct {
 	// remote file's.
 	savedHostSize  uint64
 	savedHostMtime int64
+
+	// remoteMetadataSave is the count of fs's saves (filesystem.saves) at the
+	// last save that saved the remote metadata of this regular file, which a
+	// restore validates it against: its savedHostSize and savedHostMtime, or
+	// its cached metadata refreshed from the remote file.
+	remoteMetadataSave uint64
 
 	// mmapFile implements memmap.File for mmapFD.
 	//
