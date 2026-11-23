@@ -2161,6 +2161,78 @@ func TestCheckpointRestoreWorkingSet(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreWorkingSetAfterSave checks that, with
+// --working-set-after-save=if-none, a checkpoint that leaves a sandbox never
+// restored running records its working set once it resumes, so that the next
+// checkpoint's image carries one, and that by default it records none.
+func TestCheckpointRestoreWorkingSetAfterSave(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			conf.WorkingSetWindow = 2 * time.Second
+			for _, policy := range []config.WorkingSetAfterSave{config.WorkingSetAfterSaveOff, config.WorkingSetAfterSaveIfNone} {
+				conf.WorkingSetAfterSave = policy
+				dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+				if err != nil {
+					t.Fatalf("os.MkdirTemp failed: %v", err)
+				}
+				defer os.RemoveAll(dir)
+				if err := os.Chmod(dir, 0777); err != nil {
+					t.Fatalf("error chmoding file: %q, %v", dir, err)
+				}
+				outputPath := filepath.Join(dir, "output")
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+				defer outputFile.Close()
+				script := fmt.Sprintf(`x=$(head -c %d /dev/urandom | base64 -w0); while true; do echo -n "$x" | md5sum >> %q; sleep 0.1; done`, 4<<20, outputPath)
+				spec := testutil.NewSpecWithArgs("bash", "-c", script)
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				defer cleanup()
+				cont, err := New(conf, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir})
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if err := cont.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				if err := waitForFileNotEmpty(outputFile); err != nil {
+					t.Fatalf("Failed to wait for output file: %v", err)
+				}
+				// checkpoint saves the running sandbox to a new image, which it
+				// leaves running, and returns the number of extents of the
+				// image's working set.
+				checkpoint := func() int {
+					t.Helper()
+					imagePath, err := os.MkdirTemp(dir, "image")
+					if err != nil {
+						t.Fatalf("os.MkdirTemp failed: %v", err)
+					}
+					if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone, Resume: true}); err != nil {
+						t.Fatalf("error checkpointing container: %v", err)
+					}
+					img, err := checkpointimage.ReadMetadataFile(filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName))
+					if err != nil {
+						t.Fatalf("error reading the image's metadata: %v", err)
+					}
+					return len(img.Proto.GetWorkingSet().GetExtents())
+				}
+				if n := checkpoint(); n != 0 {
+					t.Errorf("--working-set-after-save=%v: the first image of a sandbox never restored has a working set of %d extents", policy, n)
+				}
+				time.Sleep(conf.WorkingSetWindow + time.Second)
+				if got, want := checkpoint() != 0, policy == config.WorkingSetAfterSaveIfNone; got != want {
+					t.Errorf("--working-set-after-save=%v: the image after a checkpoint that left the sandbox running has a working set: %t, want %t", policy, got, want)
+				}
+			}
+		})
+	}
+}
+
 // firstLine returns the first complete line of the file at path.
 func firstLine(path string) (string, error) {
 	data, err := os.ReadFile(path)

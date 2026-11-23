@@ -984,6 +984,9 @@ func (l *Loader) save(o *controlapi.SaveOpts) error {
 		saveOpts.PagesFile = stateio.NewRateLimitedWriter(saveOpts.PagesFile, rate)
 	}
 	saveOpts.TestOnlySkipRunningLoadWait = l.root.conf.TestOnlySaveRunningLoadWait == config.SaveRunningLoadWaitSkip
+	if conf := l.root.conf; conf.WorkingSetAfterSave == config.WorkingSetAfterSaveIfNone && conf.WorkingSetWindow > 0 {
+		saveOpts.WorkingSetAfterResume = &state.WorkingSetRecording{Unit: uint64(conf.WorkingSetUnit), Window: conf.WorkingSetWindow}
+	}
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
