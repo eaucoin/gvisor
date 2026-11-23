@@ -799,6 +799,14 @@ changed: one it only looked up is looked up again, as it is on the host. A
 restore that fails stops the sandbox and the gofer that it started, so that
 waiting on the container returns.
 
+A restore reopens the files that the checkpoint holds one at a time, each after
+its directory, at the cost of a lookup on the host each: a few milliseconds
+each on a root filesystem freshly mounted for the restored container.
+`--restore-file-parallelism=N` reopens up to N of each filesystem's files at
+once, the files of a directory once the directory is reopened, so that the
+restore takes about as many lookups as the tree of files is deep. A parallel
+restore that fails to reopen several files reports the first of them by path.
+
 ## Checkpoint images in object stores
 
 `runsc checkpoint` and `runsc restore` can keep an image in an object store

@@ -181,6 +181,11 @@ type CompleteRestoreOptions struct {
 	// (cf. gofer.InternalFilesystemOptions.UniqueID) and their path relative to
 	// its root.
 	ValidateFile func(fsID checkpoint.ResourceID, path string) bool
+
+	// Parallelism is how many files filesystem implementations backed by
+	// remote filesystems restore at once, each after its parent directory;
+	// one if it is zero.
+	Parallelism int
 }
 
 // ValidatesFile returns true if the validations requested by opts apply to the
