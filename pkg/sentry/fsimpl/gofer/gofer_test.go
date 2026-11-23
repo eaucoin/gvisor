@@ -15,14 +15,20 @@
 package gofer
 
 import (
+	"os"
+	"path"
+	"path/filepath"
 	"slices"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 func TestDestroyIdempotent(t *testing.T) {
@@ -82,6 +88,103 @@ func TestDestroyIdempotent(t *testing.T) {
 	}
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+}
+
+// TestPrepareSaveRemoteMetadataOfValidatedFiles checks that a save reads the
+// remote metadata of only the regular files that its restore validates, as
+// vfs.PrepareSaveOptions.RestoreValidatesFile says them, and of every regular
+// file without it; and that the metadata of a file that the save did not read
+// cannot be validated.
+func TestPrepareSaveRemoteMetadataOfValidatedFiles(t *testing.T) {
+	ctx := contexttest.Context(t)
+	dir := t.TempDir()
+	names := []string{"validated", "unvalidated"}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0644); err != nil {
+			t.Fatalf("os.WriteFile(%q): %v", name, err)
+		}
+	}
+	fs := filesystem{
+		mf:         pgalloc.MemoryFileFromContext(ctx),
+		inoByKey:   make(map[inoKey]uint64),
+		inodeByKey: make(map[inoKey]*inode),
+		clock:      ktime.RealtimeClockFromContext(ctx),
+		// There is no VFS to allocate device numbers from.
+		opts:        filesystemOptions{virtualInodeNumbers: true},
+		dentryCache: &dentryCache{maxCachedDentries: 0},
+		iopts:       InternalFilesystemOptions{UniqueID: checkpoint.ResourceID{ContainerName: "container", Path: "/"}},
+	}
+	rootFD, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("unix.Open(%q): %v", dir, err)
+	}
+	root, err := fs.newDirectfsDentry(rootFD)
+	if err != nil {
+		t.Fatalf("fs.newDirectfsDentry(%q): %v", dir, err)
+	}
+	fs.root = root
+	files := make(map[string]*dentry)
+	for _, name := range names {
+		fd, err := unix.Openat(rootFD, name, unix.O_PATH, 0)
+		if err != nil {
+			t.Fatalf("unix.Openat(%q): %v", name, err)
+		}
+		child, err := fs.newDirectfsDentry(fd)
+		if err != nil {
+			t.Fatalf("fs.newDirectfsDentry(%q): %v", name, err)
+		}
+		root.opMu.Lock()
+		root.childrenMu.Lock()
+		root.cacheNewChildLocked(child, name)
+		root.childrenMu.Unlock()
+		root.opMu.Unlock()
+		files[name] = child
+	}
+
+	for _, tc := range []struct {
+		name string
+		opts vfs.PrepareSaveOptions
+		// saved are the files whose remote metadata the save reads.
+		saved []string
+	}{
+		{
+			name:  "every file",
+			saved: names,
+		},
+		{
+			name: "the files the restore validates",
+			opts: vfs.PrepareSaveOptions{
+				RestoreValidatesFile: func(fsID checkpoint.ResourceID, p string) bool {
+					if fsID != fs.iopts.UniqueID {
+						t.Errorf("RestoreValidatesFile(%v, %q): want the filesystem's unique ID %v", fsID, p, fs.iopts.UniqueID)
+					}
+					return path.Base(p) == "validated"
+				},
+			},
+			saved: []string{"validated"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := fs.PrepareSave(ctx, tc.opts); err != nil {
+				t.Fatalf("fs.PrepareSave(): %v", err)
+			}
+			defer fs.BeforeResume(ctx)
+			for _, name := range names {
+				size, _, err := files[name].inode.savedRemoteSizeAndMtime()
+				if !slices.Contains(tc.saved, name) {
+					if err == nil {
+						t.Errorf("%q: the save read its remote metadata (size %d), want none to validate against", name, size)
+					}
+					continue
+				}
+				if err != nil {
+					t.Errorf("%q: %v, want the remote metadata that the save read", name, err)
+				} else if size != uint64(len(name)) {
+					t.Errorf("%q: saved remote size %d, want %d", name, size, len(name))
+				}
+			}
+		})
+	}
 }
 
 func TestStringFixedCache(t *testing.T) {

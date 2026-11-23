@@ -642,7 +642,10 @@ func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opt
 	i.metadataMu.Lock()
 	defer i.metadataMu.Unlock()
 	if i.isRegularFile() && (opts.ValidateFileSizes || opts.ValidateFileModificationTimestamps) && opts.ValidatesFile(i.fs.iopts.UniqueID, genericDebugPathname(i.fs, d)) {
-		savedSize, savedMtime := i.savedRemoteSizeAndMtime()
+		savedSize, savedMtime, err := i.savedRemoteSizeAndMtime()
+		if err != nil {
+			return fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: %w", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, err)
+		}
 		if opts.ValidateFileSizes {
 			if inode.Stat.Mask&linux.STATX_SIZE == 0 {
 				return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file size validation failed: file size not available", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID)}
