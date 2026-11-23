@@ -20,6 +20,8 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -381,6 +383,230 @@ func TestPrepareSaveRunningEndsWhileTasksCache(t *testing.T) {
 	close(stop)
 	if err := <-tasks; err != nil {
 		t.Fatalf("lookUp(): %v", err)
+	}
+}
+
+// treeNode is a node of the trees that TestRestoreTree restores.
+type treeNode struct {
+	path     string
+	parent   *treeNode
+	children []*treeNode
+	fail     bool
+
+	// restores counts the node's restores; parentRestored says whether its
+	// parent had been restored when it was.
+	restores       atomic.Int32
+	parentRestored bool
+}
+
+// newTree returns the root of a tree of the given depth below it, each node
+// above the leaves with width children.
+func newTree(width, depth int) (*treeNode, []*treeNode) {
+	root := &treeNode{}
+	nodes := []*treeNode{}
+	level := []*treeNode{root}
+	for range depth {
+		var next []*treeNode
+		for _, parent := range level {
+			for i := range width {
+				n := &treeNode{path: path.Join(parent.path, fmt.Sprintf("%d", i)), parent: parent}
+				parent.children = append(parent.children, n)
+				next = append(next, n)
+			}
+		}
+		nodes = append(nodes, next...)
+		level = next
+	}
+	return root, nodes
+}
+
+// TestRestoreTree checks that restoreTree restores every node of a tree once,
+// after its parent, as many at once as its parallelism allows: so in about
+// the time of as many restores as the tree is deep, not as it has nodes; and
+// that it returns the error of the failed node with the least path, whatever
+// the order of the restores, having restored every node below no failed one.
+func TestRestoreTree(t *testing.T) {
+	const (
+		width       = 4
+		depth       = 3
+		restoreTime = 20 * time.Millisecond
+	)
+	for _, tc := range []struct {
+		name        string
+		parallelism int
+		fail        []string
+		wantErr     string
+	}{
+		{name: "parallel", parallelism: 64},
+		{name: "bounded", parallelism: 4},
+		{name: "failures", parallelism: 16, fail: []string{"3", "1/2", "2/0/1"}, wantErr: "1/2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, nodes := newTree(width, depth)
+			for _, n := range nodes {
+				n.fail = slices.Contains(tc.fail, n.path)
+			}
+			var (
+				running, most atomic.Int32
+				restored      sync.Map
+			)
+			restored.Store(root, true)
+			restore := func(n *treeNode) error {
+				now := running.Add(1)
+				defer running.Add(-1)
+				for {
+					m := most.Load()
+					if now <= m || most.CompareAndSwap(m, now) {
+						break
+					}
+				}
+				n.restores.Add(1)
+				_, n.parentRestored = restored.Load(n.parent)
+				time.Sleep(restoreTime)
+				if n.fail {
+					return fmt.Errorf("%s failed", n.path)
+				}
+				restored.Store(n, true)
+				return nil
+			}
+			start := time.Now()
+			err := restoreTree(root, tc.parallelism, func(n *treeNode) []*treeNode { return n.children }, restore, func(n *treeNode) string { return n.path })
+			elapsed := time.Since(start)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("restoreTree(): %v", err)
+			case tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr+" failed"):
+				t.Fatalf("restoreTree(): got error %v, want %q's", err, tc.wantErr)
+			}
+			for _, n := range nodes {
+				below := false
+				for a := n.parent; a != nil; a = a.parent {
+					below = below || a.fail
+				}
+				want := int32(1)
+				if below {
+					want = 0
+				}
+				if got := n.restores.Load(); got != want {
+					t.Errorf("%q restored %d times, want %d", n.path, got, want)
+				}
+				if got := n.restores.Load(); got != 0 && !n.parentRestored {
+					t.Errorf("%q restored before its parent", n.path)
+				}
+			}
+			if got := most.Load(); got > int32(tc.parallelism) {
+				t.Errorf("%d restores at once, want at most %d", got, tc.parallelism)
+			}
+			// The serial walk takes as many restores as the tree has nodes; the
+			// parallel one, as it is deep where every level's nodes restore at
+			// once, which the slack of half the serial walk's time leaves room
+			// for on a loaded machine.
+			if tc.parallelism >= width*width*width && elapsed >= time.Duration(len(nodes))*restoreTime/2 {
+				t.Errorf("restoreTree() took %v for %d nodes %d deep, want about %v", elapsed, len(nodes), depth, time.Duration(depth)*restoreTime)
+			}
+		})
+	}
+}
+
+// TestRestoreDescendantsParallel checks that a filesystem restores its
+// dentries in parallel as it does serially: every dentry's file reopened,
+// once for an inode that several share.
+func TestRestoreDescendantsParallel(t *testing.T) {
+	for _, parallelism := range []int{1, 8} {
+		t.Run(fmt.Sprintf("parallelism %d", parallelism), func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			dir := t.TempDir()
+			var paths []string
+			for i := range 4 {
+				d := fmt.Sprintf("d%d", i)
+				paths = append(paths, d)
+				if err := os.Mkdir(filepath.Join(dir, d), 0755); err != nil {
+					t.Fatalf("os.Mkdir(): %v", err)
+				}
+				for j := range 4 {
+					f := path.Join(d, fmt.Sprintf("f%d", j))
+					paths = append(paths, f)
+					if err := os.WriteFile(filepath.Join(dir, f), nil, 0644); err != nil {
+						t.Fatalf("os.WriteFile(): %v", err)
+					}
+				}
+			}
+			// Hard links of d0/f0, which share its inode.
+			for _, link := range []string{"d1/l", "d2/l", "d3/l"} {
+				paths = append(paths, link)
+				if err := os.Link(filepath.Join(dir, "d0/f0"), filepath.Join(dir, link)); err != nil {
+					t.Fatalf("os.Link(): %v", err)
+				}
+			}
+			fs := &filesystem{
+				mf:          pgalloc.MemoryFileFromContext(ctx),
+				inoByKey:    make(map[inoKey]uint64),
+				inodeByKey:  make(map[inoKey]*inode),
+				clock:       ktime.RealtimeClockFromContext(ctx),
+				opts:        filesystemOptions{virtualInodeNumbers: true},
+				dentryCache: &dentryCache{maxCachedDentries: 0},
+			}
+			rootFD, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY, 0)
+			if err != nil {
+				t.Fatalf("unix.Open(%q): %v", dir, err)
+			}
+			root, err := fs.newDirectfsDentry(rootFD)
+			if err != nil {
+				t.Fatalf("fs.newDirectfsDentry(%q): %v", dir, err)
+			}
+			fs.root = root
+			dentries := map[string]*dentry{".": root}
+			for _, p := range paths {
+				parent := dentries[path.Dir(p)]
+				fd, err := unix.Openat(parent.inode.impl.(*directfsInode).controlFD, path.Base(p), unix.O_PATH, 0)
+				if err != nil {
+					t.Fatalf("unix.Openat(%q): %v", p, err)
+				}
+				d, err := fs.newDirectfsDentry(fd)
+				if err != nil {
+					t.Fatalf("fs.newDirectfsDentry(%q): %v", p, err)
+				}
+				parent.opMu.Lock()
+				parent.childrenMu.Lock()
+				parent.cacheNewChildLocked(d, path.Base(p))
+				parent.childrenMu.Unlock()
+				parent.opMu.Unlock()
+				dentries[p] = d
+			}
+			if dentries["d1/l"].inode != dentries["d0/f0"].inode {
+				t.Fatalf("the hard links of d0/f0 do not share its inode")
+			}
+			// As a load leaves them: no dentry below the root restored.
+			for _, p := range paths {
+				i := dentries[p].inode.impl.(*directfsInode)
+				if i.controlFD >= 0 {
+					if err := unix.Close(i.controlFD); err != nil {
+						t.Fatalf("unix.Close(): %v", err)
+					}
+				}
+				i.controlFD = -1
+				dentries[p].inode.restoreClaimed.Store(false)
+			}
+
+			if err := fs.restoreDescendants(ctx, &vfs.CompleteRestoreOptions{Parallelism: parallelism}); err != nil {
+				t.Fatalf("fs.restoreDescendants(): %v", err)
+			}
+			for _, p := range paths {
+				fd := dentries[p].inode.impl.(*directfsInode).controlFD
+				var stat unix.Stat_t
+				if err := unix.Fstat(fd, &stat); err != nil {
+					t.Errorf("%q: its file is not reopened: fstat(%d): %v", p, fd, err)
+					continue
+				}
+				var want unix.Stat_t
+				if err := unix.Stat(filepath.Join(dir, p), &want); err != nil {
+					t.Fatalf("unix.Stat(%q): %v", p, err)
+				}
+				if stat.Ino != want.Ino {
+					t.Errorf("%q: reopened inode %d, want %d", p, stat.Ino, want.Ino)
+				}
+			}
+		})
 	}
 }
 
