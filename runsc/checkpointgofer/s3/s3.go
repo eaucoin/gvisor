@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 )
 
 const (
@@ -95,6 +96,9 @@ type FileServer struct {
 	client *s3.Client
 	opts   FileServerOptions
 	retry  retryPolicy
+
+	// cache, if not nil, caches the pages files read (CacheDir).
+	cache *pagesCache
 }
 
 // FileServerOptions provides options to NewFileServer.
@@ -197,6 +201,13 @@ type FileServerOptions struct {
 	// (ESTALE) or none (ENOENT), as it does where the object was lost or
 	// written over since its ETag was taken.
 	ETags map[string]string
+
+	// CacheDir, if not nil, is a directory of the node's that holds a file for
+	// each pages file of the image to cache, at the path that the FileServer
+	// serves it at, which it writes the bytes it reads of the pages file into,
+	// checked against the image's page hashes, and marks (see pagesCache).
+	// The FileServer opens files beneath it alone, and closes it.
+	CacheDir *os.File
 
 	// If Trace is true, each GET of a pages file is logged as it ends, as a
 	// line beginning "S3 read trace:", with the kind of the read it serves,
@@ -370,7 +381,7 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 	})
 
 	ctx, cancel := context.WithCancelCause(ctx)
-	return &FileServer{
+	s := &FileServer{
 		ctx:    ctx,
 		cancel: cancel,
 		client: client,
@@ -380,7 +391,11 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 			timeout:     o.RequestTimeout,
 			bandwidth:   o.MinRequestBandwidth,
 		},
-	}, nil
+	}
+	if o.CacheDir != nil {
+		s.cache = newPagesCache(s, o.CacheDir)
+	}
+	return s, nil
 }
 
 // CheckFileMode returns an error unless the file described by fi, named name,
@@ -415,6 +430,18 @@ func checkFileMode(name string, perm fs.FileMode, owner, euid uint32, secret boo
 // Destroy implements stateipc.AsyncFileServerImpl.Destroy.
 func (s *FileServer) Destroy() {
 	s.cancel(fmt.Errorf("context canceled by s3.FileServer.Destroy"))
+	if s.cache != nil {
+		s.cache.close()
+	}
+}
+
+// CacheStatus implements stateipc.CacheReporter.CacheStatus: the cache of the
+// pages files read, completed, or its zero value if there is none.
+func (s *FileServer) CacheStatus() stateipc.CacheStatus {
+	if s.cache == nil {
+		return stateipc.CacheStatus{}
+	}
+	return s.cache.CacheStatus()
 }
 
 // OpenRead implements stateipc.AsyncFileServerImpl.OpenRead.
@@ -467,6 +494,9 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	log.Infof("Opening %s for reading", obj)
 	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
 	r.etag = s.opts.ETags[path]
+	if s.cache != nil && name == checkpointfiles.PagesFileName {
+		r.cache, r.cacheFile = s.cache, s.cache.file(path)
+	}
 	r.trace = s.opts.Trace && path == checkpointfiles.PagesFileName
 	return r, nil
 }

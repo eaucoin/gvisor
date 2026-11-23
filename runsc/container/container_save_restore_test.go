@@ -1001,7 +1001,7 @@ func TestCheckpointRestoreBackground(t *testing.T) {
 			if err := os.Chmod(dir, 0777); err != nil {
 				t.Fatalf("error chmoding file: %q, %v", dir, err)
 			}
-			testCheckpointRestoreBackground(t, conf, dir, nil)
+			testCheckpointRestoreBackground(t, conf, dir, nil, nil)
 		})
 	}
 }
@@ -1015,7 +1015,7 @@ func TestCheckpointRestoreS3(t *testing.T) {
 			store := s3test.NewStore(t)
 			dir := s3ImageDir(t, store, "")
 
-			testCheckpointRestoreBackground(t, conf, dir, nil)
+			testCheckpointRestoreBackground(t, conf, dir, nil, nil)
 
 			for _, name := range []string{checkpointfiles.StateFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
 				if _, ok := store.Object("image/" + name); !ok {
@@ -1025,6 +1025,58 @@ func TestCheckpointRestoreS3(t *testing.T) {
 					t.Errorf("checkpoint wrote %s to the image path", name)
 				}
 			}
+		})
+	}
+}
+
+// TestCheckpointRestoreS3PagesCache checks that a restore from an S3-compatible
+// object store whose image path holds a pages cache writes the pages file it
+// reads into it, and marks it complete once loaded, the cached file the
+// object's bytes.
+func TestCheckpointRestoreS3PagesCache(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			store := s3test.NewStore(t)
+			dir := s3ImageDir(t, store, "")
+			cacheDir := filepath.Join(dir, sandbox.PagesCacheDir)
+			cached := filepath.Join(cacheDir, checkpointfiles.PagesFileName)
+			testCheckpointRestoreBackground(t, conf, dir, func() {
+				// Staged as a node would: a sparse file of the pages file's size.
+				pages, ok := store.Object("image/" + checkpointfiles.PagesFileName)
+				if !ok {
+					t.Fatalf("checkpoint did not write %s to the object store", checkpointfiles.PagesFileName)
+				}
+				if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(cached, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Truncate(cached, int64(len(pages))); err != nil {
+					t.Fatal(err)
+				}
+			}, func(cont *Container) {
+				if err := cont.WaitRestore(); err != nil {
+					t.Fatalf("waiting for the restore: %v", err)
+				}
+				// Marked complete once the restore has loaded every page.
+				marks, err := os.ReadFile(cached + ".marks")
+				if err != nil {
+					t.Fatalf("reading the cache's marks: %v", err)
+				}
+				// The magic, the version, then the flags, of which 1 is complete.
+				if len(marks) < 16 || string(marks[:8]) != "gvcmarks" || marks[12]&1 == 0 {
+					t.Errorf("the cache's marks do not say it is complete: %q", marks[:min(len(marks), 16)])
+				}
+				got, err := os.ReadFile(cached)
+				if err != nil {
+					t.Fatalf("reading the cached pages file: %v", err)
+				}
+				pages, _ := store.Object("image/" + checkpointfiles.PagesFileName)
+				if !bytes.Equal(got, pages) {
+					t.Errorf("the cached pages file differs from the object")
+				}
+			})
 		})
 	}
 }
@@ -1054,7 +1106,7 @@ func TestCheckpointRestoreS3Socket(t *testing.T) {
 			defer srv.Close()
 			dir := s3OptsDir(t, "http://store.invalid", fmt.Sprintf(`, "socket": %q`, sock))
 
-			testCheckpointRestoreBackground(t, conf, dir, nil)
+			testCheckpointRestoreBackground(t, conf, dir, nil, nil)
 
 			if _, ok := store.Object("image/" + checkpointfiles.PagesFileName); !ok {
 				t.Errorf("checkpoint did not write %s to the object store", checkpointfiles.PagesFileName)
@@ -1120,7 +1172,7 @@ func TestCheckpointRestoreS3StoreAway(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				restoring = true
-			})
+			}, nil)
 			mu.Lock()
 			defer mu.Unlock()
 			if refused == 0 {
@@ -1976,7 +2028,7 @@ func s3OptsDir(t *testing.T, endpoint, extra string) string {
 // data to imagePath, uncompressed, restores it with --background, and checks
 // that its data survived. beforeRestore, if not nil, is called just before the
 // restore.
-func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePath string, beforeRestore func()) {
+func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePath string, beforeRestore func(), afterRestore func(*Container)) {
 	outputPath := filepath.Join(imagePath, "output")
 	outputFile, err := createWriteableOutputFile(outputPath)
 	if err != nil {
@@ -2046,6 +2098,9 @@ func testCheckpointRestoreBackground(t *testing.T, conf *config.Config, imagePat
 	}
 	if got != want {
 		t.Errorf("checksum of the application's data after the restore is %q, want %q as before the checkpoint", got, want)
+	}
+	if afterRestore != nil {
+		afterRestore(cont2)
 	}
 }
 

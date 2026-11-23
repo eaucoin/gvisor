@@ -119,6 +119,17 @@ func (c *AsyncFileClient) DecRef() {
 	})
 }
 
+// CacheStatus asks the server to complete the cache it keeps of the files it
+// serves, once the client is done reading them, and returns what it holds:
+// its zero value if the server keeps none (AsyncFileServer.CacheStatus).
+func (c *AsyncFileClient) CacheStatus() (CacheStatus, error) {
+	var resp CacheStatusResponse
+	if err := c.uc.Call("AsyncFileServer.CacheStatus", &CacheStatusRequest{}, &resp); err != nil {
+		return CacheStatus{}, err
+	}
+	return resp.Status, nil
+}
+
 // OpenRead opens the given file for reading. If it succeeds, the returned
 // AsyncReader holds a reference on the AsyncFileClient.
 func (c *AsyncFileClient) OpenRead(path string) (stateio.AsyncReader, error) {

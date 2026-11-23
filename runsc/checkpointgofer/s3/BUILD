@@ -8,6 +8,7 @@ package(
 go_library(
     name = "s3",
     srcs = [
+        "cache.go",
         "errors.go",
         "reader.go",
         "s3.go",
@@ -23,6 +24,7 @@ go_library(
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/stateipc",
         "//pkg/sync",
         "@com_github_aws_aws_sdk_go_v2//aws:go_default_library",
         "@com_github_aws_aws_sdk_go_v2//aws/ratelimit:go_default_library",
@@ -32,6 +34,7 @@ go_library(
         "@com_github_aws_aws_sdk_go_v2_service_s3//:go_default_library",
         "@com_github_aws_aws_sdk_go_v2_service_s3//types:go_default_library",
         "@com_github_aws_smithy_go//:go_default_library",
+        "@com_github_cespare_xxhash_v2//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -39,17 +42,22 @@ go_library(
 go_test(
     name = "s3_test",
     size = "small",
-    srcs = ["s3_test.go"],
+    srcs = [
+        "cache_test.go",
+        "s3_test.go",
+    ],
     library = ":s3",
     deps = [
         "//pkg/log",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc:pgalloc_metadata_go_proto",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sync",
         "//runsc/checkpointgofer/s3/s3test",
         "@com_github_aws_aws_sdk_go_v2_credentials//:go_default_library",
+        "@com_github_cespare_xxhash_v2//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

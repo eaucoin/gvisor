@@ -160,9 +160,10 @@ type checkpointGoferCmd struct {
 	allowFSCheckpointReads  bool
 	allowFSCheckpointWrites bool
 
-	sockFD    int
-	gcsOptsFD int
-	s3OptsFD  int
+	sockFD       int
+	gcsOptsFD    int
+	s3OptsFD     int
+	pagesCacheFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -189,6 +190,7 @@ func (cmd *checkpointGoferCmd) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&cmd.sockFD, "sock-fd", -1, "FD for a Unix domain socket that is connected to the sentry")
 	f.IntVar(&cmd.gcsOptsFD, "gcs-opts-fd", -1, "FD for a file containing GCSOptions in JSON")
 	f.IntVar(&cmd.s3OptsFD, "s3-opts-fd", -1, "FD for a file containing S3Options in JSON")
+	f.IntVar(&cmd.pagesCacheFD, "pages-cache-fd", -1, "FD for a directory holding a file for each pages file to read, into which the S3 checkpoint gofer writes the bytes it reads of it (see runsc/checkpointgofer/s3's cache)")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -323,6 +325,9 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		PagesFilePartBytes:      opts.WritePartBytes,
 		PagesFileWriteParallel:  opts.WriteParallel,
 		Trace:                   trace,
+	}
+	if cmd.pagesCacheFD >= 0 {
+		s3fsOpts.CacheDir = os.NewFile(uintptr(cmd.pagesCacheFD), "pages-cache")
 	}
 	switch opts.Addressing {
 	case "":
