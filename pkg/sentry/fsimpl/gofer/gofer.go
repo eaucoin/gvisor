@@ -2053,6 +2053,13 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 	}
 }
 
+// isCached returns true if d is in its filesystem's dentry cache.
+func (d *dentry) isCached() bool {
+	d.cachingMu.Lock()
+	defer d.cachingMu.Unlock()
+	return d.cached
+}
+
 // Preconditions: d.cachingMu must be locked.
 func (d *dentry) removeFromCacheLocked() {
 	if d.cached {

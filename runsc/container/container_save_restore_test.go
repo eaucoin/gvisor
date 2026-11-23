@@ -432,6 +432,22 @@ func TestCheckpointRestore(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreDentryEvictionRunning checks a checkpoint that evicts
+// the gofer's cached dentries while the sandbox runs, before pausing it
+// (--save-dentry-eviction=running), and those cached since in its pause, of
+// a container that looks files up all the while, caching dentries as the
+// checkpoint evicts them.
+func TestCheckpointRestoreDentryEvictionRunning(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			conf.SaveDentryEviction = config.SaveDentryEvictionRunning
+			testCheckpointRestore(t, conf, statefile.CompressionLevelNone, func(script string) *specs.Spec {
+				return testutil.NewSpecWithArgs("bash", "-c", "(while true; do ls -lR /usr >/dev/null 2>&1; done) & "+script)
+			})
+		})
+	}
+}
+
 // TestCheckpointRestoreLayers restores an image whose pages are partly in
 // another image: a checkpoint rebased by "runsc image rebase" onto an earlier
 // checkpoint of the same container.
