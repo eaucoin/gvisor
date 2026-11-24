@@ -960,16 +960,19 @@ files it reads, so that the node holds the image without downloading it again.
 Stage the image path with a directory `pages-cache` that holds, for each pages
 file to keep, a file of its size at the path the gofer reads it at
 (`pages-cache/pages.img`, `pages-cache/layers/<identity>/pages.img`), sparse as
-`truncate` makes it. The checkpoint gofer then writes the bytes of each read of
-a pages file into that file, at their offsets, from buffers of its own rather
-than the sandbox's memory, behind the read and with `O_DIRECT` (a write that
-does not fit its 64 MiB queue is skipped). It checks each page the image refers
-to against the page hashes of `pages_meta.img`, which it reads from the store
-itself. Once the restore has loaded every page, it reads from the store the
-pages not checked yet, syncs the files, and writes beside each file its marks
-(`pages.img.marks`): a bitmap of the pages checked, and a flag set where every
-page the image refers to is. `runsc wait --restore` returns once the marks are
-written; the restore's log says what the cache holds.
+`truncate` makes it. The checkpoint gofer allocates each file's blocks as it
+opens it, and does not cache a file for which the disk has no room. It writes
+the bytes of each read of a pages file into that file, at their offsets, from
+buffers of its own rather than the sandbox's memory, behind the read and with
+`O_DIRECT` (a write that does not fit its 64 MiB queue is skipped). It checks
+each page the image refers to against the page hashes of `pages_meta.img`, which
+it reads from the store itself. Once the restore has loaded every page, it reads
+from the store the pages not checked yet, syncs the files, and writes beside
+each file its marks (`pages.img.marks`): a bitmap of the pages checked, and a
+flag set where every page the image refers to is. It does so within a minute,
+and writes nothing to the files after: a file without complete marks then is
+not to be used. `runsc wait --restore` returns once the marks are written; the
+restore's log says what the cache holds.
 
 ## Working sets
 
