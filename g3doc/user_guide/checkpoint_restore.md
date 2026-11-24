@@ -964,7 +964,9 @@ file to keep, a file of its size at the path the gofer reads it at
 opens it, and does not cache a file for which the disk has no room. It writes
 the bytes of each read of a pages file into that file, at their offsets, from
 buffers of its own rather than the sandbox's memory, behind the read and with
-`O_DIRECT` (a write that does not fit its 64 MiB queue is skipped). It checks
+`O_DIRECT`, one write at a time and, while the restore loads, writing at most
+half the time, so that the restore's reads keep the rest of a disk the store
+shares (a write that does not fit its 64 MiB queue is skipped). It checks
 each page the image refers to against the page hashes of `pages_meta.img`, which
 it reads from the store itself. Once the restore has loaded every page, it reads
 from the store the pages not checked yet, syncs the files, and writes beside
