@@ -72,8 +72,10 @@ const (
 	// written to the cache.
 	cacheChunkBytes = 1 << 20
 
-	// cacheWriters is the number of goroutines writing to the cache.
-	cacheWriters = 4
+	// cacheWriters is the number of goroutines writing to the cache: one, so
+	// that its writes queue on the disk one at a time behind the reads of the
+	// store that it may share (cacheWriteDuty).
+	cacheWriters = 1
 
 	// cachePage is the size of a page of a pages file, which marks count.
 	cachePage = checkpointimage.PageSize
@@ -108,6 +110,18 @@ var (
 
 	// fallocate allocates the blocks of a cached file as it is opened.
 	fallocate = unix.Fallocate
+
+	// cacheWriteDuty is the share of the time that the cache's writer spends
+	// writing while the restore loads: after a write that took d, it waits
+	// d·(1-cacheWriteDuty)/cacheWriteDuty before the next, so that on a disk
+	// that the store reads from too, the restore's reads keep the rest of it.
+	// What is read meanwhile queues, and what does not fit is not written, to
+	// be read again once the restore has loaded every page (CacheStatus), as
+	// the writer then waits no more.
+	cacheWriteDuty = 0.5
+
+	// cacheSleep waits between the cache's writes.
+	cacheSleep = time.Sleep
 )
 
 // pagesCache is the cache of the pages files of the image that a FileServer
@@ -145,6 +159,10 @@ type pagesCache struct {
 	// renamed into place and no file is written.
 	marksMu sync.Mutex
 	closed  atomic.Bool
+
+	// loaded is set once the restore has loaded every page (CacheStatus):
+	// the writer no longer waits between its writes.
+	loaded atomic.Bool
 
 	dropped    atomic.Uint64
 	mismatched atomic.Uint64
@@ -414,9 +432,13 @@ func (c *pagesCache) drop(buf []byte) {
 func (c *pagesCache) writerMain() {
 	defer c.writers.Done()
 	for ch := range c.queue {
+		start := time.Now()
 		c.writeChunk(ch.f, ch.off, ch.buf)
 		c.free <- ch.buf[:cap(ch.buf)]
 		c.pending.Done()
+		if !c.loaded.Load() && cacheWriteDuty < 1 {
+			cacheSleep(time.Duration(float64(time.Since(start)) * (1 - cacheWriteDuty) / cacheWriteDuty))
+		}
 	}
 }
 
@@ -481,6 +503,7 @@ func (c *pagesCache) check(f *cacheFile, first uint64, buf []byte) {
 // return the same status.
 func (c *pagesCache) CacheStatus() stateipc.CacheStatus {
 	c.statusOnce.Do(func() {
+		c.loaded.Store(true)
 		ctx, cancel := context.WithCancel(c.fs.ctx)
 		defer cancel()
 		done := make(chan stateipc.CacheStatus, 1)

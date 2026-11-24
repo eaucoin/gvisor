@@ -31,6 +31,8 @@ import (
 	pb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/checkpointgofer/s3/s3test"
 )
 
@@ -195,7 +197,7 @@ func TestCacheWithoutCacheDir(t *testing.T) {
 func TestCacheDropsWhatTheQueueCannotHold(t *testing.T) {
 	defer func(was int) { cacheQueueBytes = was }(cacheQueueBytes)
 	cacheQueueBytes = cacheChunkBytes
-	// 8 chunks: the cache's 4 writers take 4, waiting, and its queue 1.
+	// 8 chunks: the cache's writer takes 1, waiting, and its queue 1.
 	pages, meta := cacheTestImage(t, 8*cacheChunkBytes/cachePage)
 	s := s3test.NewStore(t)
 	s.SetObject(checkpointfiles.PagesFileName, pages)
@@ -318,5 +320,65 @@ func TestCacheStatusTimesOut(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, checkpointfiles.PagesFileName+cacheMarksSuffix)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the cache has marks after its status (%v)", err)
+	}
+}
+
+// TestCacheWriterYieldsWhileLoading checks that the cache's writer waits
+// between its writes while the restore loads, as long as each write took for
+// the duty it leaves the restore's reads, and no longer once the restore has
+// loaded every page.
+func TestCacheWriterYieldsWhileLoading(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		waits []time.Duration
+	)
+	defer func(was func(time.Duration)) { cacheSleep = was }(cacheSleep)
+	cacheSleep = func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		waits = append(waits, d)
+	}
+	waited := func() []time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Duration(nil), waits...)
+	}
+	pages, meta := cacheTestImage(t, 4*cacheChunkBytes/cachePage)
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, pages)
+	s.SetObject(checkpointfiles.PagesMetadataFileName, meta)
+	_, cacheDir := cacheTestDir(t, int64(len(pages)))
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, CacheDir: cacheDir})
+	r := openRead(t, srv, checkpointfiles.PagesFileName)
+
+	// Loading: a wait after each write.
+	buf := make([]byte, 2*cacheChunkBytes)
+	if c := read(t, r, 0, buf); c.N != uint64(len(buf)) || c.Err != nil {
+		t.Fatalf("read: %d bytes, %v", c.N, c.Err)
+	}
+	srv.cache.pending.Wait()
+	if got := waited(); len(got) != 2 {
+		t.Fatalf("the writer waited %v after 2 writes while loading, want once after each", got)
+	}
+
+	// Loaded: the writes queued then, behind a writer held, are written
+	// without a wait.
+	f := srv.cache.file(checkpointfiles.PagesFileName)
+	f.mu.Lock()
+	if c := read(t, r, int64(len(buf)), buf); c.N != uint64(len(buf)) || c.Err != nil {
+		f.mu.Unlock()
+		t.Fatalf("read: %d bytes, %v", c.N, c.Err)
+	}
+	statused := make(chan stateipc.CacheStatus)
+	go func() { statused <- srv.CacheStatus() }()
+	for !srv.cache.loaded.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	f.mu.Unlock()
+	if st := <-statused; !st.Complete {
+		t.Errorf("cache status %+v, want complete", st)
+	}
+	if got := waited(); len(got) != 2 {
+		t.Errorf("the writer waited %v, want no wait once loaded", got[2:])
 	}
 }
