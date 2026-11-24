@@ -495,6 +495,72 @@ func TestImageChain(t *testing.T) {
 	}
 }
 
+// TestImageDeltaRefersToItsParentsPagesOnly checks that a delta refers, in
+// each layer it keeps of its parent, only to pages of that layer's pages file
+// that its parent refers to: a copy of a layer that holds only the pages one
+// image refers to (a pages cache filled for its restore) serves every image
+// saved from it.
+func TestImageDeltaRefersToItsParentsPagesOnly(t *testing.T) {
+	const pages = 128
+	tf := newImageTestFile(t, pages)
+	rng := rand.New(rand.NewSource(1))
+	parent := saveTestImage(t, tf.f, nil, nil)
+	for gen := uint64(1); gen < 8; gen++ {
+		clear(tf.modified)
+		for j := 0; j < pages/8; j++ {
+			i := uint64(rng.Intn(pages))
+			switch rng.Intn(4) {
+			case 0:
+				tf.zero(i)
+			case 1:
+				tf.rewrite(i)
+			default:
+				tf.write(i, gen)
+			}
+		}
+		delta := saveTestImage(t, tf.f, parent, tf.clean)
+		referenced := referencedPages(parent)
+		digests := delta.layerDigests()
+		kept := 0
+		for i := range delta.img.MemoryFiles {
+			for _, e := range delta.img.MemoryFileImage(i).Extents {
+				if e.Layer == 0 {
+					continue
+				}
+				d := digests[e.Layer]
+				for off := e.Start; off < e.End; off += page {
+					kept++
+					if at := e.OffsetOf(off); !referenced[d][at] {
+						t.Errorf("delta %d refers, in layer %v, to its pages file at %#x, which its parent does not refer to", gen, d, at)
+					}
+				}
+			}
+		}
+		if kept == 0 {
+			t.Fatalf("delta %d refers to no page of its parent's layers", gen)
+		}
+		parent = delta
+	}
+}
+
+// referencedPages returns, for each layer of ti by its digest, the offsets
+// of the pages of its pages file that ti refers to.
+func referencedPages(ti *testImage) map[checkpointimage.Digest]map[uint64]bool {
+	digests := ti.layerDigests()
+	referenced := make(map[checkpointimage.Digest]map[uint64]bool, len(digests))
+	for _, d := range digests {
+		referenced[d] = make(map[uint64]bool)
+	}
+	for i := range ti.img.MemoryFiles {
+		for _, e := range ti.img.MemoryFileImage(i).Extents {
+			for off := e.Start; off < e.End; off += page {
+				referenced[digests[e.Layer]][e.OffsetOf(off)] = true
+			}
+		}
+	}
+	return referenced
+}
+
 // checkLayerReferences checks that every page of fr in ti refers to the layer
 // that is the image of chain that wrote it last (writer, as an index in chain,
 // or -1 for a zero page), and that ti's layers are exactly the images that its

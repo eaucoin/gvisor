@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -42,7 +43,11 @@ import (
 // with a sparse file for each pages file of the image, at the path the
 // FileServer serves it at ("pages.img", "layers/<digest>/pages.img"), the
 // FileServer writes the bytes of each GET of a pages file into that file, at
-// their offset, as the restore reads them. It reads each response's body into
+// their offset, as the restore reads them. It opens every staged file of the
+// image once it has read the image's pages metadata, or as the restore first
+// reads it, and allocates its blocks then, so that the cache never takes the
+// disk space that the node keeps free: a file whose blocks cannot all be
+// allocated is not cached. It reads each response's body into
 // buffers of its own, copies them to the client's memory, and writes them from
 // there, so that the cache never holds bytes that the Sentry, which maps the
 // client's memory too, could have changed. The writes are behind the reads,
@@ -56,7 +61,10 @@ import (
 // (CacheStatus), it reads from the store the pages that are not marked yet,
 // syncs the files, and writes each file's marks beside it
 // ("pages.img.marks"), in a new file renamed into place: complete when every
-// page the image refers to in that file is marked.
+// page the image refers to in that file is marked. It does so within
+// cacheStatusTimeout, and closes the files then: the cache is not written once
+// its status is given, so that a file without marks then, or without complete
+// marks, stays so.
 
 const (
 	// cacheChunkBytes is the size of the buffers that the bytes of a pages
@@ -88,10 +96,19 @@ const (
 	cacheMarksComplete = 1
 )
 
-// cacheQueueBytes bounds the bytes waiting to be written to the cache: a
-// chunk read while they would be more is not written. It is a variable for
-// tests.
-var cacheQueueBytes = 64 << 20
+// These are variables for tests.
+var (
+	// cacheQueueBytes bounds the bytes waiting to be written to the cache: a
+	// chunk read while they would be more is not written.
+	cacheQueueBytes = 64 << 20
+
+	// cacheStatusTimeout bounds CacheStatus: a cache that it does not
+	// complete in that time is not complete, and is not written after.
+	cacheStatusTimeout = time.Minute
+
+	// fallocate allocates the blocks of a cached file as it is opened.
+	fallocate = unix.Fallocate
+)
 
 // pagesCache is the cache of the pages files of the image that a FileServer
 // serves.
@@ -110,7 +127,6 @@ type pagesCache struct {
 
 	// indexDone is closed once index is built, or indexErr says why it
 	// could not be.
-	indexOnce sync.Once
 	indexDone chan struct{}
 	index     *cacheIndex
 	indexErr  error
@@ -119,9 +135,16 @@ type pagesCache struct {
 	// files holds the cached files, by the path the FileServer serves them
 	// at. files is protected by mu.
 	files map[string]*cacheFile
-	// status is the cache's status once CacheStatus completed it. status is
-	// protected by mu.
-	status *stateipc.CacheStatus
+
+	// statusOnce completes the cache once, whose status is then status.
+	statusOnce sync.Once
+	status     stateipc.CacheStatus
+
+	// marksMu serializes the renaming of marks into place with closing the
+	// cache: once closed is set, which marksMu protects too, no marks are
+	// renamed into place and no file is written.
+	marksMu sync.Mutex
+	closed  atomic.Bool
 
 	dropped    atomic.Uint64
 	mismatched atomic.Uint64
@@ -189,18 +212,28 @@ func newPagesCache(fs *FileServer, dir *os.File) *pagesCache {
 	for range cacheWriters {
 		go c.writerMain()
 	}
+	go c.buildIndex()
 	return c
 }
 
 // file returns the cached file of the pages file served at p, opening it,
-// or nil if the cache holds no file for it. It starts reading the image's
-// pages metadata, which the cache checks pages against.
+// or nil if the cache holds no file for it.
 func (c *pagesCache) file(p string) *cacheFile {
-	c.indexOnce.Do(func() { go c.buildIndex() })
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.openLocked(p)
+}
+
+// openLocked returns the cached file of the pages file served at p, opening
+// it and allocating its blocks, or nil if the cache holds no file for it.
+//
+// Preconditions: c.mu must be locked.
+func (c *pagesCache) openLocked(p string) *cacheFile {
 	if f, ok := c.files[p]; ok {
 		return f
+	}
+	if c.closed.Load() {
+		return nil
 	}
 	how := unix.OpenHow{
 		Flags:   unix.O_RDWR | unix.O_DIRECT | unix.O_CLOEXEC,
@@ -227,6 +260,18 @@ func (c *pagesCache) file(p string) *cacheFile {
 		c.files[p] = nil
 		return nil
 	}
+	if fi.Size() > 0 {
+		if err := fallocate(fd, 0, 0, fi.Size()); err != nil {
+			if errors.Is(err, unix.ENOSPC) {
+				log.Infof("s3 cache: no room for %s (%d bytes), which is not cached", p, fi.Size())
+			} else {
+				log.Warningf("s3 cache: allocating %s, which is not cached: %v", p, err)
+			}
+			data.Close()
+			c.files[p] = nil
+			return nil
+		}
+	}
 	pages := (uint64(fi.Size()) + cachePage - 1) / cachePage
 	f := &cacheFile{
 		path:    p,
@@ -240,12 +285,19 @@ func (c *pagesCache) file(p string) *cacheFile {
 }
 
 // buildIndex reads the image's pages metadata from the store and builds the
-// index of its pages files' hashes.
+// index of its pages files' hashes, then opens each of their cached files that
+// no read opened yet, so that each gets marks.
 func (c *pagesCache) buildIndex() {
 	defer close(c.indexDone)
 	c.index, c.indexErr = c.readIndex()
 	if c.indexErr != nil {
 		log.Warningf("s3 cache: cannot check pages, so marks none: %v", c.indexErr)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p := range c.index.files {
+		c.openLocked(p)
 	}
 }
 
@@ -339,7 +391,7 @@ func (c *pagesCache) buffer() []byte {
 // again once they are. Bytes that do not fit in the queue, or that O_DIRECT
 // cannot write (not page-aligned), are not written.
 func (c *pagesCache) write(f *cacheFile, off int64, buf []byte) {
-	if off%cachePage != 0 || len(buf)%cachePage != 0 {
+	if off%cachePage != 0 || len(buf)%cachePage != 0 || c.closed.Load() {
 		c.drop(buf)
 		return
 	}
@@ -372,7 +424,9 @@ func (c *pagesCache) writerMain() {
 // match their hashes, or records them as written if their hashes are not
 // known yet.
 func (c *pagesCache) writeChunk(f *cacheFile, off int64, buf []byte) {
-	if _, err := unix.Pwrite(int(f.data.Fd()), buf, off); err != nil {
+	// Through f.data, which a write keeps open: once the cache is closed, the
+	// write fails.
+	if _, err := f.data.WriteAt(buf, off); err != nil {
 		f.mu.Lock()
 		if f.err == nil {
 			f.err = fmt.Errorf("writing %s at %d: %w", f.path, off, err)
@@ -422,29 +476,41 @@ func (c *pagesCache) check(f *cacheFile, first uint64, buf []byte) {
 // CacheStatus implements stateipc.CacheReporter.CacheStatus: once the
 // restore's reads are done, it writes what is queued, checks the pages written
 // before the index was built, reads from the store the referenced pages not
-// marked yet, syncs the files and writes their marks. It does so once; later
-// calls return the same status.
+// marked yet, syncs the files and writes their marks, within
+// cacheStatusTimeout, then closes the files. It does so once; later calls
+// return the same status.
 func (c *pagesCache) CacheStatus() stateipc.CacheStatus {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.status != nil {
-		return *c.status
-	}
-	st := c.complete()
-	c.status = &st
-	log.Infof("s3 cache: %d files, %d of %d referenced bytes held (%d of them filled), %d bytes not written, %d pages mismatched; complete %t %s", st.Files, st.Held, st.Referenced, st.Filled, st.Dropped, st.Mismatched, st.Complete, st.Error)
-	return st
+	c.statusOnce.Do(func() {
+		ctx, cancel := context.WithCancel(c.fs.ctx)
+		defer cancel()
+		done := make(chan stateipc.CacheStatus, 1)
+		go func() { done <- c.complete(ctx) }()
+		timer := time.NewTimer(cacheStatusTimeout)
+		defer timer.Stop()
+		select {
+		case c.status = <-done:
+		case <-timer.C:
+			// What complete did is not counted: the files it did not mark
+			// complete by now have no complete marks, and will not have.
+			c.status = stateipc.CacheStatus{
+				Enabled: true,
+				Error:   fmt.Sprintf("the cache was not completed within %v", cacheStatusTimeout),
+			}
+		}
+		c.closeFiles()
+		st := c.status
+		log.Infof("s3 cache: %d files, %d of %d referenced bytes held (%d of them filled), %d bytes not written, %d pages mismatched; complete %t %s", st.Files, st.Held, st.Referenced, st.Filled, st.Dropped, st.Mismatched, st.Complete, st.Error)
+	})
+	return c.status
 }
 
-// complete completes the cache.
-//
-// Preconditions: c.mu must be locked.
-func (c *pagesCache) complete() stateipc.CacheStatus {
+// complete completes the cache, stopping as ctx is canceled.
+func (c *pagesCache) complete(ctx context.Context) stateipc.CacheStatus {
 	st := stateipc.CacheStatus{Enabled: true}
 	c.pending.Wait()
 	select {
 	case <-c.indexDone:
-	case <-c.fs.ctx.Done():
+	case <-ctx.Done():
 		st.Error = "the checkpoint gofer stopped before the cache's index was built"
 		return st
 	}
@@ -452,15 +518,21 @@ func (c *pagesCache) complete() stateipc.CacheStatus {
 		st.Error = c.indexErr.Error()
 		return st
 	}
+	c.mu.Lock()
+	files := make(map[string]*cacheFile, len(c.index.files))
+	for p := range c.index.files {
+		files[p] = c.files[p]
+	}
+	c.mu.Unlock()
 	st.Complete = true
 	for p, ph := range c.index.files {
-		f := c.files[p]
+		f := files[p]
 		if f == nil {
 			st.Complete = false
 			continue
 		}
 		st.Files++
-		filled, err := c.completeFile(f, ph)
+		filled, err := c.completeFile(ctx, f, ph)
 		st.Filled += filled
 		var referenced, held uint64
 		f.mu.Lock()
@@ -498,7 +570,7 @@ func (c *pagesCache) complete() stateipc.CacheStatus {
 // writes them and syncs f. It returns the number of bytes it read.
 //
 // Preconditions: c's writers are done with f.
-func (c *pagesCache) completeFile(f *cacheFile, ph *pageHashes) (uint64, error) {
+func (c *pagesCache) completeFile(ctx context.Context, f *cacheFile, ph *pageHashes) (uint64, error) {
 	f.mu.Lock()
 	err := f.err
 	f.mu.Unlock()
@@ -516,7 +588,7 @@ func (c *pagesCache) completeFile(f *cacheFile, ph *pageHashes) (uint64, error) 
 			continue
 		}
 		pg := buf[:cachePage]
-		if _, err := unix.Pread(int(f.data.Fd()), pg, int64(page*cachePage)); err != nil {
+		if _, err := f.data.ReadAt(pg, int64(page*cachePage)); err != nil {
 			return 0, fmt.Errorf("reading %s back: %w", f.path, err)
 		}
 		c.check(f, page, pg)
@@ -534,24 +606,36 @@ func (c *pagesCache) completeFile(f *cacheFile, ph *pageHashes) (uint64, error) 
 			end++
 		}
 		n := (end - page) * cachePage
-		if err := c.fill(obj, f.path, int64(page*cachePage), buf[:n]); err != nil {
+		if err := c.fill(ctx, obj, f.path, int64(page*cachePage), buf[:n]); err != nil {
 			return filled, err
 		}
-		if _, err := unix.Pwrite(int(f.data.Fd()), buf[:n], int64(page*cachePage)); err != nil {
+		if _, err := f.data.WriteAt(buf[:n], int64(page*cachePage)); err != nil {
 			return filled, fmt.Errorf("writing %s at %d: %w", f.path, page*cachePage, err)
 		}
 		filled += n
 		c.check(f, page, buf[:n])
 		page = end
 	}
-	if err := unix.Fdatasync(int(f.data.Fd())); err != nil {
+	if err := fdatasync(f.data); err != nil {
 		return filled, fmt.Errorf("syncing %s: %w", f.path, err)
 	}
 	return filled, nil
 }
 
+// fdatasync syncs the data of f, which it keeps open as it does.
+func fdatasync(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	if err := rc.Control(func(fd uintptr) { err = unix.Fdatasync(int(fd)) }); err != nil {
+		return err
+	}
+	return err
+}
+
 // fill reads len(buf) bytes of obj, served at p, at off from the store.
-func (c *pagesCache) fill(obj object, p string, off int64, buf []byte) error {
+func (c *pagesCache) fill(ctx context.Context, obj object, p string, off int64, buf []byte) error {
 	in := &s3.GetObjectInput{
 		Bucket: aws.String(obj.bucket),
 		Key:    aws.String(obj.key),
@@ -560,7 +644,7 @@ func (c *pagesCache) fill(obj object, p string, off int64, buf []byte) error {
 	if etag := c.fs.opts.ETags[p]; etag != "" {
 		in.IfMatch = aws.String(etag)
 	}
-	ctx, cancel := context.WithTimeout(c.fs.ctx, c.fs.retry.deadline(uint64(len(buf))))
+	ctx, cancel := context.WithTimeout(ctx, c.fs.retry.deadline(uint64(len(buf))))
 	defer cancel()
 	out, err := c.fs.client.GetObject(ctx, in)
 	if err != nil {
@@ -573,7 +657,8 @@ func (c *pagesCache) fill(obj object, p string, off int64, buf []byte) error {
 	return nil
 }
 
-// writeMarks writes f's marks beside it, in a new file renamed into place.
+// writeMarks writes f's marks beside it, in a new file renamed into place,
+// unless the cache is closed first.
 func (c *pagesCache) writeMarks(f *cacheFile, complete bool) error {
 	var flags uint32
 	if complete {
@@ -593,44 +678,84 @@ func (c *pagesCache) writeMarks(f *cacheFile, complete bool) error {
 
 	marks := f.path + cacheMarksSuffix
 	tmp := path.Join(path.Dir(marks), "."+path.Base(marks)+".tmp")
-	fd, err := unix.Openat2(int(c.dir.Fd()), tmp, &unix.OpenHow{
-		Flags:   unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_CLOEXEC,
-		Mode:    0o600,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+	closed := fmt.Errorf("the cache was closed before the marks of %s were written", f.path)
+	return c.inDir(func(dir int) error {
+		if c.closed.Load() {
+			return closed
+		}
+		fd, err := unix.Openat2(dir, tmp, &unix.OpenHow{
+			Flags:   unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_CLOEXEC,
+			Mode:    0o600,
+			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+		})
+		if err != nil {
+			return fmt.Errorf("creating %s: %w", tmp, err)
+		}
+		tf := os.NewFile(uintptr(fd), tmp)
+		if _, err := tf.Write(b); err != nil {
+			tf.Close()
+			return fmt.Errorf("writing %s: %w", tmp, err)
+		}
+		if err := unix.Fsync(fd); err != nil {
+			tf.Close()
+			return fmt.Errorf("syncing %s: %w", tmp, err)
+		}
+		if err := tf.Close(); err != nil {
+			return fmt.Errorf("closing %s: %w", tmp, err)
+		}
+		c.marksMu.Lock()
+		defer c.marksMu.Unlock()
+		if c.closed.Load() {
+			unix.Unlinkat(dir, tmp, 0)
+			return closed
+		}
+		if err := unix.Renameat(dir, tmp, dir, marks); err != nil {
+			return fmt.Errorf("renaming %s to %s: %w", tmp, marks, err)
+		}
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("creating %s: %w", tmp, err)
-	}
-	tf := os.NewFile(uintptr(fd), tmp)
-	if _, err := tf.Write(b); err != nil {
-		tf.Close()
-		return fmt.Errorf("writing %s: %w", tmp, err)
-	}
-	if err := unix.Fsync(fd); err != nil {
-		tf.Close()
-		return fmt.Errorf("syncing %s: %w", tmp, err)
-	}
-	if err := tf.Close(); err != nil {
-		return fmt.Errorf("closing %s: %w", tmp, err)
-	}
-	if err := unix.Renameat(int(c.dir.Fd()), tmp, int(c.dir.Fd()), marks); err != nil {
-		return fmt.Errorf("renaming %s to %s: %w", tmp, marks, err)
-	}
-	return nil
 }
 
-// close stops the cache's writers and closes its files.
-func (c *pagesCache) close() {
-	c.pending.Wait()
-	close(c.queue)
-	c.writers.Wait()
+// inDir calls fn with the cache directory's descriptor, which it keeps open
+// until fn returns, though the cache be closed meanwhile.
+func (c *pagesCache) inDir(fn func(dir int) error) error {
+	rc, err := c.dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var fnErr error
+	if err := rc.Control(func(fd uintptr) { fnErr = fn(int(fd)) }); err != nil {
+		return err
+	}
+	return fnErr
+}
+
+// closeFiles closes the cache's files: no more is written to them, and no
+// marks are renamed into place.
+func (c *pagesCache) closeFiles() {
+	c.marksMu.Lock()
+	closed := c.closed.Swap(true)
+	c.marksMu.Unlock()
+	if closed {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, f := range c.files {
 		if f != nil {
+			// A write in progress keeps the file open until it returns;
+			// later ones fail.
 			f.data.Close()
 		}
 	}
+}
+
+// close stops the cache's writers and closes its files.
+func (c *pagesCache) close() {
+	c.closeFiles()
+	c.pending.Wait()
+	close(c.queue)
+	c.writers.Wait()
 	for range c.allocated.Load() {
 		unix.Munmap(<-c.free)
 	}
