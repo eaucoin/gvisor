@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -912,6 +913,16 @@ func (c *Container) WaitRestore() error {
 		return err
 	}
 	return c.Sandbox.WaitRestore()
+}
+
+// WaitRestoreSummary waits for the Kernel to have been successfully restored,
+// as WaitRestore does, and returns the restore's summary.
+func (c *Container) WaitRestoreSummary() (*summary.WaitRestore, error) {
+	log.Debugf("Waiting for restore to complete in container, cid: %s", c.ID)
+	if err := c.CheckSandboxRunning(); err != nil {
+		return nil, err
+	}
+	return c.Sandbox.WaitRestoreSummary()
 }
 
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been

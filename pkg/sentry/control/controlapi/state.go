@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -120,6 +121,18 @@ type SaveOpts struct {
 	// pause held by a task blocked in a system call on such pages. See
 	// control.SaveWithOpts.
 	LoadWait time.Duration `json:"load_wait"`
+
+	// If Summary is true, the save answers with its summary
+	// (SaveReply.Summary), where its RPC answers with a SaveReply.
+	Summary bool `json:"summary"`
+}
+
+// SaveReply is the answer to a save.
+type SaveReply struct {
+	// Summary is the save's summary if SaveOpts.Summary was true, without
+	// the description of the image (summary.Checkpoint.Image), which the
+	// caller has. It is nil otherwise.
+	Summary *summary.Checkpoint `json:"summary,omitempty"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary

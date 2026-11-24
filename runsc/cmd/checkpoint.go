@@ -16,15 +16,20 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/runsc/cmd/image"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -51,6 +56,7 @@ type Checkpoint struct {
 	precopyMaxRounds          int
 	precopyThrottle           string
 	loadWait                  time.Duration
+	summaryFile               string
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -91,6 +97,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.DurationVar(&c.precopyBudget, "precopy-budget", 100*time.Millisecond, "with --precopy, stop the rounds when the memory written during the last one would take at most this long to write in the pause.")
 	f.IntVar(&c.precopyMaxRounds, "precopy-max-rounds", 8, "with --precopy, the maximum number of rounds. Rounds also stop when one does not halve the memory left to write.")
 	f.StringVar(&c.precopyThrottle, "precopy-throttle", "off", "with --precopy, when a round does not halve the memory left to write: off (default) stops the rounds; on limits instead, until the checkpoint completes, the rate at which the container's processes dirty memory, all together, to a quarter of the measured write speed, delaying only the processes that write, and goes on (requires --dirty-tracking=wp).")
+	f.StringVar(&c.summaryFile, "summary-file", "", "once the checkpoint has succeeded, write to this path, atomically, a summary of it as one JSON object: the image (its digest, version, layers, memory files and files) and how long the parts of the save took. See pkg/sentry/state/summary for its keys.")
 	f.DurationVar(&c.loadWait, "load-wait", 0, "with a container restored with --background, the longest that the checkpoint waits for the memory that is still being loaded, the memory it saves and the memory the save/restore binary waits for: past it, the checkpoint fails, its image incomplete, and the container runs on as it was, even without --leave-running, its memory loading on. It does not bound a pause held by a process blocked in a system call on such memory. 0 (default) waits for as long as loading takes.")
 	// Must match the default prefix applied by sandbox.Sandbox.Checkpoint.
 	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
@@ -165,11 +172,66 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		util.Fatalf("invalid --precopy-throttle %q: want off or on", c.precopyThrottle)
 	}
 
+	if c.summaryFile != "" {
+		opts.Summary = &summary.Checkpoint{}
+	}
+
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {
 		util.Fatalf("checkpoint failed: %v", err)
 	}
 
+	if c.summaryFile != "" {
+		if err := writeCheckpointSummary(conf, c.summaryFile, c.imagePath, opts.Summary); err != nil {
+			util.Fatalf("checkpoint succeeded, but writing its summary failed: %v", err)
+		}
+	}
+
 	return subcommands.ExitSuccess
+}
+
+// writeCheckpointSummary completes sum, the summary of a checkpoint to
+// imagePath, with the description of the image, and writes it to path
+// atomically.
+func writeCheckpointSummary(conf *config.Config, path, imagePath string, sum *summary.Checkpoint) error {
+	img, err := image.SummaryImage(conf, imagePath)
+	if err != nil {
+		return fmt.Errorf("describing the image: %w", err)
+	}
+	sum.Image = img
+	b, err := json.Marshal(sum)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(path, append(b, '\n'))
+}
+
+// writeFileAtomically writes data to a temporary file beside path, then
+// renames it to path, so that path never holds part of data.
+func writeFileAtomically(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	cu := cleanup.Make(func() {
+		f.Close()
+		os.Remove(tmp)
+	})
+	defer cu.Clean()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Chmod(0644); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	cu.Release()
+	return nil
 }
 
 // CheckpointCompression represents checkpoint image writer behavior. The

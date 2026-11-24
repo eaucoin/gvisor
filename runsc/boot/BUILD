@@ -129,6 +129,7 @@ go_library(
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/state/stateipc",
+        "//pkg/sentry/state/summary",
         "//pkg/sentry/strace",
         "//pkg/sentry/time",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",

@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -129,6 +130,11 @@ type SaveOpts struct {
 	// control.SaveWithOpts.
 	LoadWaitDeadline time.Time
 
+	// If Summary is not nil, the save records in it how long its parts took
+	// and what it wrote: summary.Checkpoint but for the image, which its
+	// caller describes once the image is complete.
+	Summary *summary.Checkpoint
+
 	// If TestOnlySkipRunningLoadWait is true, a save with a load wait does
 	// not wait for the pages still loading before the save/restore binary
 	// runs (control.SaveWithOpts), so that tests reach its waits in
@@ -188,6 +194,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		if err != nil {
 			return fmt.Errorf("pre-copy: %w", err)
 		}
+		if opts.Summary != nil {
+			opts.Summary.Precopy = precopy.Summary()
+		}
 	}
 
 	if opts.PrepareFilesystemsRunning {
@@ -204,6 +213,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		k.Unpause()
 		pause := time.Since(pauseStart)
 		log.Infof("Tasks resumed after save, paused for %v.", pause)
+		if opts.Summary != nil {
+			opts.Summary.Save.Pause = summary.Duration(pause)
+		}
 		if precopy != nil {
 			precopy.RecordPause(pause)
 		}
@@ -256,7 +268,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 			ValidateMetadata:     opts.ValidateMetadata,
 			RestoreValidatesFile: opts.RestoreValidatesFile,
 		}
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine, opts.Parent, precopy, opts.LoadWaitDeadline) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine, opts.Parent, precopy, opts.LoadWaitDeadline, opts.Summary) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts, precopy
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil

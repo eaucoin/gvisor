@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 )
 
 // Pre-copy.
@@ -110,6 +111,9 @@ type precopyStats struct {
 
 	// stop is why the rounds stopped.
 	stop precopyStop
+
+	// took is how long the rounds took.
+	took time.Duration
 
 	// longestStall is the longest that the pre-copy kept tasks from running:
 	// while it started dirty tracking, re-armed the dirty sources for a
@@ -275,6 +279,21 @@ func (p *Precopy) Release() {
 	}
 }
 
+// Summary returns the summary of p's rounds.
+func (p *Precopy) Summary() *summary.Precopy {
+	s := &summary.Precopy{
+		Rounds:    len(p.stats.roundBytes),
+		Duration:  summary.Duration(p.stats.took),
+		Stop:      p.stats.stop.String(),
+		Converged: p.stats.stop == precopyConverged,
+		Skipped:   p.stats.stop == precopySkipped,
+	}
+	for _, n := range p.stats.roundBytes {
+		s.Bytes += n
+	}
+	return s
+}
+
 // RecordPause records that the save that completed p paused the sandbox for
 // d.
 func (p *Precopy) RecordPause(d time.Duration) {
@@ -427,8 +446,9 @@ func (k *Kernel) precopyRounds(ctx context.Context, p *Precopy, parent *checkpoi
 		}
 		if stop != precopyContinue {
 			p.stats.stop = stop
+			p.stats.took = time.Since(start)
 			precopyStops.Increment(precopyStopReasons[stop])
-			log.Infof("Pre-copy done after %d rounds (%v): %d bytes in %v", round+1, stop, copied, time.Since(start))
+			log.Infof("Pre-copy done after %d rounds (%v): %d bytes in %v", round+1, stop, copied, p.stats.took)
 			return nil
 		}
 	}

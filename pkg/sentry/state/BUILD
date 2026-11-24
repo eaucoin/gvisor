@@ -24,6 +24,7 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/state/checkpointimage",
         "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/summary",
         "//pkg/sentry/time",
         "//pkg/sentry/vfs",
         "//pkg/sentry/watchdog",
