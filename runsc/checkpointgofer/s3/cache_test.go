@@ -18,11 +18,16 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"golang.org/x/sys/unix"
 	pb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
@@ -213,5 +218,105 @@ func TestCacheDropsWhatTheQueueCannotHold(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(dir, checkpointfiles.PagesFileName)); err != nil || !bytes.Equal(got, pages) {
 		t.Errorf("cached pages file differs from the object (%v)", err)
+	}
+}
+
+// TestCacheMarksAFileNoReadTouches checks that a staged pages file that the
+// restore never reads, as a layer whose pages are all freed before they are
+// loaded, is filled and marked complete all the same.
+func TestCacheMarksAFileNoReadTouches(t *testing.T) {
+	pages, meta := cacheTestImage(t, cacheTestPages)
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, pages)
+	s.SetObject(checkpointfiles.PagesMetadataFileName, meta)
+	dir, cacheDir := cacheTestDir(t, int64(len(pages)))
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, CacheDir: cacheDir})
+	st := srv.CacheStatus()
+	if !st.Complete || st.Files != 1 || st.Filled != uint64(len(pages)) {
+		t.Errorf("cache status %+v: want complete, 1 file, all %d bytes filled", st, len(pages))
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, checkpointfiles.PagesFileName)); err != nil || !bytes.Equal(got, pages) {
+		t.Errorf("cached pages file differs from the object (%v)", err)
+	}
+	if flags, marked := marksOf(t, dir); flags&cacheMarksComplete == 0 || len(marked) != cacheTestPages {
+		t.Errorf("marks: flags %#x, %d pages marked; want complete, %d", flags, len(marked), cacheTestPages)
+	}
+}
+
+// TestCacheWithoutRoom checks that a staged pages file whose blocks cannot be
+// allocated, as the node's disk is full, is not cached: not written, and
+// without marks.
+func TestCacheWithoutRoom(t *testing.T) {
+	defer func(was func(int, uint32, int64, int64) error) { fallocate = was }(fallocate)
+	fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+	pages, meta := cacheTestImage(t, cacheTestPages)
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, pages)
+	s.SetObject(checkpointfiles.PagesMetadataFileName, meta)
+	dir, cacheDir := cacheTestDir(t, int64(len(pages)))
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, CacheDir: cacheDir})
+	r := openRead(t, srv, checkpointfiles.PagesFileName)
+	buf := make([]byte, len(pages))
+	if c := read(t, r, 0, buf); c.N != uint64(len(pages)) || c.Err != nil || !bytes.Equal(buf, pages) {
+		t.Fatalf("read: %d bytes, %v", c.N, c.Err)
+	}
+	if st := srv.CacheStatus(); st.Complete || st.Files != 0 || st.Held != 0 {
+		t.Errorf("cache status %+v: want incomplete, no file", st)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, checkpointfiles.PagesFileName)); err != nil || !bytes.Equal(got, make([]byte, len(pages))) {
+		t.Errorf("the pages file not cached was written (%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, checkpointfiles.PagesFileName+cacheMarksSuffix)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the pages file not cached has marks (%v)", err)
+	}
+}
+
+// TestCacheStatusTimesOut checks that a cache that CacheStatus cannot
+// complete in time, as the store stalls, is not complete, and that it is not
+// written after: neither by the fill, nor by a read that follows.
+func TestCacheStatusTimesOut(t *testing.T) {
+	defer func(was time.Duration) { cacheStatusTimeout = was }(cacheStatusTimeout)
+	cacheStatusTimeout = 200 * time.Millisecond
+	pages, meta := cacheTestImage(t, cacheTestPages)
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, pages)
+	s.SetObject(checkpointfiles.PagesMetadataFileName, meta)
+	stalled := make(chan struct{})
+	s.Fault = func(w http.ResponseWriter, r *http.Request, op string, n int) bool {
+		if op != "GetObject" || !strings.HasSuffix(r.URL.Path, "/"+checkpointfiles.PagesFileName) {
+			return false
+		}
+		// The store stalls on the pages file, until released.
+		select {
+		case <-r.Context().Done():
+			return true
+		case <-stalled:
+			return false
+		}
+	}
+	dir, cacheDir := cacheTestDir(t, int64(len(pages)))
+	srv := newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, CacheDir: cacheDir})
+	start := time.Now()
+	st := srv.CacheStatus()
+	if took := time.Since(start); took > cacheStatusTimeout+time.Second {
+		t.Errorf("CacheStatus took %v, more than its %v and a second", took, cacheStatusTimeout)
+	}
+	if st.Complete || st.Error == "" {
+		t.Errorf("cache status %+v: want incomplete, saying why", st)
+	}
+
+	// Released, the store answers a read, which the cache does not write.
+	close(stalled)
+	r := openRead(t, srv, checkpointfiles.PagesFileName)
+	buf := make([]byte, len(pages))
+	if c := read(t, r, 0, buf); c.N != uint64(len(pages)) || c.Err != nil || !bytes.Equal(buf, pages) {
+		t.Fatalf("read: %d bytes, %v", c.N, c.Err)
+	}
+	srv.cache.pending.Wait()
+	if got, err := os.ReadFile(filepath.Join(dir, checkpointfiles.PagesFileName)); err != nil || !bytes.Equal(got, make([]byte, len(pages))) {
+		t.Errorf("the cache was written after its status (%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, checkpointfiles.PagesFileName+cacheMarksSuffix)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the cache has marks after its status (%v)", err)
 	}
 }
