@@ -512,6 +512,16 @@ func (mfl *AsyncMFLoader) Image() *checkpointimage.Image {
 	return mfl.image
 }
 
+// LoadStats describes the loading of the pages file of each layer of the
+// image, in layer order, once Wait has returned nil.
+func (mfl *AsyncMFLoader) LoadStats() []pgalloc.AsyncPagesFileLoadStats {
+	stats := make([]pgalloc.AsyncPagesFileLoadStats, len(mfl.apfls))
+	for i, apfl := range mfl.apfls {
+		stats[i] = apfl.Stats()
+	}
+	return stats
+}
+
 // KickoffPrivate notifies the background goroutine of the private MemoryFiles.
 func (mfl *AsyncMFLoader) KickoffPrivate(ctx context.Context, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile) {
 	mfl.privateMFsChan <- privateMFsInfo{

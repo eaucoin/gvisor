@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -185,6 +186,7 @@ func TestPrecopy(t *testing.T) {
 			k.dirty.Sources = []DirtySource{&slowArmSource{DirtySource: src, delay: armDelay}}
 			var (
 				stats        precopyStats
+				sum          summary.Checkpoint
 				roundsBefore = precopyRounds.Value()
 				copiedBefore = precopyBytes.Value()
 				capBefore    = precopyStops.Value(precopyStopReasons[precopyRoundCap])
@@ -193,6 +195,7 @@ func TestPrecopy(t *testing.T) {
 				parent:  parent,
 				precopy: &PrecopyOpts{Budget: 0, MaxRounds: 2},
 				stats:   &stats,
+				summary: &sum,
 			})
 			if err != nil {
 				t.Fatalf("save with pre-copy: %v", err)
@@ -244,6 +247,16 @@ func TestPrecopy(t *testing.T) {
 			}
 			if got := precopyStops.Value(precopyStopReasons[precopyRoundCap]) - capBefore; got != 1 {
 				t.Errorf("%s{reason=round_cap} counted %d pre-copies, want 1", "/checkpoint/precopy_stops", got)
+			}
+
+			// The summary says the same of the rounds, and that the save wrote
+			// the pages dirtied during round 1 and referred to the rounds'
+			// copies for the others it holds.
+			if pc := sum.Precopy; pc == nil || pc.Rounds != 2 || pc.Bytes != copied || pc.Stop != "round_cap" || pc.Converged || pc.Skipped || pc.Duration <= 0 {
+				t.Errorf("summary of the pre-copy: %+v; want 2 rounds that wrote %d bytes in some time, stopped by round_cap", pc, copied)
+			}
+			if p := sum.Pages; p == nil || p.WrittenBytes != 2*hostarch.PageSize || p.WrittenBytes+p.PrecopiedBytes+p.BaseBytes < 16*hostarch.PageSize || (!incremental && p.BaseBytes != 0) {
+				t.Errorf("summary of the pages: %+v; want %d bytes written, the rest of the test's %d bytes pre-copied or, incrementally, in the parent", sum.Pages, 2*hostarch.PageSize, 16*hostarch.PageSize)
 			}
 		})
 	}
@@ -462,6 +475,9 @@ func TestPrecopyAuto(t *testing.T) {
 	// Writing all of memory takes about 130 ms at the measured cost.
 	if _, stats = save(time.Second, nil); stats.stop != precopySkipped || len(stats.roundBytes) != 0 {
 		t.Errorf("save within the budget: %d rounds, stopped by %v; want none, skipped", len(stats.roundBytes), stats.stop)
+	}
+	if got, want := (&Precopy{stats: stats}).Summary(), (&summary.Precopy{Stop: "skipped", Skipped: true}); *got != *want {
+		t.Errorf("summary of a skipped pre-copy: %+v, want %+v", got, want)
 	}
 	if got := precopyStops.Value(precopyStopReasons[precopySkipped]) - skippedBefore; got != 1 {
 		t.Errorf("%s{reason=skipped} counted %d pre-copies, want 1", "/checkpoint/precopy_stops", got)

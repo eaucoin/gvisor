@@ -43,6 +43,7 @@ type Wait struct {
 	restore      bool
 	fsCheckpoint bool
 	fsRestore    bool
+	summary      bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -66,6 +67,7 @@ func (wt *Wait) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&wt.pid, "pid", unsetPID, "select a PID in the container's PID namespace to wait on instead of the container's root process")
 	f.BoolVar(&wt.checkpoint, "checkpoint", false, "wait for the next checkpoint to complete")
 	f.BoolVar(&wt.restore, "restore", false, "wait for the restore to complete")
+	f.BoolVar(&wt.summary, "summary", false, "with -restore, print a summary of the restore once it completes, as one JSON object on one line: how long its parts took, and how the pages of each layer of the image loaded. See pkg/sentry/state/summary for its keys.")
 	f.BoolVar(&wt.fsCheckpoint, "fscheckpoint", false, "wait for the next filesystem checkpoint to complete")
 	f.BoolVar(&wt.fsRestore, "fsrestore", false, "wait for the filesystem restore to complete")
 }
@@ -93,6 +95,9 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if b2i(wt.checkpoint)+b2i(wt.restore)+b2i(wt.fsCheckpoint)+b2i(wt.fsRestore) > 1 {
 		util.Fatalf("at most one of -checkpoint, -restore, -fscheckpoint, -fsrestore may be set")
 	}
+	if wt.summary && !wt.restore {
+		util.Fatalf("-summary requires -restore")
+	}
 
 	conf := args[0].(*config.Config)
 
@@ -115,8 +120,18 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if wt.rootPID != unsetPID || wt.pid != unsetPID {
 			log.Warningf("waiting for restore to complete, ignoring -pid and -rootpid")
 		}
-		if err := c.WaitRestore(); err != nil {
+		if !wt.summary {
+			if err := c.WaitRestore(); err != nil {
+				util.Fatalf("waiting for restore to complete: %v", err)
+			}
+			return subcommands.ExitSuccess
+		}
+		sum, err := c.WaitRestoreSummary()
+		if err != nil {
 			util.Fatalf("waiting for restore to complete: %v", err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(sum); err != nil {
+			util.Fatalf("printing the restore's summary: %v", err)
 		}
 		return subcommands.ExitSuccess
 	}

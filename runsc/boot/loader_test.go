@@ -334,7 +334,7 @@ func TestStartupHeapReleaseOnRestore(t *testing.T) {
 	l.mu.Lock()
 	l.state = restoringStarted
 	l.mu.Unlock()
-	l.ctrl.manager.onRestoreDone(sentryapi.Savings{})
+	l.ctrl.manager.onRestoreDone(sentryapi.Savings{}, nil /* sum */)
 	// A second trigger while the release is pending doesn't add a release.
 	l.releaseStartupHeapWhenIdle()
 	expectOneStartupHeapRelease(t, released)

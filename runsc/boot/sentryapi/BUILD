@@ -38,6 +38,7 @@ go_library(
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/sinks/null",
         "//pkg/sentry/seccheck/sinks/remote",
+        "//pkg/sentry/state/summary",
         "//pkg/state/statefile",
         "//pkg/urpc",
         "//runsc/config",

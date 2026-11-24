@@ -359,6 +359,35 @@ gofer, and none of its pages. `inspect` then shows the objects' URIs as the
 paths of the pages files, and no state file size, which the store does not
 report. The other commands refuse such an image.
 
+### Summaries of checkpoints and restores
+
+A program that drives runsc can get what a checkpoint wrote and how long the
+parts of a checkpoint or a restore took as JSON, rather than from runsc's logs:
+
+-   `runsc checkpoint --summary-file=PATH` writes, once the checkpoint has
+    succeeded, one JSON object to `PATH`, atomically (a temporary file renamed
+    to `PATH`): the image (`image`: its identity, runsc version, the CPU
+    features it was saved with, which a restore requires of the host, and its
+    layers as `runsc image inspect --json` and `runsc image layers` give them,
+    the bytes
+    of each MemoryFile in each layer, and the files of the image directory),
+    how long the save's parts took (`save`: the pause, preparing the
+    filesystems, writing the kernel's state and the memory files), its
+    pre-copy (`precopy`, or `null` without one), and where its pages went
+    (`pages`: written, pre-copied, in the parent image, zero).
+-   `runsc wait --restore --summary` prints, once the restore has completed and
+    every page has loaded, one JSON object on one line: how long the restore's
+    parts took (`restore`: loading the kernel's state, until the sandbox was
+    runnable, until every page had loaded) and how the pages of each layer
+    loaded (`loading`: bytes, time, and the waits of the application for pages
+    not loaded yet).
+
+Durations are in milliseconds, as floats, and every object has a `schema`
+version. Keys are only ever added to a schema: readers should ignore those they
+do not know. `pkg/sentry/state/summary` documents every key. A checkpoint
+without `--summary-file` measures nothing for it; a restore keeps the few
+numbers of its summary whether or not it is asked for.
+
 ### Using checkpointctl
 
 [checkpointctl](https://github.com/checkpoint-restore/checkpointctl) reads the

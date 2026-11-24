@@ -197,6 +197,16 @@ type sliceEntry struct {
 	entry *statEntry
 }
 
+// Counts returns the number of objects and of bytes that the save or the load
+// that s describes encoded or decoded, if its engine counted them: the graph
+// engine does, the legacy engine does not (ok is false).
+func (s *Stats) Counts() (objects, bytes int64, ok bool) {
+	if s == nil || !s.graph.used {
+		return 0, 0, false
+	}
+	return int64(s.graph.objects), int64(s.graph.bytes), true
+}
+
 // String returns a table representation of the stats.
 func (s *Stats) String() string {
 	if s == nil {

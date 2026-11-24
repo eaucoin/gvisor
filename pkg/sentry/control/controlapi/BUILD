@@ -25,6 +25,7 @@ go_library(
         "//pkg/prometheus",
         "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/state/summary",
         "//pkg/sentry/usage",
         "//pkg/sync",
         "//pkg/urpc",

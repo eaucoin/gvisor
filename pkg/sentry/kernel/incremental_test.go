@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 )
 
 // noLimit tells saveImage not to limit the size of the pages file.
@@ -101,6 +103,11 @@ type testSaveOpts struct {
 	precopy         *PrecopyOpts
 	precopyPrivates []*pgalloc.MemoryFile
 	stats           *precopyStats
+
+	// If summary is not nil, the save records in it how long it took to save
+	// the MemoryFiles, where their pages went, and the pre-copy, as
+	// state.SaveOpts.Save and Kernel.SaveTo do.
+	summary *summary.Checkpoint
 }
 
 // saveImageOpts is saveImage with the options in opts.
@@ -143,6 +150,9 @@ func saveImageOpts(t *testing.T, ctx context.Context, k *Kernel, opts testSaveOp
 			// After Release, which completes them.
 			defer func() { *opts.stats = precopy.stats }()
 		}
+		if opts.summary != nil {
+			opts.summary.Precopy = precopy.Summary()
+		}
 		defer precopy.Release()
 	}
 	saved := []*pgalloc.MemoryFile{k.mf}
@@ -152,7 +162,7 @@ func saveImageOpts(t *testing.T, ctx context.Context, k *Kernel, opts testSaveOp
 	saveEpoch, lastRound, delta, err := k.beginSave(ctx, opts.parent, precopy)
 	var img *checkpointimage.Image
 	if err == nil {
-		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, opts.privates, false /* appMFExcludeCommittedZeroPages */, true /* resume */, delta, precopy, lastRound)
+		img, err = k.saveMemoryFiles(ctx, nil, meta, pages, opts.privates, false /* appMFExcludeCommittedZeroPages */, true /* resume */, delta, precopy, lastRound, opts.summary)
 	} else {
 		meta.Close()
 		if pages != nil {
@@ -234,6 +244,43 @@ func (s *testDirtySource) write(t *testing.T, fr memmap.FileRange, i uint64, b b
 	off := fr.Start + i*hostarch.PageSize
 	pwrite(t, s.mf, off, b)
 	s.writes = append(s.writes, memmap.FileRange{off, off + hostarch.PageSize})
+}
+
+// TestIncrementalSaveSummary checks the summary of where an incremental save
+// put the pages of the MemoryFile.
+func TestIncrementalSaveSummary(t *testing.T) {
+	ctx := contexttest.Context(t)
+	k, src, fr := dirtyTestKernel(t, ctx, true /* verify */)
+	var fullSum summary.Checkpoint
+	full, _, err := saveImageOpts(t, ctx, k, testSaveOpts{summary: &fullSum})
+	if err != nil {
+		t.Fatalf("full save: %v", err)
+	}
+	fullPages := full.Layers()[0].PagesSize
+	if want := (summary.Pages{WrittenBytes: fullPages, Extents: len(full.MemoryFiles[0].GetExtents())}); fullSum.Pages == nil || *fullSum.Pages != want || fullSum.Save.MemoryFiles <= 0 {
+		t.Errorf("full save's summary: pages %+v, memory files saved in %v; want %+v, in some time", fullSum.Pages, time.Duration(fullSum.Save.MemoryFiles), want)
+	}
+
+	// Page i of fr holds byte(i+1), as dirtyTestKernel wrote it: page 5
+	// written with its own byte is unchanged, page 9 written with 0 is zero.
+	src.write(t, fr, 3, 0xaa)
+	src.write(t, fr, 5, 6)
+	src.write(t, fr, 9, 0)
+	var sum summary.Checkpoint
+	delta, _, err := saveImageOpts(t, ctx, k, testSaveOpts{parent: &full.Digest, summary: &sum})
+	if err != nil {
+		t.Fatalf("incremental save: %v", err)
+	}
+	want := summary.Pages{
+		WrittenBytes:         hostarch.PageSize,
+		BaseBytes:            fullPages - 3*hostarch.PageSize,
+		UnchangedByHashBytes: hostarch.PageSize,
+		ZeroBytes:            hostarch.PageSize,
+		Extents:              len(delta.MemoryFiles[0].GetExtents()),
+	}
+	if sum.Pages == nil || *sum.Pages != want || sum.Precopy != nil {
+		t.Errorf("incremental save's summary: pages %+v, pre-copy %+v; want %+v, no pre-copy", sum.Pages, sum.Precopy, want)
+	}
 }
 
 func TestIncrementalSave(t *testing.T) {

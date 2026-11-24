@@ -281,6 +281,9 @@ func TestAsyncLoadPrefetchCoalesced(t *testing.T) {
 	if l.apfl.prefetched != setEnd-setStart {
 		t.Fatalf("loading read %d bytes of the working set first, want all %d", l.apfl.prefetched, setEnd-setStart)
 	}
+	if st := l.apfl.Stats(); !st.Done || st.Bytes != uint64(len(img.pages)) || st.WorkingSetBytes != setEnd-setStart || st.WorkingSetReadFirstBytes != setEnd-setStart {
+		t.Errorf("Stats() = %+v, want done, %d bytes read, a working set of %d bytes, all read first", st, len(img.pages), setEnd-setStart)
+	}
 	reads := 0
 	for _, rd := range r.readsSnapshot() {
 		if rd.off < setEnd && rd.off+int64(rd.len) > setStart {

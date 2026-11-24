@@ -228,6 +228,34 @@ type SaveOpts struct {
 	// completes: clean pages that Precopy copied refer to their last copy.
 	// Pages that Precopy neither copied nor knows to be zero refer to Base.
 	Precopy *Precopy
+
+	// If Stats is not nil and PagesFile is not nil, SaveTo adds to it where
+	// the pages of f went.
+	Stats *SaveStats
+}
+
+// SaveStats sums up where MemoryFile.SaveTo put the known-committed pages of
+// MemoryFiles that it saved to a pages file, as its log says per MemoryFile.
+type SaveStats struct {
+	// WrittenBytes is the number of bytes of pages written to the pages file.
+	WrittenBytes uint64
+
+	// PrecopiedBytes is the number of bytes of pages that refer to their last
+	// copy by SaveOpts.Precopy.
+	PrecopiedBytes uint64
+
+	// BaseBytes is the number of bytes of clean pages that refer to
+	// SaveOpts.Base's data, and UnchangedByHashBytes the number of bytes of
+	// pages that do too since their hash is unchanged.
+	BaseBytes            uint64
+	UnchangedByHashBytes uint64
+
+	// ZeroBytes is the number of bytes of pages that are recorded as zero
+	// rather than written.
+	ZeroBytes uint64
+
+	// Extents is the number of extents of the MemoryFiles' pages.
+	Extents int
 }
 
 // SaveTo writes f's state to the given stream.
@@ -626,6 +654,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		img.finish(pb)
 		log.Infof("MemoryFile(%p): %d bytes written to the pages file, %d bytes in the base image (+ %d bytes found unchanged by hash), %d bytes pre-copied, %d bytes zero; %d extents; hashed in %s",
 			f, img.writtenBytes, img.baseBytes, img.refinedBytes, img.precopyBytes, img.zeroBytes, len(pb.Extents), time.Duration(gohacks.Nanotime()-timeMetadataStart))
+		if st := opts.Stats; st != nil {
+			st.WrittenBytes += img.writtenBytes
+			st.PrecopiedBytes += img.precopyBytes
+			st.BaseBytes += img.baseBytes
+			st.UnchangedByHashBytes += img.refinedBytes
+			st.ZeroBytes += img.zeroBytes
+			st.Extents += len(pb.Extents)
+		}
 	}
 	writeRecord := checkpointimage.WriteRecord
 	if amfs == nil {
@@ -1585,6 +1621,10 @@ type AsyncPagesFileLoad struct {
 	// bytesLoaded is protected by mu.
 	bytesLoaded uint64
 
+	// stats describes the loading once it has completed. stats is protected
+	// by mu.
+	stats AsyncPagesFileLoadStats
+
 	// bytesTotal is the number of bytes that the MemoryFiles registered so
 	// far load from the pages file, counted as their pages join the unloaded
 	// sets, before any of their loads can be canceled, and prefetchTotal the
@@ -2330,6 +2370,40 @@ func (apfl *AsyncPagesFileLoad) progress() AsyncPageLoadProgress {
 		Loading: left,
 		Stalled: waiters > 0 && apfl.retrying != nil && apfl.retrying.Retrying(),
 	}
+}
+
+// AsyncPagesFileLoadStats describes the loading of the pages of a pages file.
+type AsyncPagesFileLoadStats struct {
+	// Done is true once the loading has completed successfully. The other
+	// fields are zero until then.
+	Done bool
+
+	// Bytes is the number of bytes that the loading read, in Duration.
+	Bytes    uint64
+	Duration time.Duration
+
+	// Waiters is the number of waiters that waited for pages from the pages
+	// file. WaitedOne is how long at least one of them was waiting,
+	// WaitedTotal how long they waited in all, and WaitedBytes the number of
+	// bytes that at least one of them waited for.
+	Waiters     uint64
+	WaitedOne   time.Duration
+	WaitedTotal time.Duration
+	WaitedBytes uint64
+
+	// WorkingSetBytes is the number of bytes of the working sets of the
+	// MemoryFiles that the pages file holds (LoadOpts.WorkingSet), unless
+	// LoadOpts.Prefetch is PrefetchOff, and WorkingSetReadFirstBytes the
+	// number of them that the loading read before the other pages.
+	WorkingSetBytes          uint64
+	WorkingSetReadFirstBytes uint64
+}
+
+// Stats describes the loading of apfl's pages file, once it has completed.
+func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	return apfl.stats
 }
 
 // Unthrottle allows apfl to read pages without waiters at full parallelism.
@@ -3576,6 +3650,17 @@ func (apfl *AsyncPagesFileLoad) main() {
 				durTotal := time.Duration(aplNanotime() - timeStart)
 				apfl.mu.Lock()
 				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s; %d bytes not read, freed or decommitted first); %d waiters waited %v~%v for %d bytes; background reads in flight bounded to %d bytes (%s); %d bytes of gaps between pages read through", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.bytesCanceled, apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited, apfl.bgBudget.bytes, &apfl.bgBudget, apfl.gapBytesRead)
+				apfl.stats = AsyncPagesFileLoadStats{
+					Done:                     true,
+					Bytes:                    apfl.bytesLoaded,
+					Duration:                 durTotal,
+					Waiters:                  uint64(apfl.totalWaiters),
+					WaitedOne:                apfl.durWaitedOne,
+					WaitedTotal:              apfl.durWaitedTotal,
+					WaitedBytes:              apfl.bytesWaited,
+					WorkingSetBytes:          apfl.prefetchTotal,
+					WorkingSetReadFirstBytes: apfl.prefetched,
+				}
 				if apfl.prefetchTotal != 0 {
 					log.Infof("Async page loading read %d of %d bytes of working sets first", apfl.prefetched, apfl.prefetchTotal)
 				}
