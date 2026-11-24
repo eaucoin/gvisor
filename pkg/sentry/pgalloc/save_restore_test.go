@@ -397,6 +397,50 @@ func TestSaveLoad(t *testing.T) {
 	}
 }
 
+// TestSaveLoadStats checks what SaveOpts.Stats and AsyncPagesFileLoad.Stats
+// say of an image of MemoryFiles saved to a pages file and loaded from it.
+func TestSaveLoadStats(t *testing.T) {
+	const n = 2
+	var (
+		fs           [n]*MemoryFile
+		restored     [n]*MemoryFile
+		nonZeroBytes uint64
+	)
+	for i := range fs {
+		fs[i] = newTestMemoryFile(t, testMemoryFileOpts{expectHugepages: true})
+		nonZeroBytes += buildTestMemory(t, fs[i], uint64(i+1)).nonZeroBytes
+		restored[i] = newTestMemoryFile(t, testMemoryFileOpts{expectHugepages: true})
+	}
+	var stats SaveStats
+	img := saveImage(t, SaveOpts{Stats: &stats}, fs[:]...)
+	extents := 0
+	for _, mf := range img.img.MemoryFiles {
+		extents += len(mf.GetExtents())
+	}
+	// Without a base image or a pre-copy, every page with data is written,
+	// and the scan leaves zero pages out of the image.
+	if want := (SaveStats{WrittenBytes: nonZeroBytes, Extents: extents}); stats != want || extents == 0 {
+		t.Errorf("SaveOpts.Stats = %+v, want %+v (and some extents)", stats, want)
+	}
+
+	l := startLoad(t, img, newTestPagesFile(t, img.pages, testPagesFileOpts{}), restored[:]...)
+	t.Cleanup(func() {
+		for _, f := range restored {
+			releaseAll(t, f)
+		}
+	})
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	st := l.apfl.Stats()
+	if !st.Done || st.Bytes != nonZeroBytes || st.Duration <= 0 || st.WorkingSetBytes != 0 || st.WorkingSetReadFirstBytes != 0 {
+		t.Errorf("Stats() = %+v, want done, %d bytes read in some time, no working set", st, nonZeroBytes)
+	}
+	if st.Waiters == 0 && (st.WaitedTotal != 0 || st.WaitedOne != 0 || st.WaitedBytes != 0) {
+		t.Errorf("Stats() = %+v: no waiter, but waits", st)
+	}
+}
+
 // TestSaveLoadPrivateMemoryFiles saves several MemoryFiles to one pages file,
 // as the kernel saves the application MemoryFile and private MemoryFiles, and
 // loads them back in order.

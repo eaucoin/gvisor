@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -148,7 +149,7 @@ func (l *Loader) SaveAsync() (err error) {
 	l.saveFDs = nil
 
 	go func() {
-		_ = l.save(o)
+		_ = l.save(o, nil /* sum */)
 	}()
 	// Loader.save() takes over the responsibility of calling OnCheckpointAttempt() when
 	// it completes.
@@ -249,6 +250,12 @@ type restorer struct {
 	// timer is the timer for the restore process.
 	// The `restorer` owns the timer and will end it when restore is complete.
 	timer *timing.Timer
+
+	// start is when the sandbox was asked to restore (containerManager.Restore).
+	start time2.Time
+
+	// sum sums up the restore, as it goes.
+	sum summary.Restore
 
 	// If background is true, pagesFile may continue to be read after
 	// restorer.restore() returns.
@@ -634,9 +641,10 @@ func (r *restorer) restore(l *Loader) error {
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, completeRestoreOptions(l.root.conf, l.containerSpecs), r.timer.Fork("kernel load")); err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, completeRestoreOptions(l.root.conf, l.containerSpecs), r.timer.Fork("kernel load"), &r.sum); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
 	}
+	r.sum.OverallLoad = summary.Duration(time2.Since(r.start))
 	// Stop the restore if a hash does not cover all of the statefile data.
 	if err := r.stateFile.Verify(); err != nil {
 		return fmt.Errorf("statefile integrity check failed: %w", err)
@@ -828,9 +836,39 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		log.Warningf("Failed to calculate walltime savings: %v", err)
 	}
 
-	r.cm.onRestoreDone(s)
+	r.cm.onRestoreDone(s, r.summarize())
 	timeline.Reached("kernel notified")
 	log.Infof("Restore successful")
+}
+
+// summarize returns the summary of the restore, which has just succeeded.
+func (r *restorer) summarize() *summary.WaitRestore {
+	sum := &summary.WaitRestore{
+		Schema:  summary.Schema,
+		Restore: r.sum,
+		Loading: []summary.Loading{},
+	}
+	sum.Restore.Boot = summary.Duration(r.start.Sub(starttime.Get()))
+	sum.Restore.Restore = summary.Duration(time2.Since(r.start))
+	if r.asyncMFLoader != nil {
+		for _, st := range r.asyncMFLoader.LoadStats() {
+			l := summary.Loading{
+				Bytes:       st.Bytes,
+				Duration:    summary.Duration(st.Duration),
+				Waiters:     st.Waiters,
+				Waited:      summary.Duration(st.WaitedTotal),
+				WaitedBytes: st.WaitedBytes,
+				WaitedAny:   summary.Duration(st.WaitedOne),
+			}
+			if st.Duration > 0 {
+				l.BackgroundBandwidth = float64(st.Bytes) * 1e-6 / st.Duration.Seconds()
+			}
+			sum.Loading = append(sum.Loading, l)
+			sum.Restore.WorkingSetBytes += st.WorkingSetBytes
+			sum.Restore.WorkingSetReadFirstBytes += st.WorkingSetReadFirstBytes
+		}
+	}
+	return sum
 }
 
 // startWorkingSetRecording starts recording the working set of the restored
@@ -981,7 +1019,9 @@ func tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealt
 	return oldMachineCycles - curCycle, true
 }
 
-func (l *Loader) save(o *controlapi.SaveOpts) error {
+// save saves the sandbox as o says. If sum is not nil, it records in sum how
+// long the parts of the save took and what it wrote (state.SaveOpts.Summary).
+func (l *Loader) save(o *controlapi.SaveOpts, sum *summary.Checkpoint) error {
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)
@@ -995,6 +1035,7 @@ func (l *Loader) save(o *controlapi.SaveOpts) error {
 		saveOpts.PagesFile = stateio.NewRateLimitedWriter(saveOpts.PagesFile, rate)
 	}
 	saveOpts.TestOnlySkipRunningLoadWait = l.root.conf.TestOnlySaveRunningLoadWait == config.SaveRunningLoadWaitSkip
+	saveOpts.Summary = sum
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }

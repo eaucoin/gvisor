@@ -40,6 +40,7 @@ go_library(
         "//pkg/sentry/seccheck",
         "//pkg/sentry/state/checkpointfiles",
         "//pkg/sentry/state/checkpointimage",
+        "//pkg/sentry/state/summary",
         "//pkg/state/statefile",
         "//pkg/sync",
         "//pkg/tcpip",

@@ -77,6 +77,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack" // Top-level inet provider.
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -363,6 +364,11 @@ type Loader struct {
 	//
 	// +checklocks:mu
 	savings sentryapi.Savings
+
+	// restoreSummary sums up the restore once it has succeeded.
+	//
+	// +checklocks:mu
+	restoreSummary *summary.WaitRestore
 
 	fsRestore *fsRestore
 

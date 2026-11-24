@@ -21,6 +21,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -187,6 +188,20 @@ const ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
 
 // ContMgrWaitRestore waits for the Kernel restore to complete.
 const ContMgrWaitRestore = "containerManager.WaitRestore"
+
+// WaitRestoreOpts contains options for ContMgrWaitRestore.
+type WaitRestoreOpts struct {
+	// If Summary is true, the call answers with the restore's summary
+	// (WaitRestoreReply.Summary).
+	Summary bool `json:"summary"`
+}
+
+// WaitRestoreReply is the answer to ContMgrWaitRestore.
+type WaitRestoreReply struct {
+	// Summary is the restore's summary if WaitRestoreOpts.Summary was true,
+	// and nil otherwise.
+	Summary *summary.WaitRestore `json:"summary,omitempty"`
+}
 
 // ContMgrWaitFSCheckpoint waits for the next filesystem checkpoint save to
 // complete.

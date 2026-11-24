@@ -57,6 +57,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -1996,7 +1997,21 @@ func (s *Sandbox) WaitCheckpoint() error {
 // WaitRestore waits for the Kernel to have been successfully restored.
 func (s *Sandbox) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)
-	return s.call(sentryapi.ContMgrWaitRestore, nil, nil)
+	return s.call(sentryapi.ContMgrWaitRestore, &sentryapi.WaitRestoreOpts{}, nil)
+}
+
+// WaitRestoreSummary waits for the Kernel to have been successfully restored,
+// as WaitRestore does, and returns the restore's summary.
+func (s *Sandbox) WaitRestoreSummary() (*summary.WaitRestore, error) {
+	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)
+	var reply sentryapi.WaitRestoreReply
+	if err := s.call(sentryapi.ContMgrWaitRestore, &sentryapi.WaitRestoreOpts{Summary: true}, &reply); err != nil {
+		return nil, err
+	}
+	if reply.Summary == nil {
+		return nil, fmt.Errorf("the sandbox did not answer with the restore's summary")
+	}
+	return reply.Summary, nil
 }
 
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been
@@ -2154,6 +2169,10 @@ type CheckpointOpts struct {
 	// LoadWait bounds the save's wait for pages still being loaded; see
 	// controlapi.SaveOpts.LoadWait.
 	LoadWait time.Duration
+
+	// If Summary is not nil, a checkpoint that succeeds sets it to the save's
+	// summary, without the description of the image (summary.Checkpoint.Image).
+	Summary *summary.Checkpoint
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2191,6 +2210,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		PrecopyMaxRounds: opts.PrecopyMaxRounds,
 		PrecopyThrottle:  opts.PrecopyThrottle,
 		LoadWait:         opts.LoadWait,
+		Summary:          opts.Summary != nil,
 	}
 	if opts.StateEngine != nil {
 		useGraph := *opts.StateEngine == config.StateEngineGraph
@@ -2216,7 +2236,8 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
 		log.Warningf("[Lifecycle CPU] Checkpoint will run under the application CPU limit: %v. This slows down gVisor checkpointing speed.", err)
 	}
-	if err := s.call(sentryapi.ContMgrCheckpoint, &opt, nil); err != nil {
+	var reply controlapi.SaveReply
+	if err := s.call(sentryapi.ContMgrCheckpoint, &opt, &reply); err != nil {
 		// The application may still be running.
 		if err := s.applyAppCPULimit(cpuPhaseLifecycle); err != nil {
 			log.Warningf("[Lifecycle CPU] Cannot restore the application CPU limit after failed checkpoint: %v", err)
@@ -2229,6 +2250,12 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		return fmt.Errorf("checkpointing container %q: %w", cid, err)
 	}
 	s.Checkpointed = true
+	if opts.Summary != nil {
+		if reply.Summary == nil {
+			return fmt.Errorf("checkpointing container %q: the sandbox did not answer with the save's summary", cid)
+		}
+		*opts.Summary = *reply.Summary
+	}
 	if opts.Resume {
 		return s.applyAppCPULimit(cpuPhaseLifecycle)
 	}

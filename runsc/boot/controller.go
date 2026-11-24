@@ -44,6 +44,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
@@ -360,12 +361,20 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 }
 
 // Checkpoint pauses a sandbox and saves its state.
-func (cm *containerManager) Checkpoint(o *controlapi.SaveOpts, _ *struct{}) error {
+func (cm *containerManager) Checkpoint(o *controlapi.SaveOpts, reply *controlapi.SaveReply) error {
 	log.Debugf("containerManager.Checkpoint")
 	o.RunscVersion = version.Version()
 	cm.l.lifecycleCPUs.hold()
 	defer cm.l.lifecycleCPUs.release()
-	return cm.l.save(o)
+	var sum *summary.Checkpoint
+	if o.Summary {
+		sum = &summary.Checkpoint{Schema: summary.Schema}
+	}
+	if err := cm.l.save(o, sum); err != nil {
+		return err
+	}
+	reply.Summary = sum
+	return nil
 }
 
 // PortForward initiates a port forward to the container.
@@ -383,6 +392,7 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.RestoreReply) (retErr error) {
+	start := gtime.Now()
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -446,6 +456,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		background: o.Background,
 		paused:     o.Paused,
 		timer:      timer,
+		start:      start,
 	}
 
 	// Create the main MemoryFile.
@@ -718,10 +729,13 @@ func (cm *containerManager) onRestoreFailed(err error) {
 	cm.restorer = nil
 }
 
-func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
+// onRestoreDone completes a restore that succeeded, which saved s and which
+// sum sums up.
+func (cm *containerManager) onRestoreDone(s sentryapi.Savings, sum *summary.WaitRestore) {
 	cm.l.mu.Lock()
 	cm.l.state = restored
 	cm.l.savings = s
+	cm.l.restoreSummary = sum
 	cm.l.mu.Unlock()
 	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
@@ -950,10 +964,15 @@ func (cm *containerManager) WaitCheckpoint(*struct{}, *struct{}) error {
 	return err
 }
 
-func (cm *containerManager) WaitRestore(*struct{}, *struct{}) error {
+func (cm *containerManager) WaitRestore(opts *sentryapi.WaitRestoreOpts, reply *sentryapi.WaitRestoreReply) error {
 	log.Debugf("containerManager.WaitRestore")
 	err := cm.l.waitRestore()
 	log.Debugf("containerManager.WaitRestore done, err = %v", err)
+	if err == nil && opts.Summary {
+		cm.l.mu.Lock()
+		reply.Summary = cm.l.restoreSummary
+		cm.l.mu.Unlock()
+	}
 	return err
 }
 

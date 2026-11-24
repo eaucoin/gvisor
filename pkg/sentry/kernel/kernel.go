@@ -79,6 +79,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/summary"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
 	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
@@ -895,10 +896,15 @@ func setMemoryFileSaveOpts(opts *pgalloc.SaveOpts, mf *pgalloc.MemoryFile, owner
 // stateFile before, such as its header, and what precopy wrote are
 // incomplete.
 //
+// If sum is not nil, SaveTo records in it how long the parts of the save that
+// it runs took, what it wrote of the kernel's state, and where the pages of
+// the MemoryFiles went (sum.Save, but for the pause and the collection after
+// the save, which are its caller's, and sum.Pages).
+//
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, graphEngine *bool, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time, sum *summary.Checkpoint) error {
 	// The bypass is part of the saved task state, so it is armed before the
 	// state is written and covers both resuming after the save and restoring.
 	k.armSeccompRestartSyscallBypasses()
@@ -938,19 +944,28 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 			state.EnableGraphEngine(*graphEngine)
 			defer state.EnableGraphEngine(prevGraphEngine)
 		}
-		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, parent, precopy, loadWaitDeadline, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, parent, precopy, loadWaitDeadline, sum, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
 }
 
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, parent *checkpointimage.Digest, precopy *Precopy, loadWaitDeadline time.Time, sum *summary.Checkpoint, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) (retErr error) {
 	saveStart := time.Now()
 
 	// Discard unsavable mappings, such as those for host file descriptors.
 	if err := k.invalidateUnsavableMappings(ctx); err != nil {
 		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
+	}
+	if sum != nil {
+		vfsOpts.Took = map[string]time.Duration{unsavableMappingsSummaryKey: time.Since(saveStart)}
+		defer func() {
+			sum.Save.PrepareSave = make(map[string]summary.Duration, len(vfsOpts.Took))
+			for name, took := range vfsOpts.Took {
+				sum.Save.PrepareSave[name] = summary.Duration(took)
+			}
+		}()
 	}
 
 	// Capture all private memory files.
@@ -1029,7 +1044,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			image, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, delta, precopy, lastRound) // transfers ownership
+			image, mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, delta, precopy, lastRound, sum) // transfers ownership
 		}()
 		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -1047,6 +1062,9 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		return err
 	}
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
+	if sum != nil {
+		sum.Save.CPUID = summary.Duration(time.Since(cpuidStart))
+	}
 
 	// Save the timekeeper's state.
 
@@ -1059,6 +1077,9 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		k.rootNetworkNamespace.Stack().Pause()
 		defer k.rootNetworkNamespace.Stack().Resume()
 		log.Infof("Pausing root network namespace took [%s].", time.Since(netstackPauseStart))
+		if sum != nil {
+			sum.Save.NetworkPause = summary.Duration(time.Since(netstackPauseStart))
+		}
 	}
 
 	// Save the kernel state.
@@ -1069,6 +1090,13 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	}
 	log.Infof("Kernel save stats: %s", stats.String())
 	log.Infof("Kernel save took [%s].", time.Since(kernelStart))
+	if sum != nil {
+		sum.Save.Kernel = summary.Duration(time.Since(kernelStart))
+		if objects, bytes, ok := stats.Counts(); ok {
+			sum.Save.KernelObjects = &objects
+			sum.Save.KernelBytes = &bytes
+		}
+	}
 
 	if fsOpts != nil {
 		fsSaveStart := time.Now()
@@ -1078,6 +1106,9 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			}
 		}
 		log.Infof("Split filesystem save took [%s].", time.Since(fsSaveStart))
+		if sum != nil {
+			sum.Save.SplitFS = summary.Millis(time.Since(fsSaveStart))
+		}
 		fsCleanup.Release()
 	}
 
@@ -1094,7 +1125,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return mfSaveErr
 		}
 	} else {
-		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, nil /* delta */, nil /* precopy */, nil /* lastRound */)
+		_, mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume, nil /* delta */, nil /* precopy */, nil /* lastRound */, sum)
 		if mfSaveErr != nil {
 			return mfSaveErr
 		}
@@ -1108,8 +1139,17 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	}
 
 	log.Infof("Overall save took [%s].", time.Since(saveStart))
+	if sum != nil {
+		sum.Save.Overall = summary.Duration(time.Since(saveStart))
+	}
 	return nil
 }
+
+// unsavableMappingsSummaryKey is the key of summary.Save.PrepareSave under
+// which SaveTo records how long it took to invalidate unsavable mappings,
+// beside the filesystem type names under which vfs.PrepareSave records how
+// long the filesystems took to prepare.
+const unsavableMappingsSummaryKey = "unsavable_mappings"
 
 // BeforeResume is called before the kernel is resumed after save.
 func (k *Kernel) BeforeResume(ctx context.Context) {
@@ -1123,8 +1163,10 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // both pagesMetadata and pagesFile (even if it returns a non-nil error), and
 // MemoryFile state will be saved to pagesMetadata and pagesFile, or
 // precopy's pages file. If precopy is not nil, lastRound holds the pages
-// dirtied during its last round.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, resume bool, delta *incrementalSave, precopy *Precopy, lastRound *DirtyEpochResult) (*checkpointimage.Image, error) {
+// dirtied during its last round. If sum is not nil, saveMemoryFiles records in
+// it how long it took (sum.Save.MemoryFiles) and, with pagesMetadata, where
+// the pages went (sum.Pages), and nothing else.
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, resume bool, delta *incrementalSave, precopy *Precopy, lastRound *DirtyEpochResult, sum *summary.Checkpoint) (*checkpointimage.Image, error) {
 	memoryStart := time.Now()
 
 	// Private MemoryFiles are saved after the application MemoryFile, in the
@@ -1166,6 +1208,10 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
 		ExitAfterSaving:           !resume,
 		PageHashes:                image.PageHash != 0,
+	}
+	var pageStats pgalloc.SaveStats
+	if sum != nil {
+		mfOpts.Stats = &pageStats
 	}
 	var (
 		asyncPageSaveWg      sync.WaitGroup
@@ -1228,6 +1274,19 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	}
 	took := time.Since(memoryStart)
 	log.Infof("Memory files save took [%s].", took)
+	if sum != nil {
+		sum.Save.MemoryFiles = summary.Duration(took)
+		if pagesMetadata != nil {
+			sum.Pages = &summary.Pages{
+				WrittenBytes:         pageStats.WrittenBytes,
+				PrecopiedBytes:       pageStats.PrecopiedBytes,
+				BaseBytes:            pageStats.BaseBytes,
+				UnchangedByHashBytes: pageStats.UnchangedByHashBytes,
+				ZeroBytes:            pageStats.ZeroBytes,
+				Extents:              pageStats.Extents,
+			}
+		}
+	}
 	if img != nil && precopy == nil {
 		if n := img.Proto.Layers[0].PagesSize; n >= 1<<20 {
 			k.setPagesWriteCost(took * (1 << 20) / time.Duration(n))
@@ -1269,8 +1328,12 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 
 // LoadFrom restores k from r.
 //
+// If sum is not nil, LoadFrom records in it how long it took to load the CPU
+// features, the kernel's state, and the MemoryFiles if it loads them itself
+// (asyncMFLoader is nil).
+//
 // Preconditions: k is not in use.
-func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, networkArgs inet.NetworkArgs, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, timeline *timing.Timeline) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, networkArgs inet.NetworkArgs, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, timeline *timing.Timeline, sum *summary.Restore) error {
 	defer timeline.End()
 	loadStart := time.Now()
 
@@ -1290,6 +1353,9 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 		return err
 	}
 	log.Infof("CPUID load took [%s].", time.Since(cpuidStart))
+	if sum != nil {
+		sum.CPUIDLoad = summary.Duration(time.Since(cpuidStart))
+	}
 	timeline.Reached("CPUID loaded")
 
 	// Verify that the FeatureSet is usable on this host. We do this before
@@ -1313,6 +1379,9 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 	}
 	log.Infof("Kernel load stats: %s", stats.String())
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
+	if sum != nil {
+		sum.KernelLoad = summary.Duration(time.Since(kernelStart))
+	}
 	timeline.Reached("Kernel loaded")
 
 	if asyncMFLoader == nil {
@@ -1321,6 +1390,9 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 			return fmt.Errorf("failed to load memory files: %w", err)
 		}
 		log.Infof("Memory files load took [%s].", time.Since(mfStart))
+		if sum != nil {
+			sum.MemoryLoad = summary.Millis(time.Since(mfStart))
+		}
 		timeline.Reached("Memory files loaded")
 	} else {
 		// Timekeeper restore below tries writing to the main MF. If async page

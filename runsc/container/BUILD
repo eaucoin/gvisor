@@ -24,6 +24,7 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/control/controlapi",
         "//pkg/sentry/hostmm",
+        "//pkg/sentry/state/summary",
         "//pkg/sighandling",
         "//pkg/sync",
         "//pkg/unet",

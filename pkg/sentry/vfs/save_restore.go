@@ -18,6 +18,7 @@ import (
 	goContext "context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -100,7 +101,15 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context, opts PrepareSaveO
 	}()
 	for _, fs := range fss {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
-			if err := ext.PrepareSave(ctx, opts); err != nil {
+			var start time.Time
+			if opts.Took != nil {
+				start = time.Now()
+			}
+			err := ext.PrepareSave(ctx, opts)
+			if opts.Took != nil {
+				opts.Took[fs.fsType.Name()] += time.Since(start)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -124,6 +133,10 @@ type PrepareSaveOptions struct {
 	// CompleteRestoreOptions.ValidateFile takes them: those that the restore
 	// will validate. Otherwise they save that of every regular file.
 	RestoreValidatesFile func(fsID checkpoint.ResourceID, path string) bool
+
+	// If Took is not nil, VirtualFilesystem.PrepareSave adds to it how long
+	// the filesystems of each type took to prepare, by filesystem type name.
+	Took map[string]time.Duration
 }
 
 // SavesRemoteMetadata returns true if filesystems save the remote metadata of
