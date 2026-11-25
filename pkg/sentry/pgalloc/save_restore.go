@@ -3491,7 +3491,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		// Fill remaining queue with reads for pages with no waiters.
 		throttled := apfl.throttled.Load()
-		if apfl.canEnqueue() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
+		// Spike: throttled holds every read of pages without waiters, until
+		// Unthrottle, rather than letting one through at a time.
+		if apfl.canEnqueue() && !throttled {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of

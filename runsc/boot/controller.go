@@ -476,9 +476,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 		// the first reads, which a throttle phase would serialize.
 		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(image, pagesFiles, cm.restorer.mainMF, prefetch, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{
 			Trace: cm.l.root.conf.AsyncLoadTrace == config.AsyncLoadTraceAll,
-			// Spike: background reads one at a time until the kernel is loaded,
-			// after every container is restored, to tell whether the loading's
-			// load on the node delays the restore of a pod's app container.
+			// Spike: no background reads until the kernel is loaded, after every
+			// container is restored, to tell whether the loading's load on the
+			// node delays the restore of a pod's app container.
 			Throttled: true,
 		}) // transfers ownership
 		pagesFiles = nil
