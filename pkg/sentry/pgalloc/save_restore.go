@@ -1552,6 +1552,21 @@ type AsyncPagesFileLoad struct {
 	// loader goroutine.
 	lfStatus syncevent.Waiter
 
+	// failReason, once not nil, is why FailAsyncPageLoads asked the async
+	// page loader goroutine to end loading as a failed read does; failC is
+	// closed then, so that the goroutine stops waiting for reads in flight to
+	// complete (see main). failReason and failC are set once, by failOnce.
+	// failC is immutable.
+	failReason atomic.Pointer[string]
+	failC      chan struct{}
+	failOnce   sync.Once
+
+	// endedByFail is true once the async page loader goroutine ended
+	// loading for failReason; ended is closed as the goroutine ends. ended
+	// is immutable.
+	endedByFail atomicbitops.Bool
+	ended       chan struct{}
+
 	// Padding before state used mostly by the async page loader goroutine:
 	_ [hostarch.CacheLineSize]byte
 
@@ -1698,6 +1713,8 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	// aplLFFail is notified by fail.
+	aplLFFail
 )
 
 type aplFileRange struct {
@@ -2221,6 +2238,8 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		timeline:         timeline.Fork("async page loading"),
 		doneCallback:     doneCallback,
 		wake:             make(chan struct{}, 1),
+		failC:            make(chan struct{}),
+		ended:            make(chan struct{}),
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
 		throttled:        atomicbitops.FromBool(opts.Throttled),
@@ -2330,6 +2349,78 @@ func (apfl *AsyncPagesFileLoad) progress() AsyncPageLoadProgress {
 		Loading: left,
 		Stalled: waiters > 0 && apfl.retrying != nil && apfl.retrying.Retrying(),
 	}
+}
+
+// FailAsyncPageLoads ends every asynchronous page load in progress as a read
+// of its pages file that fails ends it: its reads in flight are stopped, the
+// pages it has not loaded are never loaded, and what waits for them fails, as
+// a save of the sandbox does ("previous async page loading failed"). Unlike a
+// failed read, it does not wait for the pages file to answer: a load whose
+// reads hang, as on a store that is away, ends at once. reason is logged. It
+// returns the number of loads it ended, once each has ended, within
+// failAsyncPageLoadsWait: a load that completed as it was asked, before its
+// loader saw the request, is not among them; one that has not ended within
+// the wait, as one whose pages file cannot be woken (not a
+// stateio.WaitOrAsyncReader) and ends at its next completion, is.
+func FailAsyncPageLoads(reason string) int {
+	activeLoads.mu.Lock()
+	loads := make([]*AsyncPagesFileLoad, 0, len(activeLoads.loads))
+	for apfl := range activeLoads.loads {
+		loads = append(loads, apfl)
+	}
+	activeLoads.mu.Unlock()
+	for _, apfl := range loads {
+		apfl.fail(reason)
+	}
+	deadline := time.After(failAsyncPageLoadsWait)
+	ended := 0
+	for _, apfl := range loads {
+		select {
+		case <-apfl.ended:
+		case <-deadline:
+			// Past the wait, the loads not ended yet are taken as ended
+			// for reason, at their next completion.
+			deadline = closedTimeChan
+		}
+		select {
+		case <-apfl.ended:
+			if apfl.endedByFail.Load() {
+				ended++
+			}
+		default:
+			ended++
+		}
+	}
+	return ended
+}
+
+// failAsyncPageLoadsWait bounds how long FailAsyncPageLoads waits for the
+// loads it asked to end. It is a variable for tests.
+var failAsyncPageLoadsWait = 10 * time.Second
+
+// closedTimeChan is a channel of times that is always ready, which a wait
+// whose deadline has passed waits on.
+var closedTimeChan = func() <-chan time.Time {
+	c := make(chan time.Time)
+	close(c)
+	return c
+}()
+
+// fail asks the async page loader goroutine to end loading as a failed read
+// does, for reason, wherever it waits (see main). It is idempotent: the first
+// reason is kept.
+func (apfl *AsyncPagesFileLoad) fail(reason string) {
+	apfl.failOnce.Do(func() {
+		apfl.failReason.Store(&reason)
+		close(apfl.failC)
+	})
+	// Wake the goroutine where it waits for reads that it could add to
+	// (WaitOr on wake), or for pages to load.
+	select {
+	case apfl.wake <- struct{}{}:
+	default:
+	}
+	apfl.lfStatus.Notify(aplLFFail)
 }
 
 // Unthrottle allows apfl to read pages without waiters at full parallelism.
@@ -3361,6 +3452,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
+		close(apfl.ended)
 	}()
 
 	maxParallel := apfl.ar.MaxParallel()
@@ -3420,6 +3512,17 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}
 
 	for {
+		// FailAsyncPageLoads ends loading as a failed read does, the reads
+		// in flight stopped as it ends.
+		if reason := apfl.failReason.Load(); reason != nil {
+			log.Warningf("Async page loading failed: %s", *reason)
+			apfl.mu.Lock()
+			apfl.errVal.Store(linuxerr.EIO)
+			apfl.mu.Unlock()
+			apfl.endedByFail.Store(true)
+			return
+		}
+
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
@@ -3571,6 +3674,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 				apfl.lfStatus.Ack(aplLFPending)
 				continue
 			}
+			if ev&aplLFDone == 0 && ev&aplLFFail != 0 {
+				// FailAsyncPageLoads ends loading, at the top of the loop.
+				continue
+			}
 			if ev&aplLFDone != 0 {
 				// Successfully completed all loading for all MemoryFiles.
 				durTotal := time.Duration(aplNanotime() - timeStart)
@@ -3586,15 +3693,31 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 
 		// Wait for any number of reads to complete, or, if a read can be
-		// enqueued, for a waiter to need one.
+		// enqueued, for a waiter to need one; or for FailAsyncPageLoads, which
+		// wakes both waits (fail), to end loading. A pages file that cannot
+		// wait so (a stateio.AsyncReader that is not a WaitOrAsyncReader) ends
+		// it at its next completion.
 		var err error
-		if apfl.waitOr != nil && apfl.canEnqueue() {
+		switch {
+		case apfl.waitOr != nil && apfl.canEnqueue():
 			completions, err = apfl.waitOr.WaitOr(completions[:0], apfl.wake)
-			if err == nil && len(completions) == 0 {
-				continue
+		case apfl.waitOr != nil:
+			// With no read to add, only a completion or FailAsyncPageLoads
+			// ends this wait. A WaitOr may still return without completions,
+			// as stateipc's does for a wake forwarded to its server after
+			// the wait it was meant for had returned: the loop's top, which
+			// adds reads, must not run then.
+			for {
+				completions, err = apfl.waitOr.WaitOr(completions[:0], apfl.failC)
+				if err != nil || len(completions) != 0 || apfl.failReason.Load() != nil {
+					break
+				}
 			}
-		} else {
+		default:
 			completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		}
+		if err == nil && len(completions) == 0 {
+			continue
 		}
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)

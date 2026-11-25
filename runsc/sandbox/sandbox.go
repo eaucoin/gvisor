@@ -2973,6 +2973,18 @@ func (s *Sandbox) Resume(cid string) error {
 	return nil
 }
 
+// FailLoad ends the loading of the pages of the sandbox's restore that goes on
+// in the background, for reason, as containerManager.FailLoad says, and
+// returns how many loads it ended.
+func (s *Sandbox) FailLoad(reason string) (int, error) {
+	log.Debugf("Fail the loading of the pages of sandbox %q", s.ID)
+	var ended int
+	if err := s.call(sentryapi.ContMgrFailLoad, &reason, &ended); err != nil {
+		return 0, fmt.Errorf("failing the loading of the pages of sandbox %q: %w", s.ID, err)
+	}
+	return ended, nil
+}
+
 // KillPaused sends SIGKILL to a container of a paused sandbox, to all of its
 // processes if all is true, and resumes the sandbox so that the signal takes
 // effect, without the post-resume work. If cid is the root container, or if

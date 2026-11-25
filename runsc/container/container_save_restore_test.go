@@ -1417,6 +1417,46 @@ func TestCheckpointRestoreS3StoreAwayLoadWait(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreS3StoreAwayFailLoad checks that a checkpoint of a
+// container restored with --background from an S3-compatible object store,
+// with pages_retry "while-running", whose store is away as its pages load,
+// which waits for those pages with no load wait, as long as the store is away,
+// fails once runsc fail-load ends the loading, as when a read of its pages
+// failed ("previous async page loading failed"): whether or not the store
+// answers. fail-load ends the one load the sandbox has, and none after it.
+func TestCheckpointRestoreS3StoreAwayFailLoad(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			r := newStoreAwayRestore(t, conf)
+			saved := make(chan error, 1)
+			go func() {
+				saved <- r.cont.Checkpoint(conf, newCheckpointDir(t), sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone})
+			}()
+			// The checkpoint waits for the pages, as long as the store is away.
+			select {
+			case err := <-saved:
+				t.Fatalf("checkpoint with the store away ended before fail-load: %v, want it waiting for the pages", err)
+			case <-time.After(2 * time.Second):
+			}
+			ended, err := r.cont.FailLoad("the test fails it")
+			if err != nil {
+				t.Fatalf("FailLoad: %v", err)
+			}
+			if ended != 1 {
+				t.Errorf("FailLoad ended %d loads, want the restore's 1", ended)
+			}
+			select {
+			case err := <-saved:
+				if err == nil || !strings.Contains(err.Error(), "previous async page loading failed") {
+					t.Errorf("checkpoint once the loading failed: got %v, want \"previous async page loading failed\"", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("checkpoint did not end within 30s of fail-load, the store still away")
+			}
+		})
+	}
+}
+
 // TestCheckpointRestoreS3StoreAwayLoadWaitLater checks the expiry of a
 // checkpoint's load wait past its wait before the save/restore binary runs,
 // which --TESTONLY-save-running-load-wait=skip skips, as an incremental

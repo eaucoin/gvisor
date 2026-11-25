@@ -17,6 +17,7 @@ go_library(
         "do.go",
         "events.go",
         "exec.go",
+        "fail_load.go",
         "features.go",
         "forward.go",
         "fscheckpoint.go",

@@ -1009,6 +1009,19 @@ func (cm *containerManager) KillPaused(args *sentryapi.SignalArgs, _ *struct{}) 
 	return nil
 }
 
+// FailLoad ends the loading of the pages of the sandbox's restore that goes on
+// in the background as a failed read of its pages file ends it, for reason,
+// which is logged: the pages not loaded yet are never loaded, so that a save of
+// the sandbox, which would wait for them, fails ("previous async page loading
+// failed") rather than wait, as one that waits already does at once; whether
+// or not the pages file answers, as a store that is away does not. ended is
+// how many loads it ended: none where the sandbox loads none.
+func (cm *containerManager) FailLoad(reason *string, ended *int) error {
+	log.Debugf("containerManager.FailLoad: %s", *reason)
+	*ended = pgalloc.FailAsyncPageLoads(*reason)
+	return nil
+}
+
 // resumableSandbox returns the sandbox's ID, or an error if its kernel cannot
 // be resumed: until all of its containers are restored, the kernel is the one
 // that the restore replaces, which Restore paused.

@@ -237,6 +237,14 @@ loading, such as a read of a tmpfs file, stops only once they have loaded,
 which can happen to an incremental checkpoint, whose first wait is for the
 dirty pages only.
 
+`runsc fail-load <container id>` ends a background restore's loading as a
+failed read of its pages ends it, whether or not the store answers: the pages
+not loaded yet are never loaded, and a checkpoint that waits for them, or
+would, fails with "previous async page loading failed", without waiting for the
+store. It suits a host that bounds how long a checkpoint may wait on a store it cannot
+reach. It prints the number of loads it ended (`{"ended": 1}`), none once the
+restore has loaded its pages.
+
 Note that when this is enabled, the sandbox may continue to have an open FD on
 the snapshot files even after the sandboxed application has started. This means
 that until the sandbox has fully restored (async page loading has completed):

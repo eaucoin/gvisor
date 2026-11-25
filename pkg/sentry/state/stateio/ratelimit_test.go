@@ -101,6 +101,84 @@ func TestRateLimitedReaderWaitOr(t *testing.T) {
 	}
 }
 
+// stuckReader is an AsyncReader whose reads do not complete until release is
+// closed, as a checkpoint gofer's do while its store is away; its WaitOr
+// returns once wake is readable meanwhile.
+type stuckReader struct {
+	AsyncReader
+	release chan struct{}
+}
+
+// released returns true once release is closed.
+func (r *stuckReader) released() bool {
+	select {
+	case <-r.release:
+		return true
+	default:
+		return false
+	}
+}
+
+// Wait implements AsyncReader.Wait.
+func (r *stuckReader) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
+	if minCompletions == 0 && !r.released() {
+		return cs, nil
+	}
+	<-r.release
+	return r.AsyncReader.Wait(cs, minCompletions)
+}
+
+// WaitOr implements WaitOrAsyncReader.WaitOr.
+func (r *stuckReader) WaitOr(cs []Completion, wake <-chan struct{}) ([]Completion, error) {
+	select {
+	case <-r.release:
+		return r.AsyncReader.Wait(cs, 1)
+	case <-wake:
+		return cs, nil
+	}
+}
+
+// TestRateLimitedReaderWaitOrWhileFileWaits checks that WaitOr returns when
+// woken while the reader it limits has completed nothing, as a checkpoint
+// gofer's whose store is away, and that the read completes once that reader's
+// does.
+func TestRateLimitedReaderWaitOrWhileFileWaits(t *testing.T) {
+	const readBytes = 4 << 10
+	data := make([]byte, readBytes)
+	stuck := &stuckReader{AsyncReader: NewIOReader(bytes.NewReader(data), readBytes, 1 /* maxRanges */, 1 /* maxParallel */), release: make(chan struct{})}
+	r := NewRateLimitedReader(stuck, 1<<30 /* rate */)
+	defer r.Close()
+
+	r.AddRead(0, 0, nil, memmap.FileRange{}, make([]byte, readBytes))
+	wake := make(chan struct{}, 1)
+	time.AfterFunc(10*time.Millisecond, func() { wake <- struct{}{} })
+	woken := make(chan []Completion, 1)
+	go func() {
+		cs, err := r.WaitOr(nil, wake)
+		if err != nil {
+			t.Errorf("WaitOr: %v", err)
+		}
+		woken <- cs
+	}()
+	select {
+	case cs := <-woken:
+		if len(cs) != 0 {
+			t.Fatalf("WaitOr returned %+v before the read completed", cs)
+		}
+	case <-time.After(10 * time.Second):
+		close(stuck.release)
+		t.Fatalf("WaitOr did not return when woken while the read it waits for had not completed")
+	}
+	close(stuck.release)
+	cs, err := r.Wait(nil, 1 /* minCompletions */)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if len(cs) != 1 || cs[0].N != readBytes {
+		t.Errorf("Wait returned %+v, want the read", cs)
+	}
+}
+
 // TestRateLimitedWriter checks that writes issued together complete in the
 // order they were issued, each once the bytes of the writes before it and its
 // own have been stored at the writer's rate, and write their data.

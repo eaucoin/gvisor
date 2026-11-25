@@ -905,6 +905,18 @@ func (c *Container) WaitCheckpoint() error {
 	return c.Sandbox.WaitCheckpoint()
 }
 
+// FailLoad ends the loading of the pages of the restore of c's sandbox that
+// goes on in the background, for reason, as Sandbox.FailLoad does, and returns
+// how many loads it ended. Like WaitRestore, it takes no lock of c's: it ends
+// what a checkpoint of c may be waiting on.
+func (c *Container) FailLoad(reason string) (int, error) {
+	log.Debugf("Fail the loading of the pages of the restore of container, cid: %s", c.ID)
+	if err := c.CheckSandboxRunning(); err != nil {
+		return 0, err
+	}
+	return c.Sandbox.FailLoad(reason)
+}
+
 // WaitRestore waits for the Kernel to have been successfully restored.
 func (c *Container) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in container, cid: %s", c.ID)
