@@ -60,11 +60,13 @@ func (l *rateLimiter) issue(id int, n uint64) {
 
 // wait appends completions that are due to cs until it has appended
 // minCompletions, or until wake, if not nil, is readable while it waits for a
-// completion to become due. waitIO is the underlying file's Wait. wait waits
-// for the underlying file's completions without watching wake, which is meant
-// for files whose I/O takes much less time than the rate makes it last, such
-// as a local file's.
-func (l *rateLimiter) wait(waitIO func([]Completion, int) ([]Completion, error), cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, error) {
+// completion to become due or for the underlying file's next one. waitIO is the
+// underlying file's Wait, and waitOrIO its WaitOr, if it has one: without it,
+// wait waits for the underlying file's completions without watching wake,
+// which is meant for files whose I/O takes much less time than the rate makes
+// it last, such as a local file's; with it, wake ends that wait too, as when
+// the file is a checkpoint gofer's whose store is away.
+func (l *rateLimiter) wait(waitIO func([]Completion, int) ([]Completion, error), waitOrIO func([]Completion, <-chan struct{}) ([]Completion, error), cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, error) {
 	n := 0
 	for {
 		var err error
@@ -92,6 +94,17 @@ func (l *rateLimiter) wait(waitIO func([]Completion, int) ([]Completion, error),
 		}
 		if next.IsZero() || l.earliestDue().Before(next) {
 			// An I/O that has not completed is due first.
+			if wake != nil && waitOrIO != nil {
+				completed := len(l.done)
+				if l.done, err = waitOrIO(l.done, wake); err != nil {
+					return cs, err
+				}
+				if len(l.done) == completed {
+					// Woken, as WaitOr returns without completions.
+					return cs, nil
+				}
+				continue
+			}
 			if l.done, err = waitIO(l.done, 1); err != nil {
 				return cs, err
 			}
@@ -153,12 +166,16 @@ func (r *RateLimitedReader) AddReadv(id int, off int64, total uint64, dstFile De
 
 // Wait implements AsyncReader.Wait.
 func (r *RateLimitedReader) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
-	return r.limiter.wait(r.AsyncReader.Wait, cs, minCompletions, nil)
+	return r.limiter.wait(r.AsyncReader.Wait, nil, cs, minCompletions, nil)
 }
 
 // WaitOr implements WaitOrAsyncReader.WaitOr.
 func (r *RateLimitedReader) WaitOr(cs []Completion, wake <-chan struct{}) ([]Completion, error) {
-	return r.limiter.wait(r.AsyncReader.Wait, cs, 1, wake)
+	var waitOrIO func([]Completion, <-chan struct{}) ([]Completion, error)
+	if wr, ok := r.AsyncReader.(WaitOrAsyncReader); ok {
+		waitOrIO = wr.WaitOr
+	}
+	return r.limiter.wait(r.AsyncReader.Wait, waitOrIO, cs, 1, wake)
 }
 
 // Retrying implements RetryingAsyncReader.Retrying: it is the reader's that r
@@ -211,5 +228,5 @@ func (w *RateLimitedWriter) AddWritev(id int, total uint64, srcFile SourceFile, 
 
 // Wait implements AsyncWriter.Wait.
 func (w *RateLimitedWriter) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
-	return w.limiter.wait(w.AsyncWriter.Wait, cs, minCompletions, nil)
+	return w.limiter.wait(w.AsyncWriter.Wait, nil, cs, minCompletions, nil)
 }
