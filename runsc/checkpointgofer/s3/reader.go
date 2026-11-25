@@ -58,7 +58,10 @@ var pagesRetryWatchdogTimeout = 10 * time.Second
 type Reader struct {
 	stateio.NoRegisterClientFD
 
-	client       *s3.Client
+	// fs is the FileServer that opened the file at path, held in obj, which
+	// its GETs ask fs for (FileServer.getObject).
+	fs           *FileServer
+	path         string
 	obj          object
 	retry        retryPolicy
 	whileRunning bool
@@ -87,6 +90,11 @@ type Reader struct {
 	// (FileServerOptions.ETags). etag is set before r is used.
 	etag string
 
+	// served, if not nil, counts r's GETs, as they are made, and the bytes
+	// they deliver, as they arrive (FileServerOptions.ServedFile). served is
+	// set before r is used.
+	served *servedBytes
+
 	// If trace is true, each GET is logged as it ends, and gets and bytes
 	// count them (FileServerOptions.Trace). trace is set before r is used.
 	trace bool
@@ -110,12 +118,14 @@ type readSubmission struct {
 	dst   stateio.LocalClientRanges
 }
 
-// newReader returns a Reader that reads from obj. If whileRunning, its reads
-// retry what may succeed later for as long as ctx lasts (see Reader.read).
-func newReader(ctx context.Context, client *s3.Client, obj object, policy retryPolicy, whileRunning bool, maxReadBytes uint64, maxRanges, maxParallel int) *Reader {
+// newReader returns a Reader that reads, from fs, the file at path, held in
+// obj. If whileRunning, its reads retry what may succeed later for as long as
+// ctx lasts (see Reader.read).
+func newReader(ctx context.Context, fs *FileServer, path string, obj object, policy retryPolicy, whileRunning bool, maxReadBytes uint64, maxRanges, maxParallel int) *Reader {
 	ctx, cancel := context.WithCancelCause(ctx)
 	r := &Reader{
-		client:       client,
+		fs:           fs,
+		path:         path,
 		obj:          obj,
 		retry:        policy,
 		whileRunning: whileRunning,
@@ -481,7 +491,10 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	if r.etag != "" {
 		in.IfMatch = aws.String(r.etag)
 	}
-	out, err := r.client.GetObject(ctx, in, optFns...)
+	if r.served != nil {
+		r.served.get()
+	}
+	out, err := r.fs.getObject(ctx, r.path, r.obj, in, optFns...)
 	answered = time.Now()
 	if err != nil {
 		var respErr *awshttp.ResponseError
@@ -498,11 +511,16 @@ func (r *Reader) readOnce(ctx context.Context, off int64, total uint64, dst *sta
 	r.learnSize(aws.ToString(out.ContentRange))
 	defer out.Body.Close()
 	body := io.Reader(out.Body)
+	if r.served != nil {
+		counted := r.served.count(body, r.path, off)
+		defer counted.flush()
+		body = counted
+	}
 	if r.whileRunning {
 		// The store began to answer: the read no longer counts as retrying,
 		// and each byte of its answer after keeps it from counting again.
 		s.progress()
-		body = progressReader{out.Body, s}
+		body = progressReader{body, s}
 	}
 	want := total
 	if out.ContentLength != nil {

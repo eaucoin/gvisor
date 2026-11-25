@@ -99,6 +99,14 @@ type FileServer struct {
 
 	// cache, if not nil, caches the pages files read (CacheDir).
 	cache *pagesCache
+
+	// urls is the source of the URLs of FileServerOptions.URLsFile, if not
+	// nil.
+	urls *urlSource
+
+	// served, if not nil, counts the bytes of pages files read
+	// (FileServerOptions.ServedFile).
+	served *servedBytes
 }
 
 // FileServerOptions provides options to NewFileServer.
@@ -208,6 +216,37 @@ type FileServerOptions struct {
 	// checked against the image's page hashes, and marks (see pagesCache).
 	// The FileServer opens files beneath it alone, and closes it.
 	CacheDir *os.File
+
+	// URLsFile, if not empty, is the path of a file holding, as a JSON
+	// object, the URL that each file to read is read at, by the path the file
+	// is opened at (as ETags), presigned for GET with the store's query
+	// authentication (such as Signature Version 4's X-Amz-Signature) by a
+	// host that holds the store's credentials: the FileServer then holds
+	// none, and signs nothing. Each GET of a file is made to its URL as given,
+	// with the Range and If-Match it asks, which such a URL does not sign,
+	// and none of the store's own headers (x-amz-*), which its signature
+	// would have to. A file without a URL is not opened, nor is any file for
+	// writing. The host signs the URLs for a short time, and signs them
+	// again as they near their expiry, replacing the file whole: the
+	// FileServer reads it again once a URL has less than a third of its life
+	// left, and once where the store refuses a URL (403) if the file has
+	// changed since; otherwise a refusal is final. The file must be readable
+	// by its owner alone, as credentials are, and a URL's query, which grants
+	// its reads, is never logged.
+	URLsFile string
+
+	// ServedFile, if not empty, is the path of a file that the FileServer
+	// keeps the number of bytes of pages files it has read from the store in,
+	// and the number of GETs of them it made, as two decimal numbers, a space
+	// between them, and a newline: of each pages file, the image's and its
+	// layers', the bytes of the ranges its answers delivered, each byte
+	// counted once however often it was read, counted as they arrive; and
+	// each GET as it is made, answered or not, so that a reader can tell reads
+	// that go on while the store is away, and delivers nothing, from reads
+	// that ended. The file is replaced whole, written beside it and renamed
+	// over it, within servedFileEvery of a change and as the FileServer is
+	// destroyed, so that whoever reads it reads whole counts.
+	ServedFile string
 
 	// If Trace is true, each GET of a pages file is logged as it ends, as a
 	// line beginning "S3 read trace:", with the kind of the read it serves,
@@ -324,6 +363,20 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 		}
 	}
 
+	var urls *urlSource
+	if o.URLsFile != "" {
+		if o.Credentials != nil || o.SharedCredentialsFile != "" || o.Profile != "" {
+			return nil, fmt.Errorf("URLs cannot be given with credentials, a credentials file or a profile: they are presigned")
+		}
+		if o.AllowCheckpointWrites || o.AllowFSCheckpointWrites {
+			return nil, fmt.Errorf("URLs read files, which cannot be written by them")
+		}
+		urls = &urlSource{path: o.URLsFile}
+		if err := urls.load(); err != nil {
+			return nil, err
+		}
+	}
+
 	if o.SharedCredentialsFile != "" {
 		fi, err := os.Stat(o.SharedCredentialsFile)
 		if err != nil {
@@ -357,7 +410,11 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 	if o.Region != "" {
 		cfgOpts = append(cfgOpts, config.WithRegion(o.Region))
 	}
-	if o.Credentials != nil {
+	switch {
+	case urls != nil:
+		// Anonymous credentials sign nothing: the URLs are signed.
+		cfgOpts = append(cfgOpts, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
+	case o.Credentials != nil:
 		cfgOpts = append(cfgOpts, config.WithCredentialsProvider(o.Credentials))
 	}
 	if o.SharedCredentialsFile != "" {
@@ -370,7 +427,7 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to load the AWS SDK's configuration: %w", err)
 	}
-	if cfg.Region == "" && o.Endpoint != "" {
+	if cfg.Region == "" && (o.Endpoint != "" || urls != nil) {
 		cfg.Region = defaultRegion
 	}
 	client := s3.NewFromConfig(cfg, func(so *s3.Options) {
@@ -391,6 +448,10 @@ func NewFileServer(ctx context.Context, opts *FileServerOptions) (*FileServer, e
 			timeout:     o.RequestTimeout,
 			bandwidth:   o.MinRequestBandwidth,
 		},
+		urls: urls,
+	}
+	if o.ServedFile != "" {
+		s.served = newServedBytes(o.ServedFile)
 	}
 	if o.CacheDir != nil {
 		s.cache = newPagesCache(s, o.CacheDir)
@@ -427,12 +488,45 @@ func checkFileMode(name string, perm fs.FileMode, owner, euid uint32, secret boo
 	return nil
 }
 
+// Cancel implements stateipc.Canceler.Cancel: it ends the FileServer's GETs
+// and uploads, and the waits of the pages file's reads for a store that is
+// away (FileServerOptions.PagesRetryWhileRunning), as Destroy does.
+func (s *FileServer) Cancel() {
+	s.cancel(fmt.Errorf("context canceled by s3.FileServer.Cancel"))
+}
+
 // Destroy implements stateipc.AsyncFileServerImpl.Destroy.
 func (s *FileServer) Destroy() {
 	s.cancel(fmt.Errorf("context canceled by s3.FileServer.Destroy"))
 	if s.cache != nil {
 		s.cache.close()
 	}
+	if s.served != nil {
+		s.served.close()
+	}
+}
+
+// getObject asks the store for the object obj, which holds the file at path,
+// as in says: at the file's URL where the FileServer reads by URLs
+// (FileServerOptions.URLsFile), which a file read has (see OpenRead).
+func (s *FileServer) getObject(ctx context.Context, path string, obj object, in *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	if s.urls == nil {
+		return s.client.GetObject(ctx, in, optFns...)
+	}
+	u, ok := s.urls.get(path)
+	if !ok {
+		return nil, fmt.Errorf("%s has no URL", obj)
+	}
+	out, err := s.client.GetObject(ctx, in, append(optFns, byURL(u))...)
+	// A refused URL is asked again once, at the URL the file holds now, if
+	// the host has signed it again since: a URL whose time ran out as the
+	// store was away, say. Otherwise the refusal is final.
+	if refused(err) && s.urls.reloadIfChanged() {
+		if u, ok = s.urls.get(path); ok {
+			out, err = s.client.GetObject(ctx, in, append(optFns, byURL(u))...)
+		}
+	}
+	return out, err
 }
 
 // CacheStatus implements stateipc.CacheReporter.CacheStatus: the cache of the
@@ -490,9 +584,16 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		log.Warningf("s3.FileServer.OpenRead: attempted to open %q, which this checkpoint gofer may not read", path)
 		return nil, fs.ErrPermission
 	}
+	if s.urls != nil && !s.urls.has(path) {
+		log.Warningf("s3.FileServer.OpenRead: attempted to open %q, which this checkpoint gofer has no URL of", path)
+		return nil, fs.ErrPermission
+	}
 	obj := s.object(path)
 	log.Infof("Opening %s for reading", obj)
-	r := newReader(s.ctx, s.client, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
+	r := newReader(s.ctx, s, path, obj, s.retry, whileRunning, maxReadBytes, maxRanges, maxParallel)
+	if name == checkpointfiles.PagesFileName {
+		r.served = s.served
+	}
 	r.etag = s.opts.ETags[path]
 	if s.cache != nil && name == checkpointfiles.PagesFileName {
 		r.cache, r.cacheFile = s.cache, s.cache.file(path)
@@ -542,6 +643,7 @@ func (s *FileServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 		log.Warningf("s3.FileServer.OpenWrite: attempted to open %q, which this checkpoint gofer may not write", path)
 		return nil, fs.ErrPermission
 	}
+
 	obj := s.object(path)
 	log.Infof("Opening %s for writing", obj)
 	return newWriter(s.ctx, s.client, obj, s.retry, maxWriteBytes, maxRanges, maxParallel, partBytes, maxParallelParts), nil

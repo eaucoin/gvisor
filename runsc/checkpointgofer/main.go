@@ -125,6 +125,21 @@ type S3Options struct {
 	// anything (see s3.FileServerOptions.ETags).
 	ETags map[string]string `json:"etags,omitzero"`
 
+	// URLsFile, if not empty, is the path of a file holding, as a JSON
+	// object, the URL that each file to read is read at, by the path the
+	// gofer serves it at (as ETags), presigned for GET by a host that holds
+	// the store's credentials, which signs them again as they near their
+	// expiry: the gofer then holds none, signs nothing, reads no file without
+	// a URL and writes none; Credentials, CredentialsFile and Profile must not
+	// be given (see s3.FileServerOptions.URLsFile).
+	URLsFile string `json:"urls_file,omitzero"`
+
+	// ServedFile, if not empty, is the path of a file that the gofer keeps
+	// the number of bytes of pages files it has read in, and the number of
+	// GETs of them it made, replaced whole as they grow (see
+	// s3.FileServerOptions.ServedFile).
+	ServedFile string `json:"served_file,omitzero"`
+
 	// ReadBytes and ReadParallel are the size of reads of the pages file and
 	// the number of reads in flight (default 16 MiB and 8).
 	ReadBytes    uint64 `json:"read_bytes,omitzero"`
@@ -316,6 +331,8 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 		ObjectPrefix:            opts.ObjectPrefix,
 		LayersPrefix:            opts.LayersPrefix,
 		ETags:                   opts.ETags,
+		URLsFile:                opts.URLsFile,
+		ServedFile:              opts.ServedFile,
 		SharedCredentialsFile:   opts.CredentialsFile,
 		Profile:                 opts.Profile,
 		MaxAttempts:             opts.MaxAttempts,
@@ -365,6 +382,11 @@ func (cmd *checkpointGoferCmd) runS3(ctx context.Context, sock *unet.Socket, opt
 	server := urpc.NewServer()
 	server.Register(afs)
 	server.Handle(sock)
+	// Its client gone, stop afs, which ends the I/O that no one waits for
+	// any more and destroys s3fs: it writes its served file a last time then
+	// (s3.FileServerOptions.ServedFile), so that the file holds every byte of
+	// a restore's reads, however soon after its last change the restore ends.
+	server.Stop(0)
 	return nil
 }
 

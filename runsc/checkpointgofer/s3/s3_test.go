@@ -39,7 +39,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointimage"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/checkpointgofer/s3/s3test"
 )
 
@@ -711,6 +714,92 @@ func TestPagesReadWhileRunningEndsWithReader(t *testing.T) {
 	cs, err := r.Wait(nil, 1)
 	if err != nil || len(cs) != 1 || cs[0].Err == nil {
 		t.Errorf("Wait after Close = %v, %v; want the read failed", cs, err)
+	}
+}
+
+// TestPagesReadWhileRunningEndsAsServerStops checks that the stateipc server
+// of a FileServer stops once its client goes, as a killed sandbox's does, while
+// a read of the pages file waits for a store that is away for good: stopping,
+// the server cancels the FileServer, which ends the read, then destroys it,
+// which writes its served file a last time.
+func TestPagesReadWhileRunningEndsAsServerStops(t *testing.T) {
+	// The served file is written as it is made, then as the FileServer is
+	// destroyed, and not between.
+	defer func(every time.Duration) { servedFileEvery = every }(servedFileEvery)
+	servedFileEvery = time.Hour
+	s := s3test.NewStore(t)
+	s.SetObject(checkpointfiles.PagesFileName, testObject(4096))
+	s.Fault = awayFor(t, math.MaxInt)
+	path := filepath.Join(t.TempDir(), "served")
+	afs, err := stateipc.NewAsyncFileServer(newTestFileServer(t, s, FileServerOptions{AllowCheckpointReads: true, PagesRetryWhileRunning: true, ServedFile: path}))
+	if err != nil {
+		t.Fatalf("NewAsyncFileServer: %v", err)
+	}
+	usrv := urpc.NewServer()
+	usrv.Register(afs)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("SocketPair: %v", err)
+	}
+	client, err := stateipc.NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("NewAsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	// Serve as the checkpoint gofer does: until the client goes, then stop.
+	stopped := make(chan struct{})
+	go func() {
+		usrv.Handle(serverSock)
+		usrv.Stop(0)
+		close(stopped)
+	}()
+
+	memfd, buf, err := stateio.CreateMappedMemoryFD("s3.TestPagesReadWhileRunningEndsAsServerStops", 4096)
+	if err != nil {
+		t.Fatalf("CreateMappedMemoryFD: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+	r, err := client.OpenRead(checkpointfiles.PagesFileName)
+	if err != nil {
+		t.Fatalf("OpenRead: %v", err)
+	}
+	defer r.Close()
+	df, err := r.RegisterDestinationFD(memfd, 4096, 0 /* discard */, nil)
+	if err != nil {
+		t.Fatalf("RegisterDestinationFD: %v", err)
+	}
+	r.AddRead(0, 0, df, memmap.FileRange{End: 4096}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := r.Wait(nil, 1)
+		waited <- err
+	}()
+	for deadline := time.Now().Add(10 * time.Second); len(s.Ops()) == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the read made no GET within 10s")
+		}
+	}
+
+	// The client goes, its read waiting for the store.
+	if err := clientSock.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the server did not stop within 10s of its client going while a read waited for the store")
+	}
+	if err := <-waited; err == nil {
+		t.Errorf("the client's Wait for the read in flight as it went returned nil, want an error")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the served file: %v", err)
+	}
+	var n, gets int
+	if _, err := fmt.Sscanf(string(b), "%d %d\n", &n, &gets); err != nil || n != 0 || gets == 0 {
+		t.Errorf("the served file holds %q once the server stopped, want no bytes and the GETs made", b)
 	}
 }
 
