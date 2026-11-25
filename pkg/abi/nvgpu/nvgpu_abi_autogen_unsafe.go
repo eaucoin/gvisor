@@ -106,9 +106,11 @@ var _ marshal.Marshallable = (*NV_CHANNEL_ALLOC_PARAMS_V570)(nil)
 var _ marshal.Marshallable = (*NV_CHANNEL_ALLOC_PARAMS_V610)(nil)
 var _ marshal.Marshallable = (*NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS)(nil)
 var _ marshal.Marshallable = (*NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615)(nil)
+var _ marshal.Marshallable = (*NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620)(nil)
 var _ marshal.Marshallable = (*NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS)(nil)
 var _ marshal.Marshallable = (*NV_CONTEXT_DMA_ALLOCATION_PARAMS)(nil)
 var _ marshal.Marshallable = (*NV_CTXSHARE_ALLOCATION_PARAMETERS)(nil)
+var _ marshal.Marshallable = (*NV_CTXSHARE_ALLOCATION_PARAMETERS_V620)(nil)
 var _ marshal.Marshallable = (*NV_EVENT_BUFFER_ALLOC_PARAMETERS)(nil)
 var _ marshal.Marshallable = (*NV_EXPORT_MEM_PACKET)(nil)
 var _ marshal.Marshallable = (*NV_GR_ALLOCATION_PARAMETERS)(nil)
@@ -4050,6 +4052,131 @@ func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615) WriteTo(writer io.Writer) 
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) SizeBytes() int {
+    return 8 +
+        (*NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS)(nil).SizeBytes() +
+        (*Handle)(nil).SizeBytes()
+}
+
+// MarshalBytes implements marshal.Marshallable.MarshalBytes.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) MarshalBytes(dst []byte) []byte {
+    dst = n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.MarshalUnsafe(dst)
+    hostarch.ByteOrder.PutUint32(dst[:4], uint32(n.Reserved))
+    dst = dst[4:]
+    dst = n.Reserved2.MarshalUnsafe(dst)
+    hostarch.ByteOrder.PutUint32(dst[:4], uint32(n.InternalFlags))
+    dst = dst[4:]
+    return dst
+}
+
+// UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) UnmarshalBytes(src []byte) []byte {
+    src = n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.UnmarshalUnsafe(src)
+    n.Reserved = uint32(hostarch.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
+    src = n.Reserved2.UnmarshalUnsafe(src)
+    n.InternalFlags = uint32(hostarch.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
+    return src
+}
+
+// Packed implements marshal.Marshallable.Packed.
+//go:nosplit
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) Packed() bool {
+    return n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed()
+}
+
+// MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) MarshalUnsafe(dst []byte) []byte {
+    if n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed() {
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(n), uintptr(size))
+        return dst[size:]
+    }
+    // Type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fallback to MarshalBytes.
+    return n.MarshalBytes(dst)
+}
+
+// UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) UnmarshalUnsafe(src []byte) []byte {
+    if n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed() {
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(n), unsafe.Pointer(&src[0]), uintptr(size))
+        return src[size:]
+    }
+    // Type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fallback to UnmarshalBytes.
+    return n.UnmarshalBytes(src)
+}
+
+// CopyOutN implements marshal.Marshallable.CopyOutN.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
+    if !n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed() {
+        // Type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to MarshalBytes.
+        buf := cc.CopyScratchBuffer(n.SizeBytes()) // escapes: okay.
+        n.MarshalBytes(buf) // escapes: fallback.
+        return cc.CopyOutBytes(addr, buf[:limit]) // escapes: okay.
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := cc.CopyOutBytes(addr, buf[:limit]) // escapes: okay.
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return length, err
+}
+
+// CopyOut implements marshal.Marshallable.CopyOut.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+    return n.CopyOutN(cc, addr, n.SizeBytes())
+}
+
+// CopyInN implements marshal.Marshallable.CopyInN.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) CopyInN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
+    if !n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed() {
+        // Type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to UnmarshalBytes.
+        buf := cc.CopyScratchBuffer(n.SizeBytes()) // escapes: okay.
+        length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
+        // Unmarshal unconditionally. If we had a short copy-in, this results in a
+        // partially unmarshalled struct.
+        n.UnmarshalBytes(buf) // escapes: fallback.
+        return length, err
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return length, err
+}
+
+// CopyIn implements marshal.Marshallable.CopyIn.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+    return n.CopyInN(cc, addr, n.SizeBytes())
+}
+
+// WriteTo implements io.WriterTo.WriteTo.
+func (n *NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) WriteTo(writer io.Writer) (int64, error) {
+    if !n.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS.Packed() && n.Reserved2.Packed() {
+        // Type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to MarshalBytes.
+        buf := make([]byte, n.SizeBytes())
+        n.MarshalBytes(buf)
+        length, err := writer.Write(buf)
+        return int64(length), err
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := writer.Write(buf)
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return int64(length), err
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes.
 func (n *NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS) SizeBytes() int {
     return 0 +
         (*Handle)(nil).SizeBytes()
@@ -4403,6 +4530,123 @@ func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS) CopyIn(cc marshal.CopyContext, addr 
 func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS) WriteTo(writer io.Writer) (int64, error) {
     if !n.HVASpace.Packed() {
         // Type NV_CTXSHARE_ALLOCATION_PARAMETERS doesn't have a packed layout in memory, fall back to MarshalBytes.
+        buf := make([]byte, n.SizeBytes())
+        n.MarshalBytes(buf)
+        length, err := writer.Write(buf)
+        return int64(length), err
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := writer.Write(buf)
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return int64(length), err
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) SizeBytes() int {
+    return 0 +
+        (*NV_CTXSHARE_ALLOCATION_PARAMETERS)(nil).SizeBytes() +
+        (*Handle)(nil).SizeBytes()
+}
+
+// MarshalBytes implements marshal.Marshallable.MarshalBytes.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) MarshalBytes(dst []byte) []byte {
+    dst = n.NV_CTXSHARE_ALLOCATION_PARAMETERS.MarshalUnsafe(dst)
+    dst = n.Reserved.MarshalUnsafe(dst)
+    return dst
+}
+
+// UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) UnmarshalBytes(src []byte) []byte {
+    src = n.NV_CTXSHARE_ALLOCATION_PARAMETERS.UnmarshalUnsafe(src)
+    src = n.Reserved.UnmarshalUnsafe(src)
+    return src
+}
+
+// Packed implements marshal.Marshallable.Packed.
+//go:nosplit
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) Packed() bool {
+    return n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed()
+}
+
+// MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) MarshalUnsafe(dst []byte) []byte {
+    if n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed() {
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(n), uintptr(size))
+        return dst[size:]
+    }
+    // Type NV_CTXSHARE_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fallback to MarshalBytes.
+    return n.MarshalBytes(dst)
+}
+
+// UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) UnmarshalUnsafe(src []byte) []byte {
+    if n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed() {
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(n), unsafe.Pointer(&src[0]), uintptr(size))
+        return src[size:]
+    }
+    // Type NV_CTXSHARE_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fallback to UnmarshalBytes.
+    return n.UnmarshalBytes(src)
+}
+
+// CopyOutN implements marshal.Marshallable.CopyOutN.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
+    if !n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed() {
+        // Type NV_CTXSHARE_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to MarshalBytes.
+        buf := cc.CopyScratchBuffer(n.SizeBytes()) // escapes: okay.
+        n.MarshalBytes(buf) // escapes: fallback.
+        return cc.CopyOutBytes(addr, buf[:limit]) // escapes: okay.
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := cc.CopyOutBytes(addr, buf[:limit]) // escapes: okay.
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return length, err
+}
+
+// CopyOut implements marshal.Marshallable.CopyOut.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+    return n.CopyOutN(cc, addr, n.SizeBytes())
+}
+
+// CopyInN implements marshal.Marshallable.CopyInN.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) CopyInN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
+    if !n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed() {
+        // Type NV_CTXSHARE_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to UnmarshalBytes.
+        buf := cc.CopyScratchBuffer(n.SizeBytes()) // escapes: okay.
+        length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
+        // Unmarshal unconditionally. If we had a short copy-in, this results in a
+        // partially unmarshalled struct.
+        n.UnmarshalBytes(buf) // escapes: fallback.
+        return length, err
+    }
+
+    buf := unsafe.Slice((*byte)(gohacks.Noescape(unsafe.Pointer(n))), n.SizeBytes())
+
+    length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.
+    // Since we bypassed the compiler's escape analysis, indicate that n
+    // must live until the use above.
+    runtime.KeepAlive(n) // escapes: replaced by intrinsic.
+    return length, err
+}
+
+// CopyIn implements marshal.Marshallable.CopyIn.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
+    return n.CopyInN(cc, addr, n.SizeBytes())
+}
+
+// WriteTo implements io.WriterTo.WriteTo.
+func (n *NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) WriteTo(writer io.Writer) (int64, error) {
+    if !n.NV_CTXSHARE_ALLOCATION_PARAMETERS.Packed() && n.Reserved.Packed() {
+        // Type NV_CTXSHARE_ALLOCATION_PARAMETERS_V620 doesn't have a packed layout in memory, fall back to MarshalBytes.
         buf := make([]byte, n.SizeBytes())
         n.MarshalBytes(buf)
         length, err := writer.Write(buf)
