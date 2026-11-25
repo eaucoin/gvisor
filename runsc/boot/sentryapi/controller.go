@@ -166,6 +166,12 @@ const ContMgrResume = "containerManager.Resume"
 // resumes the sandbox so that the signal takes effect.
 const ContMgrKillPaused = "containerManager.KillPaused"
 
+// ContMgrFailLoad ends the loading of a restored sandbox's pages that goes on
+// in the background as a failed read of its pages file ends it, so that a save
+// that waits for those pages fails rather than wait (see
+// containerManager.FailLoad).
+const ContMgrFailLoad = "containerManager.FailLoad"
+
 // ContMgrWait waits on the init process of the container and returns its
 // ExitStatus.
 const ContMgrWait = "containerManager.Wait"

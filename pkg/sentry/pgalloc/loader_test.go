@@ -935,6 +935,125 @@ func TestAsyncLoadWaitErrorDropsReadReferences(t *testing.T) {
 	checkReleased(t, restored)
 }
 
+// TestFailAsyncPageLoads checks that FailAsyncPageLoads ends a load whose
+// reads hang as a failed read ends it, wherever its loader waits for them:
+// what waits for its pages, a save's wait among them, fails, as SaveTo would
+// ("previous async page loading failed"), and its reads in flight are
+// stopped; and that it ends no load that has completed.
+func TestFailAsyncPageLoads(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// If awaited, a task waits for a page that no read loads yet, whose
+		// read takes the last slot: the loader can add no read, and waits for
+		// one to complete alone.
+		awaited bool
+	}{
+		{name: "with a slot free"},
+		{name: "with every slot busy", awaited: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr, _, img := loaderTestImage(t, 16*hostarch.PageSize)
+			r := newTestPagesFile(t, img.pages, testPagesFileOpts{
+				maxReadBytes: hostarch.PageSize,
+				maxParallel:  2,
+				latency:      time.Millisecond,
+				manual:       true,
+			})
+			restored := newTestMemoryFile(t, testMemoryFileOpts{})
+			l := startLoad(t, img, r, restored)
+			t.Cleanup(func() { releaseAll(t, restored) })
+			r.waitInflight(1)
+			var waited <-chan error
+			if tc.awaited {
+				waited = awaitAsync(restored, memmap.FileRange{fr.Start + 8*hostarch.PageSize, fr.Start + 9*hostarch.PageSize})
+				waitForWaiters(t, l.apfl, 1)
+				r.waitInflight(2)
+			}
+			saved := make(chan error, 1)
+			go func() { saved <- restored.AwaitSaveLoads(&SaveOpts{}, time.Time{}) }()
+
+			if n := FailAsyncPageLoads("the test fails it"); n != 1 {
+				t.Errorf("FailAsyncPageLoads ended %d loads, want the test's", n)
+			}
+			if err := l.wait(t); err != linuxerr.EIO {
+				t.Fatalf("async page loading: got %v, want EIO", err)
+			}
+			if err := receive(t, saved, "the save's wait"); !errors.Is(err, linuxerr.EIO) || !strings.Contains(err.Error(), "previous async page loading failed") {
+				t.Errorf("save's wait: got %v, want the failure (EIO), as SaveTo says it", err)
+			}
+			if waited != nil {
+				if err := receive(t, waited, "the task's await"); err == nil {
+					t.Errorf("await of a page never loaded: got success, want an error")
+				}
+			}
+			r.mu.Lock()
+			closed := r.closed
+			r.mu.Unlock()
+			if !closed {
+				t.Errorf("the pages file is open once loading failed, its reads in flight not stopped")
+			}
+		})
+	}
+
+	t.Run("once loaded", func(t *testing.T) {
+		fr, gens, img := loaderTestImage(t, 4*hostarch.PageSize)
+		r := newTestPagesFile(t, img.pages, testPagesFileOpts{latency: time.Millisecond})
+		restored := newTestMemoryFile(t, testMemoryFileOpts{})
+		l := startLoad(t, img, r, restored)
+		t.Cleanup(func() { releaseAll(t, restored) })
+		if err := l.wait(t); err != nil {
+			t.Fatalf("async page loading failed: %v", err)
+		}
+		if n := FailAsyncPageLoads("the test fails it"); n != 0 {
+			t.Errorf("FailAsyncPageLoads ended %d loads once the test's had loaded, want none", n)
+		}
+		if err := restored.AwaitSaveLoads(&SaveOpts{}, time.Time{}); err != nil {
+			t.Errorf("save's wait once loaded: got %v, want success", err)
+		}
+		gens.checkPages(t, restored, fr)
+	})
+}
+
+// staleWakeReader is a testPagesFile whose every other WaitOr returns at
+// once, without completions, as stateipc's client does when its server holds
+// a wake forwarded after the wait it was meant for had returned.
+type staleWakeReader struct {
+	*testPagesFile
+	// stale is true if the last WaitOr returned at once. Only the loader's
+	// goroutine calls WaitOr.
+	stale bool
+}
+
+// WaitOr implements stateio.WaitOrAsyncReader.WaitOr.
+func (r *staleWakeReader) WaitOr(cs []stateio.Completion, wake <-chan struct{}) ([]stateio.Completion, error) {
+	r.stale = !r.stale
+	if r.stale {
+		return cs, nil
+	}
+	return r.testPagesFile.WaitOr(cs, wake)
+}
+
+// TestAsyncLoadStaleWake checks that a load whose pages file's WaitOr returns
+// without completions while every read slot is busy, as one that a stale wake
+// ends does, waits again rather than add a read it has no slot for, and loads
+// every page.
+func TestAsyncLoadStaleWake(t *testing.T) {
+	fr, gens, img := loaderTestImage(t, 8*hostarch.PageSize)
+	r := &staleWakeReader{testPagesFile: newTestPagesFile(t, img.pages, testPagesFileOpts{
+		maxReadBytes: hostarch.PageSize,
+		maxParallel:  1,
+		latency:      time.Millisecond,
+	})}
+	restored := newTestMemoryFile(t, testMemoryFileOpts{})
+	l := startLoad(t, img, r, restored)
+	t.Cleanup(func() { releaseAll(t, restored) })
+	if err := l.wait(t); err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	gens.checkPages(t, restored, fr)
+	checkInvariants(t, restored)
+}
+
 // TestAsyncPageLoadProgress checks what a load says it does: loading while it
 // has pages left to load, and stalled only while it keeps waiters waiting as
 // its pages file's reader retries a read that failed; and that
