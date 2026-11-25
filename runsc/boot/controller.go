@@ -478,8 +478,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 			Trace: cm.l.root.conf.AsyncLoadTrace == config.AsyncLoadTraceAll,
 			// Spike: no background reads until the kernel is loaded, after every
 			// container is restored, to tell whether the loading's load on the
-			// node delays the restore of a pod's app container.
-			Throttled: true,
+			// node delays the restore of a pod's app container: a background
+			// restore's alone, which Unthrottle ends.
+			Throttled: o.Background,
 		}) // transfers ownership
 		pagesFiles = nil
 		timer.Reached("created async MF loader")
