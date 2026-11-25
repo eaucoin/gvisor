@@ -325,7 +325,7 @@ func (c *pagesCache) readIndex() (*cacheIndex, error) {
 	if etag := c.fs.opts.ETags[checkpointfiles.PagesMetadataFileName]; etag != "" {
 		in.IfMatch = aws.String(etag)
 	}
-	out, err := c.fs.client.GetObject(c.fs.ctx, in)
+	out, err := c.fs.getObject(c.fs.ctx, checkpointfiles.PagesMetadataFileName, obj, in)
 	if err != nil {
 		return nil, mapError(err, "GetObject", obj)
 	}
@@ -669,12 +669,18 @@ func (c *pagesCache) fill(ctx context.Context, obj object, p string, off int64, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.fs.retry.deadline(uint64(len(buf))))
 	defer cancel()
-	out, err := c.fs.client.GetObject(ctx, in)
+	out, err := c.fs.getObject(ctx, p, obj, in)
 	if err != nil {
 		return mapError(err, "GetObject", obj)
 	}
 	defer out.Body.Close()
-	if _, err := io.ReadFull(out.Body, buf); err != nil {
+	body := io.Reader(out.Body)
+	if c.fs.served != nil {
+		counted := c.fs.served.count(body, p, off)
+		defer counted.flush()
+		body = counted
+	}
+	if _, err := io.ReadFull(body, buf); err != nil {
 		return fmt.Errorf("reading %s at %d: %w", obj, off, err)
 	}
 	return nil
