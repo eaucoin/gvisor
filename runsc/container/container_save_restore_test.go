@@ -1081,6 +1081,101 @@ func TestCheckpointRestoreS3PagesCache(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreS3URLs checks that a container checkpointed to an
+// S3-compatible object store restores from it with --background by the URLs
+// its options give each file, presigned, holding no credentials: every GET of
+// the restore is made to its file's URL, its query whole, unsigned; and that
+// the restore's gofer keeps, in its served file, the bytes of the pages file it
+// read, all of them once the restore is done; and that nothing of the URLs,
+// nor of the file they are in, is in what the sandbox's /proc shows.
+func TestCheckpointRestoreS3URLs(t *testing.T) {
+	const query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=0123456789abcdef"
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			store := s3test.NewStore(t)
+			var (
+				mu       sync.Mutex
+				byURL    bool
+				gets     int
+				unsigned int
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				if byURL && r.Method == http.MethodGet {
+					gets++
+					if r.URL.RawQuery == query && r.Header.Get("Authorization") == "" {
+						unsigned++
+					}
+				}
+				mu.Unlock()
+				store.ServeHTTP(w, r)
+			}))
+			defer srv.Close()
+			dir := s3OptsDir(t, srv.URL, "")
+			served := filepath.Join(dir, "served")
+			// Apart from the image path, as a host keeps them on its tmpfs.
+			urlsFile := filepath.Join(t.TempDir(), "urls.json")
+			testCheckpointRestoreBackground(t, conf, dir, func() {
+				urls := make(map[string]string)
+				for _, f := range []string{checkpointfiles.StateFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
+					urls[f] = srv.URL + "/" + s3test.Bucket + "/image/" + f + "?" + query
+				}
+				b, err := json.Marshal(urls)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(urlsFile, b, 0600); err != nil {
+					t.Fatalf("error writing the URLs: %v", err)
+				}
+				opts, err := json.Marshal(map[string]any{"bucket": s3test.Bucket, "object_prefix": "image/", "urls_file": urlsFile, "served_file": served})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "s3_opts.json"), opts, 0600); err != nil {
+					t.Fatalf("error writing S3 options: %v", err)
+				}
+				mu.Lock()
+				byURL = true
+				mu.Unlock()
+			}, func(cont *Container) {
+				if err := cont.WaitRestore(); err != nil {
+					t.Fatalf("waiting for the restore: %v", err)
+				}
+				// Nothing of the URLs, nor of where they are, in what the sandbox sees.
+				seen, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", "cat /proc/[0-9]*/cmdline /proc/[0-9]*/environ /proc/self/mountinfo /proc/mounts 2>/dev/null; true")
+				if err != nil {
+					t.Fatalf("reading the sandbox's /proc: %v", err)
+				}
+				for _, secret := range []string{"X-Amz-Signature", "0123456789abcdef", urlsFile} {
+					if strings.Contains(string(seen), secret) {
+						t.Errorf("the sandbox's /proc holds %q", secret)
+					}
+				}
+				pages, _ := store.Object("image/" + checkpointfiles.PagesFileName)
+				// Every byte of the pages file, and the GETs that read them.
+				if err := testutil.Poll(func() error {
+					got, err := os.ReadFile(served)
+					var n, made int
+					if err == nil {
+						_, err = fmt.Sscanf(string(got), "%d %d\n", &n, &made)
+					}
+					if err != nil || n != len(pages) || made == 0 {
+						return fmt.Errorf("the served file holds %q, %v; want %d bytes and the GETs that read them", got, err, len(pages))
+					}
+					return nil
+				}, 10*time.Second); err != nil {
+					t.Error(err)
+				}
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if gets == 0 || unsigned != gets {
+				t.Errorf("%d of the restore's %d GETs were made to their file's URL, unsigned; want all of them", unsigned, gets)
+			}
+		})
+	}
+}
+
 // TestCheckpointRestoreS3Socket checks that a container checkpoints to and
 // restores with --background from an S3-compatible object store served on the
 // Unix domain socket that its options' socket names, whatever their endpoint's

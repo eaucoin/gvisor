@@ -850,6 +850,35 @@ Gateway and others), the file is `s3_opts.json`:
     version of its object (`If-Match`), and fails without retrying where the
     store holds another version or none, so that a restore whose files were
     lost or written over fails before it loads anything.
+-   `urls_file`: the absolute path of a file holding, as a JSON object, the URL
+    of each file to read, by its path in the image, as for `etags`, presigned
+    for `GET` with the store's query authentication (such as Signature Version
+    4's `X-Amz-Signature`) by a host that holds the store's credentials: the
+    checkpoint gofer then holds none and signs nothing, and reads each file at
+    its URL as given, with the `Range` and `If-Match` it asks, which such a URL
+    does not sign, and none of the store's own `x-amz-*` headers, which its
+    signature would have to. It reads no file without a URL and writes none, so
+    it suits a restore; `credentials`, `credentials_file` and `profile` must not
+    be given. The host signs the URLs for a short time and signs them again as
+    they near their expiry, replacing the file whole (written beside it and
+    renamed over it): the gofer reads it again once a URL has less than a third
+    of its life left (`X-Amz-Date`, `X-Amz-Expires`), and once where the store
+    refuses a URL (403), if the file has changed since; otherwise a refusal fails
+    the read at once, as refused credentials do. The file must be readable by its
+    owner alone, as `credentials` are, and a URL's query is never logged. Keep it
+    apart from the image path, on a tmpfs: once its host stops signing the URLs
+    again, they lapse within their short life.
+-   `served_file`: the absolute path of a file that the checkpoint gofer keeps
+    the number of bytes of pages files it has read in, and the number of GETs
+    of them it made (two decimal numbers, a space between them, and a
+    newline): of `pages.img`, the image's and its layers', the bytes of the
+    ranges the store delivered, each counted once however often it was read,
+    as they arrive; and each GET as it is made, answered or not. It is written
+    as the gofer starts and replaced whole, a new file renamed over it, within
+    a quarter of a second of each change and as the gofer ends, so a reader
+    always reads whole counts: how far a restore's reads have gone, as a host
+    bounding a checkpoint's wait on them can tell, and whether they go on
+    while the store delivers nothing, as one that is away does.
 -   `addressing`: `path` (`https://host/bucket/key`, the default with an
     `endpoint`, as most stores other than Amazon S3 require) or `virtual`
     (`https://bucket.host/key`).
