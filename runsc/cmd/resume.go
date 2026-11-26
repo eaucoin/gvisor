@@ -24,11 +24,13 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // Resume implements subcommands.Command for the "resume" command.
 type Resume struct {
 	containerLoader
+	saveRestoreReason string
 }
 
 // Name implements subcommands.Command.Name.
@@ -47,7 +49,9 @@ func (*Resume) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (*Resume) SetFlags(*flag.FlagSet) {}
+func (r *Resume) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&r.saveRestoreReason, "save-restore-reason", "", "for the first resume of a container restored paused, why it stopped before it was restored: one line, which the restore's request to a save/restore socket tells after its mode (runsc checkpoint --save-restore-exec-socket).")
+}
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (r *Resume) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
@@ -72,7 +76,7 @@ func (r *Resume) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 		util.Fatalf("loading container: %v", err)
 	}
 
-	if err := cont.Resume(); err != nil {
+	if err := cont.ResumeWithOpts(sandbox.ResumeOpts{SaveRestoreReason: r.saveRestoreReason}); err != nil {
 		util.Fatalf("resume failed: %v", err)
 	}
 

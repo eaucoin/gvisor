@@ -5379,6 +5379,135 @@ func TestCheckpointRestorePaused(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreSaveRestoreSocket checks that a checkpoint given a
+// save/restore socket sends each mode's request to the container's listener
+// on it, telling a save that leaves the container running so and a restore
+// the reason its resume was given, and runs no binary.
+func TestCheckpointRestoreSaveRestoreSocket(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	// Skip overlay because test requires writing to host file.
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			imagePath := filepath.Join(dir, "image")
+			if err := os.Mkdir(imagePath, 0777); err != nil {
+				t.Fatalf("os.Mkdir failed: %v", err)
+			}
+			logPath := filepath.Join(dir, "requests")
+			logFile, err := createWriteableOutputFile(logPath)
+			if err != nil {
+				t.Fatalf("error creating the listener's log: %v", err)
+			}
+			defer logFile.Close()
+			checkLog := func(want string) {
+				t.Helper()
+				got, err := os.ReadFile(logPath)
+				if err != nil {
+					t.Fatalf("error reading the listener's log: %v", err)
+				}
+				if string(got) != want {
+					t.Errorf("the listener's log: got %q, want %q", got, want)
+				}
+			}
+			// In a tmpfs of the sandbox's own: a path under the test's directory may be
+			// longer than a Unix socket's may be.
+			socket := "/save-restore/listener.sock"
+			spec := testutil.NewSpecWithArgs(app, "save-restore-listener", "--socket", socket, "--log", logPath)
+			spec.Mounts = append(spec.Mounts, specs.Mount{
+				Destination: "/save-restore",
+				Type:        "tmpfs",
+				Source:      "tmpfs",
+			})
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(logFile); err != nil {
+				t.Fatalf("the listener did not start: %v", err)
+			}
+			opts := sandbox.CheckpointOpts{
+				SaveRestoreExecSocket:      socket,
+				SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+				SaveRestoreExecSaveTimeout: 30 * time.Second,
+				SaveRestoreExecContainerID: cont.ID,
+			}
+
+			// A checkpoint that leaves the container running asks it to save,
+			// saying so, then to resume.
+			leaveRunning := opts
+			leaveRunning.Resume = true
+			if err := cont.Checkpoint(conf, imagePath, leaveRunning); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			// The resume is asked after the checkpoint returns, as the container
+			// runs on.
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+				if got, err := os.ReadFile(logPath); err == nil && strings.HasSuffix(string(got), "resume\n") {
+					break
+				}
+			}
+			checkLog("listening\nsave leave-running\nresume\n")
+
+			// A checkpoint that ends it asks it to save; a restore paused,
+			// nothing until it is resumed, which asks it to restore, telling
+			// why it stopped.
+			if err := os.RemoveAll(imagePath); err != nil {
+				t.Fatalf("os.RemoveAll failed: %v", err)
+			}
+			if err := os.Mkdir(imagePath, 0777); err != nil {
+				t.Fatalf("os.Mkdir failed: %v", err)
+			}
+			if err := cont.Checkpoint(conf, imagePath, opts); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			checkLog("listening\nsave leave-running\nresume\nsave\n")
+			cont.Destroy()
+
+			cont2, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, imagePath, sandbox.RestoreOpts{Paused: true}); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			checkLog("listening\nsave leave-running\nresume\nsave\n")
+			if err := cont2.ResumeWithOpts(sandbox.ResumeOpts{SaveRestoreReason: "it ran out of its memory"}); err != nil {
+				t.Fatalf("error resuming container: %v", err)
+			}
+			// Resume returns once the listener has answered.
+			checkLog("listening\nsave leave-running\nresume\nsave\nrestore it ran out of its memory\n")
+		})
+	}
+}
+
 // TestCheckpointLeaveRunningRestoresWhatMovedOn checks what the restore of a
 // checkpoint taken with --leave-running asks of the files that the container,
 // running on, changes after it. The checkpoint holds only the files pinned at
