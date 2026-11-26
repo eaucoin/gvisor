@@ -113,6 +113,7 @@ func (fs *filesystem) StateFields() []string {
 		"lastDirIno",
 		"maxFilenameLen",
 		"stackDepth",
+		"landlock",
 	}
 }
 
@@ -133,6 +134,7 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveUint64(9, &fs.lastDirIno)
 	stateSinkObject.SaveUint64(10, &fs.maxFilenameLen)
 	stateSinkObject.SaveInt(11, &fs.stackDepth)
+	stateSinkObject.Save(12, &fs.landlock)
 }
 
 func (fs *filesystem) afterLoad(context.Context) {}
@@ -151,6 +153,7 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.LoadUint64(9, &fs.lastDirIno)
 	stateSourceObject.LoadUint64(10, &fs.maxFilenameLen)
 	stateSourceObject.LoadInt(11, &fs.stackDepth)
+	stateSourceObject.Load(12, &fs.landlock)
 }
 
 func (l *layerDevNumber) StateTypeName() string {
@@ -270,6 +273,7 @@ func (d *dentry) StateFields() []string {
 		"writeCount",
 		"watches",
 		"dirInoHash",
+		"landlockLinked",
 	}
 }
 
@@ -308,6 +312,7 @@ func (d *dentry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(24, &d.writeCount)
 	stateSinkObject.Save(25, &d.watches)
 	stateSinkObject.Save(26, &d.dirInoHash)
+	stateSinkObject.SaveBool(27, &d.landlockLinked)
 	stateSinkObject.SaveValue(5, accessACLValue)
 	stateSinkObject.SaveValue(6, defaultACLValue)
 	stateSinkObject.SaveValue(10, parentValue)
@@ -339,6 +344,7 @@ func (d *dentry) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(24, &d.writeCount)
 	stateSourceObject.Load(25, &d.watches)
 	stateSourceObject.Load(26, &d.dirInoHash)
+	stateSourceObject.LoadBool(27, &d.landlockLinked)
 	stateSourceObject.LoadValueTo(5, (**vfs.PosixACL)(nil), d)
 	stateSourceObject.LoadValueTo(6, (**vfs.PosixACL)(nil), d)
 	stateSourceObject.LoadValueTo(10, (**dentry)(nil), d)

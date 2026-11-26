@@ -1184,6 +1184,234 @@ func (e *Event) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(5, &e.name)
 }
 
+func (l *landlockLayerAccess) StateTypeName() string {
+	return "pkg/sentry/vfs.landlockLayerAccess"
+}
+
+func (l *landlockLayerAccess) StateFields() []string {
+	return []string{
+		"layer",
+		"accessFS",
+	}
+}
+
+func (l *landlockLayerAccess) beforeSave() {}
+
+// +checklocksignore
+func (l *landlockLayerAccess) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.SaveUint8(0, &l.layer)
+	stateSinkObject.SaveUint64(1, &l.accessFS)
+}
+
+func (l *landlockLayerAccess) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *landlockLayerAccess) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadUint8(0, &l.layer)
+	stateSourceObject.LoadUint64(1, &l.accessFS)
+}
+
+func (d *LandlockDomain) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockDomain"
+}
+
+func (d *LandlockDomain) StateFields() []string {
+	return []string{
+		"refs",
+		"vfs",
+		"parent",
+		"handledAccessFS",
+		"rules",
+	}
+}
+
+func (d *LandlockDomain) beforeSave() {}
+
+// +checklocksignore
+func (d *LandlockDomain) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.refs)
+	stateSinkObject.Save(1, &d.vfs)
+	stateSinkObject.Save(2, &d.parent)
+	stateSinkObject.Save(3, &d.handledAccessFS)
+	stateSinkObject.Save(4, &d.rules)
+}
+
+func (d *LandlockDomain) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *LandlockDomain) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.refs)
+	stateSourceObject.Load(1, &d.vfs)
+	stateSourceObject.Load(2, &d.parent)
+	stateSourceObject.Load(3, &d.handledAccessFS)
+	stateSourceObject.Load(4, &d.rules)
+}
+
+func (o *LandlockObject) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockObject"
+}
+
+func (o *LandlockObject) StateFields() []string {
+	return []string{
+		"refs",
+	}
+}
+
+func (o *LandlockObject) beforeSave() {}
+
+// +checklocksignore
+func (o *LandlockObject) StateSave(stateSinkObject state.Sink) {
+	o.beforeSave()
+	stateSinkObject.Save(0, &o.refs)
+}
+
+func (o *LandlockObject) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (o *LandlockObject) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &o.refs)
+}
+
+func (s *LandlockFileSlot) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockFileSlot"
+}
+
+func (s *LandlockFileSlot) StateFields() []string {
+	return []string{}
+}
+
+func (s *LandlockFileSlot) beforeSave() {}
+
+// +checklocksignore
+func (s *LandlockFileSlot) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+}
+
+func (s *LandlockFileSlot) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *LandlockFileSlot) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+}
+
+func (m *LandlockKeyMap) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockKeyMap"
+}
+
+func (m *LandlockKeyMap) StateFields() []string {
+	return []string{}
+}
+
+func (m *LandlockKeyMap) beforeSave() {}
+
+// +checklocksignore
+func (m *LandlockKeyMap) StateSave(stateSinkObject state.Sink) {
+	m.beforeSave()
+}
+
+func (m *LandlockKeyMap) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (m *LandlockKeyMap) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+}
+
+func (s *LandlockKeySlot) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockKeySlot"
+}
+
+func (s *LandlockKeySlot) StateFields() []string {
+	return []string{
+		"m",
+		"key",
+	}
+}
+
+func (s *LandlockKeySlot) beforeSave() {}
+
+// +checklocksignore
+func (s *LandlockKeySlot) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.m)
+	stateSinkObject.Save(1, &s.key)
+}
+
+func (s *LandlockKeySlot) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *LandlockKeySlot) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.m)
+	stateSourceObject.Load(1, &s.key)
+}
+
+func (r *LandlockRuleset) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockRuleset"
+}
+
+func (r *LandlockRuleset) StateFields() []string {
+	return []string{
+		"vfs",
+		"handledAccessFS",
+		"rules",
+	}
+}
+
+func (r *LandlockRuleset) beforeSave() {}
+
+// +checklocksignore
+func (r *LandlockRuleset) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.vfs)
+	stateSinkObject.SaveUint64(1, &r.handledAccessFS)
+	stateSinkObject.Save(2, &r.rules)
+}
+
+func (r *LandlockRuleset) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (r *LandlockRuleset) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.vfs)
+	stateSourceObject.LoadUint64(1, &r.handledAccessFS)
+	stateSourceObject.Load(2, &r.rules)
+}
+
+func (fd *LandlockRulesetFD) StateTypeName() string {
+	return "pkg/sentry/vfs.LandlockRulesetFD"
+}
+
+func (fd *LandlockRulesetFD) StateFields() []string {
+	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"NoLockFD",
+		"ruleset",
+	}
+}
+
+func (fd *LandlockRulesetFD) beforeSave() {}
+
+// +checklocksignore
+func (fd *LandlockRulesetFD) StateSave(stateSinkObject state.Sink) {
+	fd.beforeSave()
+	stateSinkObject.Save(0, &fd.vfsfd)
+	stateSinkObject.Save(1, &fd.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &fd.NoLockFD)
+	stateSinkObject.Save(4, &fd.ruleset)
+}
+
+func (fd *LandlockRulesetFD) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (fd *LandlockRulesetFD) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fd.vfsfd)
+	stateSourceObject.Load(1, &fd.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &fd.NoLockFD)
+	stateSourceObject.Load(4, &fd.ruleset)
+}
+
 func (fl *FileLocks) StateTypeName() string {
 	return "pkg/sentry/vfs.FileLocks"
 }
@@ -1304,6 +1532,8 @@ func (mnt *Mount) StateFields() []string {
 		"groupID",
 		"umounted",
 		"locked",
+		"internal",
+		"landlockUnnameable",
 		"lockedFlags",
 		"writers",
 	}
@@ -1332,8 +1562,10 @@ func (mnt *Mount) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveUint32(14, &mnt.groupID)
 	stateSinkObject.SaveBool(15, &mnt.umounted)
 	stateSinkObject.SaveBool(16, &mnt.locked)
-	stateSinkObject.Save(17, &mnt.lockedFlags)
-	stateSinkObject.Save(18, &mnt.writers)
+	stateSinkObject.SaveBool(17, &mnt.internal)
+	stateSinkObject.SaveBool(18, &mnt.landlockUnnameable)
+	stateSinkObject.Save(19, &mnt.lockedFlags)
+	stateSinkObject.Save(20, &mnt.writers)
 	stateSinkObject.SaveValue(5, keyValue)
 }
 
@@ -1355,8 +1587,10 @@ func (mnt *Mount) StateLoad(ctx context.Context, stateSourceObject state.Source)
 	stateSourceObject.LoadUint32(14, &mnt.groupID)
 	stateSourceObject.LoadBool(15, &mnt.umounted)
 	stateSourceObject.LoadBool(16, &mnt.locked)
-	stateSourceObject.Load(17, &mnt.lockedFlags)
-	stateSourceObject.Load(18, &mnt.writers)
+	stateSourceObject.LoadBool(17, &mnt.internal)
+	stateSourceObject.LoadBool(18, &mnt.landlockUnnameable)
+	stateSourceObject.Load(19, &mnt.lockedFlags)
+	stateSourceObject.Load(20, &mnt.writers)
 	stateSourceObject.LoadValueTo(5, (*VirtualDentry)(nil), mnt)
 	stateSourceObject.AfterLoadTo(mnt)
 }
@@ -1738,6 +1972,8 @@ func (m *MountOptions) StateFields() []string {
 		"ReadOnly",
 		"GetFilesystemOptions",
 		"Locked",
+		"Internal",
+		"LandlockUnnameable",
 		"lockReadOnly",
 	}
 }
@@ -1751,7 +1987,9 @@ func (m *MountOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(1, &m.ReadOnly)
 	stateSinkObject.Save(2, &m.GetFilesystemOptions)
 	stateSinkObject.SaveBool(3, &m.Locked)
-	stateSinkObject.SaveBool(4, &m.lockReadOnly)
+	stateSinkObject.SaveBool(4, &m.Internal)
+	stateSinkObject.SaveBool(5, &m.LandlockUnnameable)
+	stateSinkObject.SaveBool(6, &m.lockReadOnly)
 }
 
 func (m *MountOptions) afterLoad(context.Context) {}
@@ -1762,7 +2000,9 @@ func (m *MountOptions) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.LoadBool(1, &m.ReadOnly)
 	stateSourceObject.Load(2, &m.GetFilesystemOptions)
 	stateSourceObject.LoadBool(3, &m.Locked)
-	stateSourceObject.LoadBool(4, &m.lockReadOnly)
+	stateSourceObject.LoadBool(4, &m.Internal)
+	stateSourceObject.LoadBool(5, &m.LandlockUnnameable)
+	stateSourceObject.LoadBool(6, &m.lockReadOnly)
 }
 
 func (o *OpenOptions) StateTypeName() string {
@@ -2502,6 +2742,14 @@ func init() {
 	state.RegisterNoHooks((*Watches)(nil))
 	state.RegisterNoHooks((*Watch)(nil))
 	state.RegisterNoHooks((*Event)(nil))
+	state.RegisterNoHooks((*landlockLayerAccess)(nil))
+	state.RegisterNoHooks((*LandlockDomain)(nil))
+	state.RegisterNoHooks((*LandlockObject)(nil))
+	state.RegisterNoHooks((*LandlockFileSlot)(nil))
+	state.RegisterNoHooks((*LandlockKeyMap)(nil))
+	state.RegisterNoHooks((*LandlockKeySlot)(nil))
+	state.RegisterNoHooks((*LandlockRuleset)(nil))
+	state.RegisterNoHooks((*LandlockRulesetFD)(nil))
 	state.RegisterNoHooks((*FileLocks)(nil))
 	state.RegisterNoHooks((*fileLocks)(nil))
 	state.RegisterNoHooks((*mountLockFlags)(nil))

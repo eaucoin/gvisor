@@ -593,6 +593,7 @@ func (i *inode) StateFields() []string {
 		"locks",
 		"writeCount",
 		"watches",
+		"landlock",
 		"impl",
 	}
 }
@@ -621,7 +622,8 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(14, &i.locks)
 	stateSinkObject.Save(15, &i.writeCount)
 	stateSinkObject.Save(16, &i.watches)
-	stateSinkObject.Save(17, &i.impl)
+	stateSinkObject.Save(17, &i.landlock)
+	stateSinkObject.Save(18, &i.impl)
 	stateSinkObject.SaveValue(4, accessACLValue)
 	stateSinkObject.SaveValue(5, defaultACLValue)
 }
@@ -645,7 +647,8 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(14, &i.locks)
 	stateSourceObject.Load(15, &i.writeCount)
 	stateSourceObject.Load(16, &i.watches)
-	stateSourceObject.Load(17, &i.impl)
+	stateSourceObject.Load(17, &i.landlock)
+	stateSourceObject.Load(18, &i.impl)
 	stateSourceObject.LoadValueTo(4, (**vfs.PosixACL)(nil), i)
 	stateSourceObject.LoadValueTo(5, (**vfs.PosixACL)(nil), i)
 }

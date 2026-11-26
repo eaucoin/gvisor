@@ -248,6 +248,7 @@ func (i *inode) StateFields() []string {
 		"inlineTail",
 		"locks",
 		"watches",
+		"landlock",
 	}
 }
 
@@ -264,6 +265,7 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(5, &i.inlineTail)
 	stateSinkObject.Save(6, &i.locks)
 	stateSinkObject.Save(7, &i.watches)
+	stateSinkObject.Save(8, &i.landlock)
 }
 
 func (i *inode) afterLoad(context.Context) {}
@@ -278,6 +280,7 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(5, &i.inlineTail)
 	stateSourceObject.Load(6, &i.locks)
 	stateSourceObject.Load(7, &i.watches)
+	stateSourceObject.Load(8, &i.landlock)
 }
 
 func (d *dentry) StateTypeName() string {

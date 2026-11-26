@@ -648,6 +648,7 @@ func (k *Kernel) StateFields() []string {
 		"NvidiaDriverVersion",
 		"AllowSUID",
 		"IOUringEnabled",
+		"LandlockEnabled",
 		"MaxKeySetSize",
 		"HostNamePoller",
 		"DomainNamePoller",
@@ -713,9 +714,10 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(50, &k.NvidiaDriverVersion)
 	stateSinkObject.SaveBool(51, &k.AllowSUID)
 	stateSinkObject.SaveBool(52, &k.IOUringEnabled)
-	stateSinkObject.Save(53, &k.MaxKeySetSize)
-	stateSinkObject.Save(54, &k.HostNamePoller)
-	stateSinkObject.Save(55, &k.DomainNamePoller)
+	stateSinkObject.SaveBool(53, &k.LandlockEnabled)
+	stateSinkObject.Save(54, &k.MaxKeySetSize)
+	stateSinkObject.Save(55, &k.HostNamePoller)
+	stateSinkObject.Save(56, &k.DomainNamePoller)
 	stateSinkObject.SaveValue(27, danglingEndpointsValue)
 }
 
@@ -775,9 +777,10 @@ func (k *Kernel) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(50, &k.NvidiaDriverVersion)
 	stateSourceObject.LoadBool(51, &k.AllowSUID)
 	stateSourceObject.LoadBool(52, &k.IOUringEnabled)
-	stateSourceObject.Load(53, &k.MaxKeySetSize)
-	stateSourceObject.Load(54, &k.HostNamePoller)
-	stateSourceObject.Load(55, &k.DomainNamePoller)
+	stateSourceObject.LoadBool(53, &k.LandlockEnabled)
+	stateSourceObject.Load(54, &k.MaxKeySetSize)
+	stateSourceObject.Load(55, &k.HostNamePoller)
+	stateSourceObject.Load(56, &k.DomainNamePoller)
 	stateSourceObject.LoadValueTo(27, (*[]tcpip.Endpoint)(nil), k)
 }
 

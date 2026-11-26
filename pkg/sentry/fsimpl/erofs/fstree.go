@@ -55,6 +55,19 @@ func genericIsDescendant(fs *filesystem, vfsroot *vfs.Dentry, d *dentry) bool {
 	return d != nil
 }
 
+// WalkAncestors is a generic implementation of FilesystemImpl.WalkAncestors().
+// It calls visit on d and then on each of d's ancestors, up to the root of fs,
+// and stops early if visit returns false.
+func genericWalkAncestors(fs *filesystem, d *dentry, visit func(*vfs.Dentry) bool) {
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
+	for ; d != nil; d = d.parent.Load() {
+		if !visit(&d.vfsd) {
+			return
+		}
+	}
+}
+
 // PrependPath is a generic implementation of FilesystemImpl.PrependPath().
 func genericPrependPath(fs *filesystem, vfsroot vfs.VirtualDentry, mnt *vfs.Mount, d *dentry, b *fspath.Builder) error {
 	fs.ancestryMu.RLock()

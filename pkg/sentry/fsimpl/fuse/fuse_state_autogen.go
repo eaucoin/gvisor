@@ -395,6 +395,7 @@ func (fs *filesystem) StateFields() []string {
 		"conn",
 		"opts",
 		"clock",
+		"landlock",
 	}
 }
 
@@ -408,6 +409,7 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &fs.conn)
 	stateSinkObject.Save(3, &fs.opts)
 	stateSinkObject.Save(4, &fs.clock)
+	stateSinkObject.Save(5, &fs.landlock)
 }
 
 func (fs *filesystem) afterLoad(context.Context) {}
@@ -419,6 +421,7 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(2, &fs.conn)
 	stateSourceObject.Load(3, &fs.opts)
 	stateSourceObject.Load(4, &fs.clock)
+	stateSourceObject.Load(5, &fs.landlock)
 }
 
 func (f *fileHandle) StateTypeName() string {
@@ -467,6 +470,7 @@ func (i *inode) StateFields() []string {
 		"fs",
 		"nodeID",
 		"generation",
+		"landlock",
 		"entryTime",
 		"attrVersion",
 		"attrTime",
@@ -502,24 +506,25 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(6, &i.fs)
 	stateSinkObject.SaveUint64(7, &i.nodeID)
 	stateSinkObject.SaveUint64(8, &i.generation)
-	stateSinkObject.Save(9, &i.entryTime)
-	stateSinkObject.Save(10, &i.attrVersion)
-	stateSinkObject.Save(11, &i.attrTime)
-	stateSinkObject.SaveString(12, &i.link)
-	stateSinkObject.Save(13, &i.fh)
-	stateSinkObject.Save(14, &i.locks)
-	stateSinkObject.Save(15, &i.watches)
-	stateSinkObject.Save(16, &i.ino)
-	stateSinkObject.Save(17, &i.uid)
-	stateSinkObject.Save(18, &i.gid)
-	stateSinkObject.Save(19, &i.mode)
-	stateSinkObject.Save(20, &i.atime)
-	stateSinkObject.Save(21, &i.mtime)
-	stateSinkObject.Save(22, &i.ctime)
-	stateSinkObject.Save(23, &i.size)
-	stateSinkObject.Save(24, &i.blocks)
-	stateSinkObject.Save(25, &i.nlink)
-	stateSinkObject.Save(26, &i.blockSize)
+	stateSinkObject.Save(9, &i.landlock)
+	stateSinkObject.Save(10, &i.entryTime)
+	stateSinkObject.Save(11, &i.attrVersion)
+	stateSinkObject.Save(12, &i.attrTime)
+	stateSinkObject.SaveString(13, &i.link)
+	stateSinkObject.Save(14, &i.fh)
+	stateSinkObject.Save(15, &i.locks)
+	stateSinkObject.Save(16, &i.watches)
+	stateSinkObject.Save(17, &i.ino)
+	stateSinkObject.Save(18, &i.uid)
+	stateSinkObject.Save(19, &i.gid)
+	stateSinkObject.Save(20, &i.mode)
+	stateSinkObject.Save(21, &i.atime)
+	stateSinkObject.Save(22, &i.mtime)
+	stateSinkObject.Save(23, &i.ctime)
+	stateSinkObject.Save(24, &i.size)
+	stateSinkObject.Save(25, &i.blocks)
+	stateSinkObject.Save(26, &i.nlink)
+	stateSinkObject.Save(27, &i.blockSize)
 }
 
 func (i *inode) afterLoad(context.Context) {}
@@ -535,24 +540,53 @@ func (i *inode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(6, &i.fs)
 	stateSourceObject.LoadUint64(7, &i.nodeID)
 	stateSourceObject.LoadUint64(8, &i.generation)
-	stateSourceObject.Load(9, &i.entryTime)
-	stateSourceObject.Load(10, &i.attrVersion)
-	stateSourceObject.Load(11, &i.attrTime)
-	stateSourceObject.LoadString(12, &i.link)
-	stateSourceObject.Load(13, &i.fh)
-	stateSourceObject.Load(14, &i.locks)
-	stateSourceObject.Load(15, &i.watches)
-	stateSourceObject.Load(16, &i.ino)
-	stateSourceObject.Load(17, &i.uid)
-	stateSourceObject.Load(18, &i.gid)
-	stateSourceObject.Load(19, &i.mode)
-	stateSourceObject.Load(20, &i.atime)
-	stateSourceObject.Load(21, &i.mtime)
-	stateSourceObject.Load(22, &i.ctime)
-	stateSourceObject.Load(23, &i.size)
-	stateSourceObject.Load(24, &i.blocks)
-	stateSourceObject.Load(25, &i.nlink)
-	stateSourceObject.Load(26, &i.blockSize)
+	stateSourceObject.Load(9, &i.landlock)
+	stateSourceObject.Load(10, &i.entryTime)
+	stateSourceObject.Load(11, &i.attrVersion)
+	stateSourceObject.Load(12, &i.attrTime)
+	stateSourceObject.LoadString(13, &i.link)
+	stateSourceObject.Load(14, &i.fh)
+	stateSourceObject.Load(15, &i.locks)
+	stateSourceObject.Load(16, &i.watches)
+	stateSourceObject.Load(17, &i.ino)
+	stateSourceObject.Load(18, &i.uid)
+	stateSourceObject.Load(19, &i.gid)
+	stateSourceObject.Load(20, &i.mode)
+	stateSourceObject.Load(21, &i.atime)
+	stateSourceObject.Load(22, &i.mtime)
+	stateSourceObject.Load(23, &i.ctime)
+	stateSourceObject.Load(24, &i.size)
+	stateSourceObject.Load(25, &i.blocks)
+	stateSourceObject.Load(26, &i.nlink)
+	stateSourceObject.Load(27, &i.blockSize)
+}
+
+func (l *landlockKey) StateTypeName() string {
+	return "pkg/sentry/fsimpl/fuse.landlockKey"
+}
+
+func (l *landlockKey) StateFields() []string {
+	return []string{
+		"nodeID",
+		"generation",
+	}
+}
+
+func (l *landlockKey) beforeSave() {}
+
+// +checklocksignore
+func (l *landlockKey) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.SaveUint64(0, &l.nodeID)
+	stateSinkObject.SaveUint64(1, &l.generation)
+}
+
+func (l *landlockKey) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *landlockKey) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadUint64(0, &l.nodeID)
+	stateSourceObject.LoadUint64(1, &l.generation)
 }
 
 func (r *inodeRefs) StateTypeName() string {
@@ -813,6 +847,7 @@ func init() {
 	state.RegisterNoHooks((*filesystem)(nil))
 	state.RegisterNoHooks((*fileHandle)(nil))
 	state.RegisterNoHooks((*inode)(nil))
+	state.RegisterNoHooks((*landlockKey)(nil))
 	state.RegisterStruct((*inodeRefs)(nil))
 	state.RegisterNoHooks((*regularFileFD)(nil))
 	state.RegisterNoHooks((*requestList)(nil))

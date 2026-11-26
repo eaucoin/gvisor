@@ -1549,6 +1549,7 @@ func (i *ioData) StateTypeName() string {
 func (i *ioData) StateFields() []string {
 	return []string{
 		"DynamicBytesFile",
+		"task",
 		"ioUsage",
 	}
 }
@@ -1559,7 +1560,8 @@ func (i *ioData) beforeSave() {}
 func (i *ioData) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.DynamicBytesFile)
-	stateSinkObject.Save(1, &i.ioUsage)
+	stateSinkObject.Save(1, &i.task)
+	stateSinkObject.Save(2, &i.ioUsage)
 }
 
 func (i *ioData) afterLoad(context.Context) {}
@@ -1567,7 +1569,8 @@ func (i *ioData) afterLoad(context.Context) {}
 // +checklocksignore
 func (i *ioData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.DynamicBytesFile)
-	stateSourceObject.Load(1, &i.ioUsage)
+	stateSourceObject.Load(1, &i.task)
+	stateSourceObject.Load(2, &i.ioUsage)
 }
 
 func (o *oomScoreAdj) StateTypeName() string {

@@ -31,6 +31,7 @@ func (c *Credentials) StateFields() []string {
 		"KeepCaps",
 		"NoSetUIDFixup",
 		"UserNamespace",
+		"LandlockDomain",
 	}
 }
 
@@ -56,6 +57,7 @@ func (c *Credentials) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(14, &c.KeepCaps)
 	stateSinkObject.SaveBool(15, &c.NoSetUIDFixup)
 	stateSinkObject.Save(16, &c.UserNamespace)
+	stateSinkObject.Save(17, &c.LandlockDomain)
 }
 
 func (c *Credentials) afterLoad(context.Context) {}
@@ -79,6 +81,7 @@ func (c *Credentials) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.LoadBool(14, &c.KeepCaps)
 	stateSourceObject.LoadBool(15, &c.NoSetUIDFixup)
 	stateSourceObject.Load(16, &c.UserNamespace)
+	stateSourceObject.Load(17, &c.LandlockDomain)
 }
 
 func (i *IDMapEntry) StateTypeName() string {

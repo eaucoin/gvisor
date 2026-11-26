@@ -656,6 +656,7 @@ func (i *InodeWatches) StateTypeName() string {
 func (i *InodeWatches) StateFields() []string {
 	return []string{
 		"watches",
+		"landlock",
 	}
 }
 
@@ -665,6 +666,7 @@ func (i *InodeWatches) beforeSave() {}
 func (i *InodeWatches) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.watches)
+	stateSinkObject.Save(1, &i.landlock)
 }
 
 func (i *InodeWatches) afterLoad(context.Context) {}
@@ -672,6 +674,7 @@ func (i *InodeWatches) afterLoad(context.Context) {}
 // +checklocksignore
 func (i *InodeWatches) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.watches)
+	stateSourceObject.Load(1, &i.landlock)
 }
 
 func (i *InodeAnonymous) StateTypeName() string {
