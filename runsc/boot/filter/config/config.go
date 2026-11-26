@@ -46,6 +46,21 @@ const (
 	// holds.
 	HostFSNone HostFSAccess = iota
 
+	// HostFSReadOnly means that the Sentry can look up host files and read
+	// their metadata. It cannot create, rename or remove a host file, and it
+	// cannot change the mode or the owner of a host file.
+	//
+	// The Sentry does not check that a mount is writable before it reopens a
+	// host file for writing or changes an extended attribute, so this level
+	// allows those syscalls. On a read-only host mount, the host denies
+	// them, except the reopen of a special file such as a device.
+	HostFSReadOnly
+
+	// HostFSReadWriteExistingFiles means that the Sentry can also change
+	// the mode and the owner of a host file. It cannot create, rename or
+	// remove a host file.
+	HostFSReadWriteExistingFiles
+
 	// HostFSReadWrite means that the Sentry can look up, create, rename and
 	// remove host files and directories, and can change their metadata.
 	HostFSReadWrite
@@ -56,6 +71,10 @@ func (a HostFSAccess) String() string {
 	switch a {
 	case HostFSNone:
 		return "none"
+	case HostFSReadOnly:
+		return "readonly"
+	case HostFSReadWriteExistingFiles:
+		return "readwriteexistingfiles"
 	case HostFSReadWrite:
 		return "readwrite"
 	default:
@@ -206,7 +225,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(cpuProfilerFilters())
 	}
 	if opt.HostFS != HostFSNone {
-		s.Merge(hostFilesystemFilters(vars))
+		s.Merge(hostFilesystemFilters(opt.HostFS, vars))
 	}
 	if opt.NVProxy {
 		s.Merge(nvproxy.Filters(opt.NVProxyCaps))

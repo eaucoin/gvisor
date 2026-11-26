@@ -509,7 +509,7 @@ func frontendExportToDMABufFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Pa
 }
 
 // dmaBufFDWrapper wraps a host dma-buf fd returned by the NVIDIA driver's
-// export operation as an application FD. It implements vfs.HostFDProvider so
+// export operation as an application FD. It implements vfs.DMABufProvider so
 // that rdmaproxy can recover the host fd to hand to ibv_reg_dmabuf_mr.
 //
 // +stateify savable
@@ -522,8 +522,8 @@ type dmaBufFDWrapper struct {
 	hostFD int32
 }
 
-// HostFD implements vfs.HostFDProvider.HostFD.
-func (fd *dmaBufFDWrapper) HostFD() int {
+// DMABufHostFD implements vfs.DMABufProvider.DMABufHostFD.
+func (fd *dmaBufFDWrapper) DMABufHostFD() int {
 	return int(fd.hostFD)
 }
 
@@ -844,7 +844,7 @@ func mirrorAppRange(ctx context.Context, t *kernel.Task, ar hostarch.AddrRange, 
 		}
 		if _, _, errno := unix.Syscall(unix.SYS_MADVISE, m, uintptr(ar.Length()), uintptr(advice)); errno != 0 {
 			if !madvPopulateDisabled.Swap(true) {
-				log.Infof("nvproxy: disabling MADV_POPULATE_READ/WRITE before host driver pinning: %s", errno)
+				log.Infof("PERF: nvproxy: disabling MADV_POPULATE_READ/WRITE before host driver pinning: %s", errno)
 			}
 		}
 	}
@@ -1675,6 +1675,14 @@ func rmAllocChannelGroupV615(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_P
 	})
 }
 
+// rmAllocChannelGroupV620 is the same as rmAllocChannelGroup, but for
+// 620.70.06.
+func rmAllocChannelGroupV620(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+	})
+}
+
 func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS) {
 		// See
@@ -1711,6 +1719,14 @@ func rmAllocContextShare(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// group, so (given that we are representing graphics context
 		// dependencies as channel group dependencies) no separate dependency
 		// is required.
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+	})
+}
+
+// rmAllocContextShareV620 is the same as rmAllocContextShare, but for
+// 620.70.06.
+func rmAllocContextShareV620(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) {
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
 	})
 }

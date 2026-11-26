@@ -107,6 +107,15 @@ func OpenProcSelfFD(path string) error {
 	return nil
 }
 
+// ProcSelfFD returns the open /proc/self/fd directory FD, or -1 if it has not
+// been opened.
+func ProcSelfFD() int {
+	if procSelfFD == nil {
+		return -1
+	}
+	return procSelfFD.FD()
+}
+
 // ConnectionOpts returns the lisafs.ConnectionOpts for fsgofer.
 func ConnectionOpts(readonly bool) lisafs.ConnectionOpts {
 	return lisafs.ConnectionOpts{
@@ -1141,7 +1150,7 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 		return nil, lisafs.Statx{}, nil, -1, err
 	}
 	cu.Add(func() {
-		_ = unix.Unlink(socketPath)
+		_ = unix.Unlinkat(fd.hostFD, name, 0)
 	})
 
 	sockFileFD, err := tryOpen(func(flags int) (int, error) {

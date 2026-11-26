@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -46,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/hostsettings"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -456,9 +458,8 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		}
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
-		// setupCgroupForRoot confined a cgroup v1 sandbox cgroup; a systemd one
-		// exists only now that it is joined.
 		if cgroup.IsOnlyV2() {
+			hostsettings.ReportCgroupNSDelegate(conf, cgroup.HasNSDelegate())
 			if err := allowDevices(conf, containerCgroup, args.Spec); err != nil {
 				return err
 			}
@@ -679,11 +680,13 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 			}()
 
 			if mountsFile != nil {
-				cleanMounts, err := specutils.ReadMounts(mountsFile)
+				resolved, err := specutils.ReadMounts(mountsFile)
 				if err != nil {
 					return fmt.Errorf("reading mounts file: %v", err)
 				}
-				c.Spec.Mounts = cleanMounts
+				if err := specutils.ApplyResolvedMounts(c.Spec, c.GoferMountConfs, resolved); err != nil {
+					return fmt.Errorf("applying resolved mounts: %v", err)
+				}
 			}
 
 			// Setup stdios if the container is not using terminal. Otherwise TTY was
@@ -1779,7 +1782,8 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	if err := c.initGoferConfs(conf.GetOverlay2(), mountHints, rootfsHint); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error initializing gofer confs: %w", err)
 	}
-	if !c.GoferMountConfs[0].ShouldUseLisafs() && specutils.GPUFunctionalityRequestedViaHook(c.Spec, conf) {
+	configureGPU := specutils.GPUFunctionalityRequestedViaHook(c.Spec, conf)
+	if !c.GoferMountConfs[0].ShouldUseLisafs() && configureGPU {
 		// nvidia-container-runtime-hook attempts to populate the container
 		// rootfs with NVIDIA libraries and devices. With EROFS, spec.Root.Path
 		// points to an empty directory and populating that has no effect.
@@ -1892,6 +1896,18 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		return nil, nil, nil, nil, err
 	}
 	donations.DonateAndClose("mounts-fd", mountsGofer)
+	var sandEnds, goferFilestores []*os.File
+	var devSandEnd *os.File
+	cu := cleanup.Make(func() {
+		mountsSand.Close()
+		if devSandEnd != nil {
+			devSandEnd.Close()
+		}
+		for _, f := range slices.Concat(sandEnds, goferFilestores) {
+			f.Close()
+		}
+	})
+	defer cu.Clean()
 
 	willNeedHostRPC, err := goferWillNeedHostRPC(c.Spec)
 	if err != nil {
@@ -1930,7 +1946,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		}
 	}
 
-	sandEnds := make([]*os.File, 0, ioFileCount)
+	sandEnds = make([]*os.File, 0, ioFileCount)
 
 	// Handle rootfs (index 0)
 	switch {
@@ -1969,7 +1985,6 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		}
 		cfgIdx++
 	}
-	var devSandEnd *os.File
 	if shouldCreateDeviceGofer(c.Spec, conf) {
 		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
@@ -1985,9 +2000,8 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
 	}
 
-	// Enter new namespaces to isolate from the rest of the system. Don't unshare
-	// cgroup because gofer is added to a cgroup in the caller's namespace.
 	nss := []specs.LinuxNamespace{
+		{Type: specs.CgroupNamespace},
 		{Type: specs.IPCNamespace},
 		{Type: specs.MountNamespace},
 		{Type: specs.PIDNamespace},
@@ -2003,6 +2017,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	}
 
 	rootlessEUID := unix.Geteuid() != 0
+	var usernsSync *os.File
 	setUserMappings := false
 	// Setup any uid/gid mappings, and create or join the configured user
 	// namespace so the gofer's view of the filesystem aligns with the
@@ -2033,11 +2048,11 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		} else {
 			setUserMappings = true
 		}
-		syncFile, err := sandbox.ConfigureCmdForRootless(cmd, &donations)
+		usernsSync, err = sandbox.ConfigureCmdForRootless(cmd, &donations)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		defer syncFile.Close()
+		defer usernsSync.Close()
 		uid, gid := sandbox.SandboxUserGroupIDs(c.Spec)
 		if uid != 0 {
 			cmd.Args = append(cmd.Args, fmt.Sprintf("--uid=%d", uid))
@@ -2054,7 +2069,11 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	}
 	chrootSyncSandEnd := os.NewFile(uintptr(fds[0]), "chroot sync runsc FD")
 	chrootSyncGoferEnd := os.NewFile(uintptr(fds[1]), "chroot sync gofer FD")
-	donations.DonateAndClose("sync-chroot-fd", chrootSyncGoferEnd)
+	syncFlag := "sync-chroot-fd"
+	if configureGPU {
+		syncFlag = "sync-gpu-fd"
+	}
+	donations.DonateAndClose(syncFlag, chrootSyncGoferEnd)
 	defer chrootSyncSandEnd.Close()
 
 	donations.Transfer(cmd, nextFD)
@@ -2082,7 +2101,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		// The gofer was started in a new empty network namespace.
 		// Pin it, future gofers will join it instead of creating a new one.
 		if err := pinNullNetNS(conf, cmd.Process.Pid); err != nil {
-			log.Warningf("Unable to pin the gofer's network namespace at %q (%v); future gofers will create new network namespaces. This slows down gVisor startup.", nullNetNSPath(conf), err)
+			log.Warningf("PERF: Unable to pin the gofer's network namespace at %q (%v); future gofers will create new network namespaces. This slows down gVisor startup.", nullNetNSPath(conf), err)
 		} else {
 			log.Infof("Pinned null network namespace at %q", nullNetNSPath(conf))
 		}
@@ -2095,19 +2114,35 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		}
 	}
 
-	// Set up nvproxy with the Gofer's mount namespaces while chrootSyncSandEnd is
-	// is still open.
-	if err := nvproxySetup(c.Spec, conf, c.GoferPid.Load()); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("setting up nvproxy for gofer: %w", err)
+	if configureGPU {
+		// The gofer needs its user namespace mappings to prepare the rootfs.
+		if usernsSync != nil {
+			usernsSync.Close()
+		}
+		// Close our copy of the peer so a gofer setup error unblocks the read.
+		chrootSyncGoferEnd.Close()
+		var ready [1]byte
+		if _, err := io.ReadFull(chrootSyncSandEnd, ready[:]); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("waiting for gofer rootfs: %w", err)
+		}
+		if err := nvproxySetup(c.Spec, conf, c.GoferPid.Load()); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("setting up nvproxy for gofer: %w", err)
+		}
 	}
 
 	// Create gofer filestore files with the Gofer's mount namespaces while
 	// chrootSyncSandEnd is still open.
-	goferFilestores, err := c.createGoferFilestores(conf.GetOverlay2(), mountHints)
+	goferFilestores, err = c.createGoferFilestores(conf.GetOverlay2(), mountHints)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("creating gofer filestore files: %w", err)
 	}
 
+	if configureGPU {
+		if _, err := chrootSyncSandEnd.Write([]byte{1}); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("releasing gofer after GPU setup: %w", err)
+		}
+	}
+	cu.Release()
 	return sandEnds, goferFilestores, devSandEnd, mountsSand, nil
 }
 
@@ -2130,14 +2165,14 @@ func goferNetworkNamespace(conf *config.Config) (ns *specs.LinuxNamespace, nsFil
 		if err != nil {
 			if !os.IsNotExist(err) {
 				// Unexpected error.
-				log.Warningf("No usable null network namespace at %q (%v); creating a new one. This issue is slowing down your sandboxes' startup.", nullNetNSPath(conf), err)
+				log.Warningf("PERF: No usable null network namespace at %q (%v); creating a new one. This issue is slowing down your sandboxes' startup.", nullNetNSPath(conf), err)
 			} else if conf.SharedRootDir == "" && conf.RootDir != config.DefaultRootDir() {
 				// User has customized `--root` but not `--shared-root`, so they are likely missing out on
 				// the performance benefits of a shared root directory.
-				log.Warningf("gVisor startup is slower if `--root` (or `--shared-root`) is not reused across multiple sandboxes. You can speed up sandbox startup by setting `--shared-root` to a shared system-wide directory so that the null gofer network namespace is reused across sandboxes.")
+				log.Warningf("PERF: gVisor startup is slower if `--root` (or `--shared-root`) is not reused across multiple sandboxes. You can speed up sandbox startup by setting `--shared-root` to a shared system-wide directory so that the null gofer network namespace is reused across sandboxes.")
 			} else {
 				// Informational-only as this is expected on first sandbox creation.
-				log.Infof("No usable null network namespace at %q (%v); creating a new one. This is expected if this sandbox is the first sandbox to start with this `--shared-root` directory (%v). If this is not the first sandbox, this issue is slowing down your sandboxes' startup.", nullNetNSPath(conf), err, conf.SharedRoot())
+				log.Infof("PERF: No usable null network namespace at %q (%v); creating a new one. This is expected if this sandbox is the first sandbox to start with this `--shared-root` directory (%v). If this is not the first sandbox, this issue is slowing down your sandboxes' startup.", nullNetNSPath(conf), err, conf.SharedRoot())
 			}
 			return &specs.LinuxNamespace{Type: specs.NetworkNamespace}, nil, true
 		}
@@ -2464,7 +2499,7 @@ func logCPUPoliciesNotApplied(conf *config.Config, reason string) {
 	if !conf.SandboxCreationCPUPolicy.Implicit() || !conf.SandboxLifecycleCPUPolicy.Implicit() {
 		logf = log.Warningf
 	}
-	logf("[Lifecycle CPU] Not applying --sandbox-creation-cpu-policy=%v and --sandbox-lifecycle-cpu-policy=%v: %s.", conf.SandboxCreationCPUPolicy, conf.SandboxLifecycleCPUPolicy, reason)
+	logf("PERF: [Lifecycle CPU] Not applying --sandbox-creation-cpu-policy=%v and --sandbox-lifecycle-cpu-policy=%v: %s.", conf.SandboxCreationCPUPolicy, conf.SandboxLifecycleCPUPolicy, reason)
 }
 
 // cgroupResources returns `res` as the sandbox cgroup should have it now:
@@ -2799,7 +2834,7 @@ func nvproxyLoadKernelModules() {
 //
 // This should be called after the Gofer has started but before it has
 // pivot-root'd, as the bind mounts are created in the Gofer's mount namespace.
-// This function has no effect if nvproxy functionality is not requested.
+// The Gofer must have prepared the rootfs at spec.Root.Path.
 //
 // This function essentially replicates
 // nvidia-container-toolkit:cmd/nvidia-container-runtime-hook, i.e. the
@@ -2812,10 +2847,6 @@ func nvproxyLoadKernelModules() {
 // Note that nvidia-container-cli will set up files in /proc which are useless,
 // since they will be hidden by sentry procfs.
 func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
-	if !specutils.GPUFunctionalityRequestedViaHook(spec, conf) {
-		return nil
-	}
-
 	if spec.Root == nil {
 		return fmt.Errorf("spec missing root filesystem")
 	}

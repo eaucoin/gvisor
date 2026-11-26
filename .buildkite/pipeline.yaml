@@ -292,8 +292,7 @@ steps:
     <<: *source_test
     label: ":ship: Release tests"
     commands:
-      - make BAZEL_OPTIONS=--config=x86_64 artifacts/x86_64
-      - make BAZEL_OPTIONS=--config=aarch64 artifacts/aarch64
+      - make artifacts-all
       - make release
     agents:
       arch: "amd64"
@@ -524,13 +523,6 @@ steps:
     command: make plugin-network-tests
     agents:
       <<: *kvm_agents
-      arch: "amd64"
-      queue: "default"
-  - <<: *common
-    <<: *source_test
-    label: ":coffee: Do tests"
-    command: make do-tests
-    agents:
       arch: "amd64"
       queue: "default"
   - <<: *common

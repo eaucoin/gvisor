@@ -189,6 +189,10 @@ type subprocess struct {
 	dead atomicbitops.Bool
 }
 
+// errStubSeccompRejected is returned when the stub seccomp filter rejects a
+// syscall that the Sentry injects with ptrace.
+var errStubSeccompRejected = errors.New("seccomp says no")
+
 var seccompNotifyIsSupported = false
 
 func initSeccompNotify() {
@@ -198,7 +202,7 @@ func initSeccompNotify() {
 		// seccomp unotify is supported.
 		seccompNotifyIsSupported = true
 	case unix.EINVAL:
-		log.Warningf("Seccomp user-space notification mechanism isn't " +
+		log.Warningf("PERF: Seccomp user-space notification mechanism isn't " +
 			"supported by the kernel (available since Linux 5.0).")
 	default:
 		panic(fmt.Sprintf("seccomp returns unexpected code: %d", errno))
@@ -311,7 +315,7 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 			arch.SyscallArgument{Value: 0})
 		if err != nil {
 			if errors.Is(err, unix.EINVAL) {
-				t.Debugf("PR_SET_SYSCALL_USER_DISPATCH isn't supported. User syscalls will be trapped by seccomp.")
+				t.Debugf("PERF: PR_SET_SYSCALL_USER_DISPATCH isn't supported. User syscalls will be trapped by seccomp.")
 			} else {
 				handlePtraceSyscallRequestError(req, "prctl: %v", err)
 				return
@@ -797,14 +801,21 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 			return 0, err
 		}
 		if sig == unix.SIGTRAP {
-			// Reached syscall-enter-stop.
+			// Reached the trap instruction after the system call.
 			break
-		} else {
-			// Some other signal caused a thread stop; ignore.
-			if sig != unix.SIGSTOP && sig != unix.SIGCHLD {
-				log.Warningf("The thread %d:%d has been interrupted by %d", t.tgid, t.tid, sig)
+		}
+		if sig == unix.SIGSYS {
+			var si linux.SignalInfo
+			if err := t.getSignalInfo(&si); err != nil {
+				return 0, fmt.Errorf("cannot get signal info: %w", err)
 			}
-			continue
+			if si.Code == linux.SYS_SECCOMP {
+				return 0, errStubSeccompRejected
+			}
+		}
+		// Some other signal caused a thread stop. Ignore.
+		if sig != unix.SIGSTOP && sig != unix.SIGCHLD {
+			log.Warningf("The thread %d:%d has been interrupted by %d", t.tgid, t.tid, sig)
 		}
 	}
 
@@ -831,6 +842,8 @@ func (t *thread) syscallIgnoreInterrupt(
 			continue
 		case ERESTARTNOHAND:
 			continue
+		case errStubSeccompRejected:
+			return rval, fmt.Errorf("cannot inject system call %d: %w", sysno, err)
 		default:
 			return rval, err
 		}
@@ -1255,17 +1268,6 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	}
 
 	// Install a pre-compiled seccomp rules for the BPF process.
-	_, err = p.syscallIgnoreInterrupt(&p.initRegs, unix.SYS_PRCTL,
-		arch.SyscallArgument{Value: uintptr(linux.PR_SET_NO_NEW_PRIVS)},
-		arch.SyscallArgument{Value: uintptr(1)},
-		arch.SyscallArgument{Value: uintptr(0)},
-		arch.SyscallArgument{Value: uintptr(0)},
-		arch.SyscallArgument{Value: uintptr(0)},
-		arch.SyscallArgument{Value: uintptr(0)})
-	if err != nil {
-		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS) failed: %w", err)
-	}
-
 	_, err = p.syscallIgnoreInterrupt(&p.initRegs, seccomp.SYS_SECCOMP,
 		arch.SyscallArgument{Value: uintptr(linux.SECCOMP_SET_MODE_FILTER)},
 		arch.SyscallArgument{Value: uintptr(0)},

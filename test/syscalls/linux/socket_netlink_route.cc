@@ -4138,6 +4138,9 @@ TEST(NetlinkRouteTest, VethLinkLocalAddrOnUpDown) {
 TEST(NetlinkRouteTest, BridgeAddUnnamed) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
+  // Netstack state is not restored across save/restore.
+  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
+  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4155,13 +4158,18 @@ TEST(NetlinkRouteTest, BridgeAddUnnamed) {
   SKIP_IF(!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP);
   ASSERT_NO_ERRNO(err);
 
-  std::vector<Link> links = ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(fd));
-  std::map<std::string, std::string> link_kinds;
-  for (const Link& link : links) {
+  for (const Link& link : ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(fd))) {
     EXPECT_NE(link.name, "");
-    link_kinds[link.name] = link.kind;
   }
-  EXPECT_EQ(link_kinds["bridge0"], "bridge");
+  const Link bridge = ASSERT_NO_ERRNO_AND_VALUE(GetLinkByName("bridge0"));
+  EXPECT_EQ(bridge.kind, "bridge");
+  EXPECT_EQ(bridge.mtu, 1500);
+
+  MtuRequest mtu_req = GetMtuRequest(bridge, RTM_SETLINK, 1460);
+  ASSERT_NO_ERRNO(
+      NetlinkRequestAckOrError(fd, kSeq, &mtu_req, sizeof(mtu_req)));
+  const Link updated = ASSERT_NO_ERRNO_AND_VALUE(GetLinkByName("bridge0"));
+  EXPECT_EQ(updated.mtu, 1460);
 }
 
 TEST(NetlinkRouteTest, LinkInfoKind) {

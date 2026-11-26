@@ -94,7 +94,10 @@ func (c *controller) registerHandlers() {
 	l := c.manager.l
 	c.srv.Register(c.manager)
 	c.srv.Register(&control.Cgroups{Kernel: l.k})
-	c.srv.Register(&control.Fs{Kernel: l.k})
+	c.srv.Register(&control.Fs{
+		Kernel:             l.k,
+		CheckDirectFSMount: l.checkDirectFSMount,
+	})
 	c.srv.Register(&control.Lifecycle{Kernel: l.k})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
@@ -932,11 +935,12 @@ func (cm *containerManager) Mount(args *sentryapi.MountArgs, _ *struct{}) error 
 		Path:  fspath.Parse(dest),
 	}
 
+	// EROFS consumes the image FD even if mounting fails.
+	cu.Release()
 	if _, err := t.Kernel().VFS().MountAt(ctx, t.Credentials(), source, &pop, fstype, &opts); err != nil {
 		return err
 	}
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q, in container %q", source, dest, fstype, opts.GetFilesystemOptions.Data, args.ContainerID)
-	cu.Release()
 	return nil
 }
 

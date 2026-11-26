@@ -62,6 +62,10 @@ var redirects = map[string]string{
 	"/blog/2025/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent":  "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 	"/blog/2025/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/": "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 
+	// containerd 1.1 is end of life; its page was removed.
+	"/docs/user_guide/containerd/containerd_11/": "/docs/user_guide/containerd/quick_start/",
+	"/docs/user_guide/containerd/containerd_11":  "/docs/user_guide/containerd/quick_start/",
+
 	// Deprecated, but links continue to work.
 	"/cl": "https://gvisor-review.googlesource.com",
 
@@ -70,6 +74,9 @@ var redirects = map[string]string{
 
 	// Code search root.
 	"/cs": "https://cs.opensource.google/gvisor/gvisor",
+
+	// Self-service invite to the CNCF Slack workspace.
+	"/slack": "https://slack.cncf.io",
 }
 
 type prefixInfo struct {

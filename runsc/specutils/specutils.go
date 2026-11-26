@@ -400,17 +400,54 @@ func FixConfig(conf *config.Config, spec *specs.Spec) error {
 	return conf.Validate()
 }
 
-// ReadMounts reads mount list from a file.
-func ReadMounts(f *os.File) ([]specs.Mount, error) {
+// ResolvedMount is a mount of the spec after the gofer has set it up.
+type ResolvedMount struct {
+	Spec specs.Mount `json:"spec"`
+
+	// NonDir is true if the gofer serves the mount and its target is not a
+	// directory.
+	NonDir bool `json:"nonDir,omitempty"`
+}
+
+// ReadMounts reads the resolved mounts from a file.
+func ReadMounts(f *os.File) ([]ResolvedMount, error) {
 	bytes, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("error reading mounts: %v", err)
 	}
-	var mounts []specs.Mount
+	var mounts []ResolvedMount
 	if err := json.Unmarshal(bytes, &mounts); err != nil {
 		return nil, fmt.Errorf("error unmarshaling mounts: %v\nJSON bytes:\n%s", err, string(bytes))
 	}
 	return mounts, nil
+}
+
+// ApplyResolvedMounts replaces the mounts of spec with the resolved mounts,
+// and copies NonDir to the gofer mount config of each mount that has one.
+// mountConfs holds the config of the root, then the configs of those mounts
+// in order. On error, nothing changes.
+func ApplyResolvedMounts(spec *specs.Spec, mountConfs []GoferMountConf, resolved []ResolvedMount) error {
+	numConfs := 1 // First config is for rootfs.
+	for _, m := range resolved {
+		if HasMountConfig(m.Spec) {
+			numConfs++
+		}
+	}
+	if numConfs != len(mountConfs) {
+		return fmt.Errorf("the root and the resolved mounts need %d gofer mount configs, but there are %d", numConfs, len(mountConfs))
+	}
+	mounts := make([]specs.Mount, 0, len(resolved))
+	mountIdx := 1 // First index is for rootfs.
+	for _, m := range resolved {
+		mounts = append(mounts, m.Spec)
+		if !HasMountConfig(m.Spec) {
+			continue
+		}
+		mountConfs[mountIdx].NonDir = m.NonDir
+		mountIdx++
+	}
+	spec.Mounts = mounts
+	return nil
 }
 
 // ChangeMountType changes m.Type to the specified type. It may do necessary
@@ -936,17 +973,49 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	// Do the mount.
 	if err := SafeMount(src, dst, typ, uintptr(flags), "", procPath); err != nil {
-		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
+		return fmt.Errorf("mount(%q, %q, %d) failed: %w", src, dst, flags, err)
+	}
+	return nil
+}
+
+// CreateMountPointFile creates an empty regular file at dst for a file mount
+// point. It does nothing if dst already exists, including as a symlink or
+// another file type: the caller must verify dst before it mounts on it. It
+// never follows symlinks in any path component of dst.
+func CreateMountPointFile(dst string) error {
+	how := &unix.OpenHow{
+		// O_CREAT|O_EXCL refuses to follow a symlink at the final path component
+		// and returns EEXIST for any existing path without opening it.
+		// RESOLVE_NO_SYMLINKS also rejects symlinks in parent components.
+		Flags:   unix.O_RDONLY | unix.O_CREAT | unix.O_EXCL | unix.O_NOFOLLOW | unix.O_NOCTTY | unix.O_CLOEXEC,
+		Mode:    0644,
+		Resolve: unix.RESOLVE_NO_SYMLINKS,
+	}
+	var (
+		fd  int
+		err error
+	)
+	for {
+		fd, err = unix.Openat2(unix.AT_FDCWD, dst, how)
+		if err != unix.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		if err == unix.EEXIST {
+			return nil
+		}
+		return fmt.Errorf("creating mount point %q: %w", dst, err)
+	}
+	if err := unix.Close(fd); err != nil {
+		return fmt.Errorf("closing mount point %q: %w", dst, err)
 	}
 	return nil
 }
@@ -964,12 +1033,26 @@ type ErrSymlinkMount struct {
 // normal case with a destination consisting of a known root (/proc/root) and
 // symlink-free path (from resolveSymlink).
 func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) error {
+	fd, safePath, err := OpenMountTarget(dst, procPath)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	mountErr := unix.Mount(src, safePath, fstype, flags, data)
+	if mountErr != nil {
+		return fmt.Errorf("mount(%q, %q, %q, %#x, %q) failed: %w", src, safePath, fstype, flags, data, mountErr)
+	}
+	return nil
+}
+
+// OpenMountTarget pins dst and verifies its path through procfs. The caller
+// owns the returned O_PATH FD and can mount through its procfs path.
+func OpenMountTarget(dst, procPath string) (int, string, error) {
 	// Open the destination.
 	fd, err := unix.Open(dst, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("failed to safely mount: Open(%s, _, _): %w", dst, err)
+		return -1, "", fmt.Errorf("failed to safely mount: Open(%s, _, _): %w", dst, err)
 	}
-	defer unix.Close(fd)
 
 	// Use /proc/self/fd/ to verify that we opened the intended destination. This
 	// guards against dst being a symlink, in which case we could accidentally
@@ -980,17 +1063,15 @@ func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 	safePath := filepath.Join(procPath, "self/fd", strconv.Itoa(fd))
 	target, err := os.Readlink(safePath)
 	if err != nil {
-		return fmt.Errorf("failed to safely mount: Readlink(%s): %w", safePath, err)
+		unix.Close(fd)
+		return -1, "", fmt.Errorf("failed to safely mount: Readlink(%s): %w", safePath, err)
 	}
 	if dst != target {
-		return &ErrSymlinkMount{fmt.Errorf("failed to safely mount: expected to open %s, but found %s", dst, target)}
+		unix.Close(fd)
+		return -1, "", &ErrSymlinkMount{fmt.Errorf("failed to safely mount: expected to open %s, but found %s", dst, target)}
 	}
 
-	mountErr := unix.Mount(src, safePath, fstype, flags, data)
-	if mountErr != nil {
-		return fmt.Errorf("mount(%q, %q, %q, %#x, %q) failed: %w", src, safePath, fstype, flags, data, mountErr)
-	}
-	return nil
+	return fd, safePath, nil
 }
 
 // RetryEintr retries the function until an error different than EINTR is

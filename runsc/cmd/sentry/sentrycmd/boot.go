@@ -579,9 +579,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 		if b.willReexec() {
 			if config.CgoEnabled {
-				log.Warningf("Need to re-exec in order to drop capabilities, due to cgo build. This slows down gVisor startup. Use a pure-Go gVisor build for faster startup.")
+				log.Warningf("PERF: Need to re-exec in order to drop capabilities, due to cgo build. This slows down gVisor startup. Use a pure-Go gVisor build for faster startup.")
 			} else {
-				log.Infof("Re-execing. FYI, this step isn't necessary when running with root. gVisor will start up faster (and is just as secure) when started as root, as it has to do fewer hoops to get to its as-sandboxed-as-possible state.")
+				log.Infof("PERF: Re-execing. FYI, this step isn't necessary when running with root. gVisor will start up faster (and is just as secure) when started as root, as it has to do fewer hoops to get to its as-sandboxed-as-possible state.")
 			}
 			argOverride["apply-caps"] = "false"
 
@@ -646,13 +646,15 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	if b.mountsFD >= 0 {
 		// Read resolved mount list and replace the original one from the spec.
 		mountsFile := os.NewFile(uintptr(b.mountsFD), "mounts file")
-		cleanMounts, err := specutils.ReadMounts(mountsFile)
+		resolved, err := specutils.ReadMounts(mountsFile)
 		if err != nil {
 			mountsFile.Close()
 			util.Fatalf("Error reading mounts file: %v", err)
 		}
 		mountsFile.Close()
-		spec.Mounts = cleanMounts
+		if err := specutils.ApplyResolvedMounts(spec, b.goferMountConfs, resolved); err != nil {
+			util.Fatalf("Error applying resolved mounts: %v", err)
+		}
 		timer.Reached("resolved mounts read")
 	}
 
@@ -774,7 +776,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	// Fatalf exits the process and doesn't run defers.
 	// 'l' must be destroyed explicitly after this point!
 
-	l.PreSeccompCallback = func() {
+	l.PreSeccompCallback = func(procSelfFD int) {
 		if b.procMountSyncFD != -1 {
 			// Call validateOpenFDs() before umounting /proc.
 			validateOpenFDs(bootArgs.PassFDs, procSelfFD)

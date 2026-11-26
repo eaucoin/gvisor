@@ -126,6 +126,19 @@ func TestStartUp(t *testing.T) {
 	})
 }
 
+// TestMountTwice tests that a mounted connection refuses the Mount RPC.
+func TestMountTwice(t *testing.T) {
+	runServerClient(t, func(c *lisafs.Client) {
+		var (
+			req  lisafs.MountReq
+			resp lisafs.MountResp
+		)
+		if err := c.SndRcvMessage(lisafs.Mount, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String); err != unix.EBUSY {
+			t.Errorf("second Mount got error %v, want EBUSY", err)
+		}
+	})
+}
+
 func TestUnsupportedMessage(t *testing.T) {
 	unsupportedM := lisafs.MID(len(handlers))
 	var em lisafs.EmptyMessage
@@ -450,7 +463,7 @@ func TestUnlinkCloseRace(t *testing.T) {
 			// node while the original ControlFD on name was just closed.
 			tempChildFD := parent.allocateChild(name)
 			retainedSubFD = tempChildFD.allocateChild("sub")
-			tempChildFD.RemoveFromConn() // +checklocksignore
+			tempChildFD.DecRefLocked() // +checklocksignore
 			return nil
 		},
 	}

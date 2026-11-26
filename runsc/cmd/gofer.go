@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -81,12 +82,13 @@ type goferSyncFDs struct {
 	// filesystem related setup is done. This setup involves creating files and
 	// mounts in the Gofer process's mount namespace and needs to be done before
 	// the Gofer chroots.
-	// If this is set, this FD is the first that the Gofer waits for.
 	chrootFD int
+
+	// gpuFD synchronizes GPU setup at the prepared rootfs instead of chrootFD.
+	gpuFD int
 
 	// usernsFD is a file descriptor that is used to wait until
 	// user namespace ID mappings are established in the Gofer's userns.
-	// If this is set, this FD is the second that the Gofer waits for.
 	usernsFD int
 
 	// procMountFD is a file descriptor that has to be closed when the
@@ -224,7 +226,11 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if spawnUnmounter {
 			umounter = openProcUmounter()
 		}
-		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, containerID, g.bundleDir); err != nil {
+		var configureGPU func() error
+		if g.syncFDs.gpuFD >= 0 {
+			configureGPU = g.syncFDs.configureGPU
+		}
+		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, configureGPU, containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
 	}
@@ -251,9 +257,9 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	if g.applyCaps && willReexec {
 		if config.CgoEnabled {
-			log.Warningf("Need to re-exec in order to drop capabilities, due to cgo build. This slows down gVisor startup. Use a pure-Go gVisor build for faster startup.")
+			log.Warningf("PERF: Need to re-exec in order to drop capabilities, due to cgo build. This slows down gVisor startup. Use a pure-Go gVisor build for faster startup.")
 		} else {
-			log.Infof("Re-execing. FYI, this step isn't necessary when running with root. gVisor will start up faster (and is just as secure) when started as root, as it has to do fewer hoops to get to its as-sandboxed-as-possible state.")
+			log.Infof("PERF: Re-execing. FYI, this step isn't necessary when running with root. gVisor will start up faster (and is just as secure) when started as root, as it has to do fewer hoops to get to its as-sandboxed-as-possible state.")
 		}
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
@@ -290,13 +296,15 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	//
 	// Note that all mount points have been mounted in the proper location in
 	// setupRootFS().
-	cleanMounts, err := sandboxsetup.ResolveMounts(conf, spec.Mounts, root, g.mountConfs)
+	resolved, err := sandboxsetup.ResolveMounts(conf, spec.Mounts, root, g.mountConfs)
 	if err != nil {
 		util.Fatalf("Failure to resolve mounts: %v", err)
 	}
-	spec.Mounts = cleanMounts
+	if err := specutils.ApplyResolvedMounts(spec, g.mountConfs, resolved); err != nil {
+		util.Fatalf("Failure to apply resolved mounts: %v", err)
+	}
 	go func() {
-		if err := sandboxsetup.WriteMounts(g.mountsFD, cleanMounts); err != nil {
+		if err := sandboxsetup.WriteMounts(g.mountsFD, resolved); err != nil {
 			panic(fmt.Sprintf("Failed to write mounts: %v", err))
 		}
 	}()
@@ -393,12 +401,21 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d groups=%v canSetGroups=%t", ruid, euid, rgid, egid, groups, canSetGroups)
 
 	// Initialize filters.
+	procSelfFD := fsgofer.ProcSelfFD()
+	if procSelfFD < 0 {
+		util.Fatalf("procSelfFD is not open")
+	}
+	hostFS := filter.HostFSNone
+	if !conf.DirectFS || lisafsNeeded {
+		// The Sentry does not use directfs for every mount.
+		hostFS = filter.HostFSReadWrite
+	}
 	opts := filter.Options{
 		UDSOpenEnabled:   conf.GetHostUDS().AllowOpen(),
 		UDSCreateEnabled: conf.GetHostUDS().AllowCreate(),
 		ProfileEnabled:   profileOpts.Enabled(),
-		DirectFS:         conf.DirectFS,
-		LisafsNeeded:     lisafsNeeded,
+		HostFS:           hostFS,
+		ProcSelfFD:       uint32(procSelfFD),
 		CgoEnabled:       config.CgoEnabled,
 		VendorSyscalls:   filter.HostVendorSyscalls(),
 	}
@@ -594,6 +611,7 @@ func makeRPCMountOpener(goferToHostRPC *urpc.Client) sandboxsetup.MountOpener {
 // setFlags sets sync FD flags on the given FlagSet.
 func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
 	f.IntVar(&g.chrootFD, "sync-chroot-fd", -1, "file descriptor that the gofer waits on until container filesystem setup is done")
+	f.IntVar(&g.gpuFD, "sync-gpu-fd", -1, "replaces --sync-chroot-fd for GPU setup. The gofer writes one byte when the rootfs is ready and reads one byte when runsc finishes GPU setup.")
 	f.IntVar(&g.usernsFD, "sync-userns-fd", -1, "file descriptor the gofer waits on until userns mappings are set up")
 	f.IntVar(&g.procMountFD, "proc-mount-sync-fd", -1, "file descriptor that the gofer writes to when /proc isn't needed anymore and can be unmounted")
 }
@@ -603,6 +621,7 @@ func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
 func (g *goferSyncFDs) flags() map[string]string {
 	return map[string]string{
 		"sync-chroot-fd":     fmt.Sprintf("%d", g.chrootFD),
+		"sync-gpu-fd":        fmt.Sprintf("%d", g.gpuFD),
 		"sync-userns-fd":     fmt.Sprintf("%d", g.usernsFD),
 		"proc-mount-sync-fd": fmt.Sprintf("%d", g.procMountFD),
 	}
@@ -667,6 +686,20 @@ func (g *goferSyncFDs) syncUsernsForRootless(uid, gid uint32) {
 	}
 	sandboxsetup.SyncUsernsForRootless(g.usernsFD, uid, gid)
 	g.usernsFD = -1
+}
+
+// configureGPU signals that the rootfs is ready for the NVIDIA toolkit and
+// waits for runsc to finish setting up the filesystem.
+func (g *goferSyncFDs) configureGPU() error {
+	f := os.NewFile(uintptr(g.gpuFD), "GPU setup sync FD")
+	defer f.Close()
+	g.gpuFD = -1
+	var ready [1]byte
+	if _, err := f.Write(ready[:]); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(f, ready[:])
+	return err
 }
 
 // syncChroot waits on chrootFD to be closed.

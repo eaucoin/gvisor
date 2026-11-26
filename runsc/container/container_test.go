@@ -2814,6 +2814,74 @@ func TestReadonlyMount(t *testing.T) {
 	}
 }
 
+func TestRecursiveReadonlyMount(t *testing.T) {
+	version, err := hostos.KernelVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !version.AtLeast(5, 12) {
+		t.Skip("rro requires mount_setattr")
+	}
+	src := t.TempDir()
+	nested := filepath.Join(src, "inherited")
+	for _, name := range []string{nested, filepath.Join(src, "overmount")} {
+		if err := os.Mkdir(name, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.Mount("tmpfs", nested, "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Unmount(nested, unix.MNT_DETACH)
+
+	plain, tree := t.TempDir(), t.TempDir()
+	spec, conf := sleepSpecConf(t)
+	conf.Overlay2.Set("none")
+	spec.Mounts = append(spec.Mounts,
+		specs.Mount{Source: src, Destination: plain, Type: "bind", Options: []string{"rbind", "ro"}},
+		specs.Mount{Source: src, Destination: tree, Type: "bind", Options: []string{"rbind", "rro"}},
+		specs.Mount{Source: t.TempDir(), Destination: filepath.Join(tree, "overmount"), Type: "bind", Options: []string{"rw"}},
+	)
+	setupTestRootDir(t, conf)
+	cs, cleanup, err := startContainers(conf, []*specs.Spec{spec}, []string{testutil.RandomContainerID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	// Inspect the Gofer's host mounts independently of Sentry VFS checks.
+	root := fmt.Sprintf("/proc/%d/root", cs[0].GoferPid.Load())
+	for path, wantReadonly := range map[string]bool{
+		nested:                                  false,
+		filepath.Join(root, nested):             false,
+		filepath.Join(root, plain):              true,
+		filepath.Join(root, plain, "inherited"): false,
+		filepath.Join(root, tree):               true,
+		filepath.Join(root, tree, "inherited"):  true,
+		filepath.Join(root, tree, "overmount"):  false,
+	} {
+		var st unix.Statfs_t
+		if err := unix.Statfs(path, &st); err != nil {
+			t.Fatalf("statfs(%q): %v", path, err)
+		}
+		if path != nested && st.Flags&(unix.ST_NODEV|unix.ST_NOSUID) != unix.ST_NODEV|unix.ST_NOSUID {
+			t.Errorf("statfs(%q) flags = %#x, want nodev and nosuid", path, st.Flags)
+		}
+		if ro := st.Flags&unix.ST_RDONLY != 0; ro != wantReadonly {
+			t.Errorf("statfs(%q) read-only = %t, want %t", path, ro, wantReadonly)
+		}
+	}
+	out, err := executeCombinedOutput(conf, cs[0], nil, "/bin/sh", "-c",
+		`grep -F " $1 " /proc/mounts | grep -Eq ' ro(,| )' && touch "$1/overmount/file"`, "sh", tree)
+	if err != nil {
+		t.Errorf("checking container mounts: %v, output: %s", err, out)
+	}
+	out, status, err := executeCombinedOutputWithStatus(conf, cs[0], nil, "/bin/touch", filepath.Join(tree, "inherited", "file"))
+	if err != nil || status == 0 || !strings.Contains(string(out), "Read-only file system") {
+		t.Errorf("touch in inherited rro mount: status %d, err %v, output %q, want EROFS", status, err, out)
+	}
+}
+
 func TestIDMappedMount(t *testing.T) {
 	for name, conf := range configs(t, false /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
@@ -3074,6 +3142,16 @@ func TestIDMappedMountFlags(t *testing.T) {
 				t.Fatalf("os.MkdirAll() failed: %v", err)
 			}
 
+			// ID-mapped rbinds also apply host mount flags to inherited mounts.
+			inherited := filepath.Join(dir1, "inherited")
+			if err := os.Mkdir(inherited, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Mount("tmpfs", inherited, "tmpfs", 0, ""); err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Unmount(inherited, unix.MNT_DETACH)
+
 			// Create a file in dir1 owned by 0:0 and a script/binary
 			testFilePath1 := filepath.Join(dir1, "test-file")
 			f, err := os.OpenFile(testFilePath1, os.O_RDONLY|os.O_CREATE, 0644)
@@ -3101,8 +3179,7 @@ func TestIDMappedMountFlags(t *testing.T) {
 			f.Close()
 
 			spec, _ := sleepSpecConf(t)
-			// Test with two mounts, since nodiratime and relatime are mutually exclusive.
-			spec.Mounts = append(spec.Mounts, specs.Mount{
+			plain := specs.Mount{
 				Destination: dir1,
 				Source:      dir1,
 				Type:        "bind",
@@ -3117,8 +3194,8 @@ func TestIDMappedMountFlags(t *testing.T) {
 					HostID:      0,
 					Size:        1,
 				}},
-			})
-			spec.Mounts = append(spec.Mounts, specs.Mount{
+			}
+			spec.Mounts = append(spec.Mounts, plain, specs.Mount{
 				Destination: dir2,
 				Source:      dir2,
 				Type:        "bind",
@@ -3134,6 +3211,20 @@ func TestIDMappedMountFlags(t *testing.T) {
 					Size:        1,
 				}},
 			})
+			rro := plain
+			rro.Destination = t.TempDir()
+			rro.Options = []string{"rbind", "idmap", "rro", "noexec"}
+			child := filepath.Join(inherited, "child")
+			if err := os.Mkdir(filepath.Join(inherited, "overmount"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			overmount := filepath.Join(rro.Destination, "inherited", "overmount")
+			spec.Mounts = append(spec.Mounts, rro,
+				// Plain ro permits a new mountpoint in the inherited submount.
+				specs.Mount{Destination: child, Source: dir2, Type: "bind", Options: []string{"bind", "rw"}},
+				// An explicit mount on an rro tree keeps its own flags.
+				specs.Mount{Destination: overmount, Source: dir2, Type: "bind", Options: []string{"bind", "rw", "relatime"}},
+			)
 			spec.Root.Readonly = false
 
 			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
@@ -3202,11 +3293,30 @@ func TestIDMappedMountFlags(t *testing.T) {
 			}
 
 			verifyMountinfo(dir1, []string{"ro", "noexec", "noatime", "nodiratime"})
+			goferRoot := fmt.Sprintf("/proc/%d/root", c.GoferPid.Load())
+			var st unix.Statfs_t
+			if err := unix.Statfs(filepath.Join(goferRoot, inherited), &st); err != nil {
+				t.Fatal(err)
+			}
+			const want = unix.ST_RDONLY | unix.ST_NOEXEC | unix.ST_NOSUID | unix.ST_NODEV
+			if st.Flags&want != want {
+				t.Errorf("inherited mount flags %#x, want ro, noexec, nosuid and nodev", st.Flags)
+			}
 			mnt2Want := []string{"rw", "relatime"}
 			if strings.Contains(name, "-overlay") {
 				mnt2Want = []string{"ro", "relatime"}
 			}
 			verifyMountinfo(dir2, mnt2Want)
+			verifyMountinfo(child, []string{"ro", "noexec"})
+			verifyMountinfo(rro.Destination, []string{"ro"})
+			verifyMountinfo(filepath.Join(rro.Destination, "inherited"), []string{"ro", "noexec", "nosuid", "nodev"})
+			verifyMountinfo(overmount, mnt2Want)
+			if err := unix.Statfs(filepath.Join(goferRoot, overmount), &st); err != nil {
+				t.Fatal(err)
+			}
+			if st.Flags&unix.ST_NOEXEC != 0 {
+				t.Errorf("explicit overmount inherited noexec from its rro parent")
+			}
 		})
 	}
 }
@@ -3717,7 +3827,6 @@ func TestOCISeccompErrnoRet(t *testing.T) {
 	}
 
 	spec, conf := sleepSpecConf(t)
-	conf.OCISeccomp = true
 
 	// getsid(2) and getpgid(2) are both fully implemented by the sentry and
 	// are not on the Go runtime's startup path, so the only way test_app can
@@ -3918,6 +4027,57 @@ probe %[6]s/after`, app, unix.SYS_GETSID, unix.SYS_GETPRIORITY, unix.PRIO_PGRP, 
 		t.Fatalf("error creating restore marker: %v", err)
 	}
 	checkOutput("after")
+}
+
+// TestOCISeccompKillProcess checks that an OCI seccomp profile can kill the
+// process that makes a syscall.
+func TestOCISeccompKillProcess(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.OCISeccomp = true
+	spec.Linux = &specs.Linux{
+		Seccomp: &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{
+				{
+					Names:  []string{"getsid"},
+					Action: specs.ActKillProcess,
+				},
+			},
+		},
+	}
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	ws, err := execute(conf, cont, app, "syscall", "--syscall="+strconv.Itoa(unix.SYS_GETSID))
+	if err != nil {
+		t.Fatalf("error executing test_app: %v", err)
+	}
+	if !ws.Signaled() || ws.Signal() != unix.SIGSYS {
+		t.Errorf("test_app wait status: got %#x, want killed by SIGSYS", uint32(ws))
+	}
 }
 
 func TestWaitOnExitedSandbox(t *testing.T) {
@@ -6960,5 +7120,157 @@ func TestReadFile(t *testing.T) {
 	}
 	if string(content3) != "inux" {
 		t.Errorf("Got %q (%d bytes), want 'inux' (4 bytes)", string(content3), len(content3))
+	}
+}
+
+// TestBindAtCleanup verifies that when creating a host socket fails after
+// bind(2), the gofer removes the socket and is not killed by its seccomp
+// filters.
+func TestBindAtCleanup(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	hostDir, err := os.MkdirTemp(testutil.TmpDir(), "bind-at")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(hostDir)
+	if err := os.Chmod(hostDir, 0777); err != nil {
+		t.Fatalf("os.Chmod(%q) failed: %v", hostDir, err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.DebugLog = filepath.Join(t.TempDir(), "runsc.log.%TIMESTAMP%.%COMMAND%.txt")
+	conf.DirectFS = true
+	conf.HostUDS = config.HostUDSCreate
+	if err := conf.Overlay2.Set("none"); err != nil {
+		t.Fatalf("Overlay2.Set(none) failed: %v", err)
+	}
+	spec.Mounts = slices.DeleteFunc(spec.Mounts, func(m specs.Mount) bool {
+		return m.Destination == testutil.TmpDir() || m.Destination == "/tmp"
+	})
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Destination: "/tmp",
+		Source:      hostDir,
+		Type:        "bind",
+	})
+	// Map only UID and GID 0 so that fchown(2) in the gofer fails for UID 1
+	// after bind(2) has created the socket on the host.
+	spec.Linux = &specs.Linux{
+		Namespaces: []specs.LinuxNamespace{
+			{Type: specs.UserNamespace},
+			{Type: specs.PIDNamespace},
+			{Type: specs.MountNamespace},
+		},
+		UIDMappings: []specs.LinuxIDMapping{{
+			ContainerID: 0,
+			HostID:      uint32(os.Getuid()),
+			Size:        1,
+		}},
+		GIDMappings: []specs.LinuxIDMapping{{
+			ContainerID: 0,
+			HostID:      uint32(os.Getgid()),
+			Size:        1,
+		}},
+	}
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	c, err := New(conf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer c.Destroy()
+	if err := c.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	pattern := strings.NewReplacer("%TIMESTAMP%", "*", "%COMMAND%", "gofer").Replace(conf.DebugLog)
+	logs, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("filepath.Glob(%q) failed: %v", pattern, err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("got log files %v for %q, want 1 file", logs, pattern)
+	}
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		if goferLog, err := os.ReadFile(logs[0]); err == nil {
+			t.Logf("gofer log %q:\n%s", logs[0], goferLog)
+		}
+	})
+	data, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", logs[0], err)
+	}
+	if !bytes.Contains(data, []byte("HostFS=none ")) {
+		t.Fatalf("gofer log %q does not show HostFS=none", logs[0])
+	}
+
+	// Run twice on the same path: the second run fails with EADDRINUSE if
+	// the first run left the socket behind, and with EIO if the gofer died.
+	wantErr := fmt.Sprintf("BindAndListen(%q) failed: %v", "/tmp/sock", unix.EINVAL)
+	for i := range 2 {
+		execFile, err := os.Open(app)
+		if err != nil {
+			t.Fatalf("os.Open(%q) failed: %v", app, err)
+		}
+		r, w, err := os.Pipe()
+		if err != nil {
+			execFile.Close()
+			t.Fatalf("os.Pipe() failed: %v", err)
+		}
+		type readResult struct {
+			out []byte
+			err error
+		}
+		readCh := make(chan readResult, 1)
+		go func() {
+			out, err := io.ReadAll(r)
+			readCh <- readResult{out: out, err: err}
+		}()
+		execArgs := &controlapi.ExecArgs{
+			Argv: []string{app, "fd_receiver", "--socket=/tmp/sock"},
+			KUID: 1,
+			KGID: 1,
+			FilePayload: controlapi.NewFilePayload(map[int]*os.File{
+				0: os.Stdin, 1: w, 2: w,
+			}, execFile),
+		}
+		ws, execErr := c.executeSync(conf, execArgs)
+		execFile.Close()
+		w.Close()
+		res := <-readCh
+		r.Close()
+		out, readErr := res.out, res.err
+		if execErr != nil {
+			t.Fatalf("attempt %d: executeSync failed: %v", i, execErr)
+		}
+		if readErr != nil {
+			t.Fatalf("attempt %d: io.ReadAll() failed: %v", i, readErr)
+		}
+		if !ws.Exited() {
+			t.Fatalf("attempt %d: fd_receiver did not exit normally (waitStatus=%#x): %s", i, ws, out)
+		}
+		if ws.ExitStatus() == 0 {
+			t.Fatalf("attempt %d: fd_receiver succeeded unexpectedly: %s", i, out)
+		}
+		if !strings.Contains(string(out), wantErr) {
+			t.Fatalf("attempt %d: got output %q, want %q", i, out, wantErr)
+		}
+		if _, err := os.Lstat(filepath.Join(hostDir, "sock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("attempt %d: os.Lstat(sock) = %v, want not exist", i, err)
+		}
 	}
 }

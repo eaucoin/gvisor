@@ -383,6 +383,27 @@ TEST_P(UnixNonStreamSocketPairTest, ZeroLengthRecvPeerShutdown) {
   }
 }
 
+// A zero-length send on a packet socket queues an empty message.
+TEST_P(UnixNonStreamSocketPairTest, ZeroLengthSend) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  struct msghdr msg = {};
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(0));
+  ASSERT_THAT(RetryEINTR(send)(sockets->second_fd(), nullptr, 0, 0),
+              SyscallSucceedsWithValue(0));
+
+  char buf[1];
+  for (int i = 0; i < 2; i++) {
+    EXPECT_THAT(
+        RetryEINTR(recv)(sockets->first_fd(), buf, sizeof(buf), MSG_DONTWAIT),
+        SyscallSucceedsWithValue(0));
+  }
+  EXPECT_THAT(
+      RetryEINTR(recv)(sockets->first_fd(), buf, sizeof(buf), MSG_DONTWAIT),
+      SyscallFailsWithErrno(EAGAIN));
+}
+
 // Shutting down writes fails subsequent sends with EPIPE, and must not
 // affect the peer's receive side on datagram sockets: messages sent before
 // the shutdown remain readable, and afterwards the peer sees EAGAIN, not

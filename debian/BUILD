@@ -1,6 +1,6 @@
 load("//tools:arch.bzl", "select_arch")
 load("//tools:defs.bzl", "pkg_deb", "pkg_tar", "version")
-load("//tools:release.bzl", "SIDECARS", "release_tars")
+load("//tools:release.bzl", "SIDECARS", "release_archives", "release_tars")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -36,9 +36,9 @@ pkg_tar(
 
 genrule(
     name = "changelog",
-    srcs = ["//tools/bazeldefs:version"],
+    srcs = [version],
     outs = ["changelog"],
-    cmd = "VERSION=$$(cat $(location //tools/bazeldefs:version)); printf 'runsc (%s) unstable; urgency=medium\\n\\n  * See https://gvisor.dev/docs/ for release details.\\n\\n -- The gVisor Authors <gvisor-dev@googlegroups.com>  %s\\n' \"$$VERSION\" \"$$(date -R)\" > \"$@\"",
+    cmd = "VERSION=$$(cat $(SRCS)); printf 'runsc (%s) unstable; urgency=medium\\n\\n  * See https://gvisor.dev/docs/ for release details.\\n\\n -- The gVisor Authors <gvisor-dev@googlegroups.com>  %s\\n' \"$$VERSION\" \"$$(date -R)\" > \"$@\"",
     stamp = 1,
 )
 
@@ -82,6 +82,21 @@ release_tars(
     bins = RELEASE_TAR_EXTRA_BINS,
     flavor = "default",
     visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "release-packages",
+    srcs = [
+        ":debian",
+        ":gvisor-release-tar-bz2",
+        ":gvisor-release-tar-zstd",
+    ],
+)
+
+release_archives(
+    name = "release-archives",
+    packages = ":release-packages",
+    tags = ["manual"],
 )
 
 # Release tarballs of instrumented gVisor builds, for fuzzing and testing.

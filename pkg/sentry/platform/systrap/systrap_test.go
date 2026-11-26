@@ -15,10 +15,14 @@
 package systrap
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
@@ -181,4 +185,113 @@ func TestSpinningQueueLayout(t *testing.T) {
 	if stubSpinningThreadQueueAddr < queueStart || stubSpinningThreadQueueAddr+sysmsg.SpinningQueueMemSize > stubContextRegion {
 		t.Errorf("spinning queue %#x not in [%#x, %#x)", stubSpinningThreadQueueAddr, queueStart, stubContextRegion)
 	}
+}
+
+// TestStubFiltersAttached checks the number of seccomp programs and
+// no_new_privs on each kind of stub thread.
+func TestStubFiltersAttached(t *testing.T) {
+	_, as, pctx, ac := newSystrapTest(t)
+	// Run once so that the subprocess creates a sysmsg thread.
+	if _, _, err := pctx.Switch(pkgcontext.Background(), &testMemoryManager{as: as}, ac, 0); err != nil {
+		t.Fatalf("cannot switch: %v", err)
+	}
+	// Stub processes inherit the seccomp programs of the test process.
+	self := procStatus(t, "self")
+	selfFilters, ok := self["Seccomp_filters"]
+	if !ok {
+		t.Skip("Seccomp_filters is not in /proc/self/status (Linux < 5.9)")
+	}
+	base, err := strconv.Atoi(selfFilters)
+	if err != nil {
+		t.Fatalf("cannot parse Seccomp_filters %q: %v", selfFilters, err)
+	}
+	sp := as.(*subprocess)
+	syscallFilters, sysmsgFilters := 1, 2
+	if seccompNotifyIsSupported {
+		syscallFilters, sysmsgFilters = 2, 3
+	}
+	type stubThread struct {
+		name    string
+		tid     int32
+		filters int
+	}
+	threads := []stubThread{
+		{"source", globalPool.source.syscallThread.thread.tid, 1},
+		{"syscall_thread", sp.syscallThread.thread.tid, syscallFilters},
+	}
+	sp.sysmsgThreadsMu.Lock()
+	numSysmsgThreads := len(sp.sysmsgThreads)
+	for _, mt := range sp.sysmsgThreads {
+		threads = append(threads, stubThread{"sysmsg_thread", mt.thread.tid, sysmsgFilters})
+	}
+	sp.sysmsgThreadsMu.Unlock()
+	if numSysmsgThreads == 0 {
+		t.Fatal("the subprocess has no sysmsg thread")
+	}
+	for _, th := range threads {
+		fields := procStatus(t, fmt.Sprint(th.tid))
+		if got := fields["NoNewPrivs"]; got != "1" {
+			t.Errorf("%s %d: NoNewPrivs = %q, want 1", th.name, th.tid, got)
+		}
+		if got, want := fields["Seccomp_filters"], fmt.Sprint(base+th.filters); got != want {
+			t.Errorf("%s %d: Seccomp_filters = %s, want %s", th.name, th.tid, got, want)
+		}
+	}
+}
+
+// procStatus returns the fields of /proc/<pid>/status.
+func procStatus(t *testing.T, pid string) map[string]string {
+	t.Helper()
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%s/status", pid))
+	if err != nil {
+		t.Fatalf("cannot read the status of %s: %v", pid, err)
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(status), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			fields[k] = strings.TrimSpace(v)
+		}
+	}
+	return fields
+}
+
+// TestSyscallLoopSpuriousWakeup checks that the futex loop of syscall
+// threads still work after a futex wakeup that comes before a syscall
+// request.
+func TestSyscallLoopSpuriousWakeup(t *testing.T) {
+	newSystrapTest(t)
+	// The source stub process uses the futex loop.
+	s := globalPool.source
+	tid := s.syscallThread.thread.tid
+	s.syscallThreadMu.Lock()
+	woken := 0
+	for range 10 {
+		woken += futexWakeCount(t, &s.syscallThread.sentryMessage.state)
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.syscallThreadMu.Unlock()
+	if woken == 0 {
+		t.Fatal("no futex wakeup reached the syscall thread")
+	}
+	for range 10 {
+		if threadDead(t, tid) {
+			t.Fatalf("syscall thread %d died after spurious futex wakeups", tid)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// munmap of an unmapped range succeeds.
+	if _, err := s.syscall(unix.SYS_MUNMAP, arch.SyscallArgument{Value: 0x10000}, arch.SyscallArgument{Value: hostarch.PageSize}); err != nil {
+		t.Fatalf("cannot munmap after spurious futex wakeups: %v", err)
+	}
+}
+
+// threadDead reports whether the thread tid is a zombie or gone.
+func threadDead(t *testing.T, tid int32) bool {
+	t.Helper()
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", tid))
+	if err != nil {
+		return true
+	}
+	fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+	return len(fields) == 0 || fields[0] == "Z" || fields[0] == "X"
 }

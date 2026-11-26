@@ -21,7 +21,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/flipcall"
@@ -94,14 +93,15 @@ func ErrorHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	return 0, unix.EINVAL
 }
 
-// MountHandler handles the Mount RPC. Note that there can not be concurrent
-// executions of MountHandler on a connection because the connection enforces
-// that Mount is the first message on the connection. Only after the connection
-// has been successfully mounted can other channels be created.
+// MountHandler handles the Mount RPC. A connection is only ever mounted once.
 //
 // +checklocksexclude:c.fdsMu
 // +checklocksexclude:c.server.renameMu
 func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	if !c.mounted.CompareAndSwap(false, true) {
+		log.Warningf("received Mount request on a connection which is mounted or is being mounted, mountPath = %q", c.mountPath)
+		return 0, unix.EBUSY
+	}
 	var (
 		mountPointFD     *ControlFD
 		mountPointHostFD = -1
@@ -154,6 +154,7 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		mountPointFD, mountPointStat, mountPointHostFD, err = c.impl.Mount(c, mountNode)
 		return err
 	}); err != nil {
+		c.mounted.Store(false)
 		return 0, err
 	}
 
@@ -162,7 +163,7 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	}
 	resp := MountResp{
 		Root: Inode{
-			ControlFD: mountPointFD.id,
+			ControlFD: c.publishFD(mountPointFD),
 			Stat:      mountPointStat,
 		},
 		SupportedMs:    c.impl.SupportedMessages(),
@@ -321,29 +322,23 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 		status    = WalkSuccess
 	)
 	respMetaSize := status.SizeBytes() + numInodes.SizeBytes()
-	maxPayloadSize := respMetaSize + (len(req.Path) * (*Inode)(nil).SizeBytes())
+	inodeSize := (*Inode)(nil).SizeBytes()
+	maxPayloadSize := respMetaSize + len(req.Path)*inodeSize
 	if maxPayloadSize > int(c.maxMessageSize) {
 		// Too much to walk, can't do.
 		return 0, unix.EIO
 	}
 	payloadBuf := comm.PayloadBuf(uint32(maxPayloadSize))
 	payloadPos := respMetaSize
+	// Each child belongs to this walk until the response is ready.
+	children := make([]*ControlFD, 0, len(req.Path))
+	defer func() {
+		for _, child := range children {
+			child.DecRef(nil)
+		}
+	}()
 	if err := c.server.withRenameReadLock(func() error {
 		curDir := startDir
-		// newFDs holds the IDs of the FDs created by this walk.
-		newFDs := make([]FDID, 0, len(req.Path))
-		cu := cleanup.Make(func() {
-			// Destroy all newly created FDs until now. Do not read their IDs back
-			// from the payload buffer, because the client can modify it at any
-			// time.
-			for _, id := range newFDs {
-				// Cleanup runs before withRenameReadLock releases the mutex;
-				// checklocks cannot propagate it into these passed callbacks.
-				c.removeControlFDLocked(id) // +checklocksignore
-			}
-		})
-		defer cu.Clean()
-
 		for _, name := range req.Path {
 			if err := checkSafeName(name); err != nil {
 				return err
@@ -371,18 +366,21 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 			if err != nil {
 				return err
 			}
-			newFDs = append(newFDs, child.id)
-			// Write inode into payload buffer.
-			i := Inode{ControlFD: child.id, Stat: childStat}
-			i.MarshalUnsafe(payloadBuf[payloadPos:])
-			payloadPos += i.SizeBytes()
+			children = append(children, child)
+			// Leave room for the FDID at the start of each Inode.
+			childStat.MarshalUnsafe(payloadBuf[payloadPos+(*FDID)(nil).SizeBytes():])
+			payloadPos += inodeSize
 			numInodes++
 			curDir = child
 		}
-		cu.Release()
 		return nil
 	}); err != nil {
 		return 0, err
+	}
+	for pos := respMetaSize; len(children) != 0; pos += inodeSize {
+		id := c.publishFD(children[0])
+		children = children[1:]
+		id.MarshalUnsafe(payloadBuf[pos:])
 	}
 
 	// WalkResp writes the walk status followed by the number of inodes in the
@@ -471,7 +469,7 @@ func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 			if parent != startDir {
 				// Both direct and deferred cleanup run inside withRenameReadLock;
 				// checklocks does not retain that callback's lock state.
-				c.removeControlFDLocked(parent.id) // +checklocksignore
+				parent.DecRefLocked() // +checklocksignore
 			}
 		}
 		defer closeParent()
@@ -572,7 +570,7 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	if hostOpenFD >= 0 {
 		comm.DonateFD(hostOpenFD)
 	}
-	resp := OpenAtResp{OpenFD: openFD.id}
+	resp := OpenAtResp{OpenFD: c.publishFD(openFD)}
 	respLen := uint32(resp.SizeBytes())
 	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
 	return respLen, nil
@@ -631,9 +629,9 @@ func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 		comm.DonateFD(hostOpenFD)
 	}
 	resp := OpenCreateAtResp{
-		NewFD: openFD.id,
+		NewFD: c.publishFD(openFD),
 		Child: Inode{
-			ControlFD: childFD.id,
+			ControlFD: c.publishFD(childFD),
 			Stat:      childStat,
 		},
 	}
@@ -818,7 +816,7 @@ func MkdirAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 
 	resp := MkdirAtResp{
 		ChildDir: Inode{
-			ControlFD: childDir.id,
+			ControlFD: c.publishFD(childDir),
 			Stat:      childDirStat,
 		},
 	}
@@ -868,7 +866,7 @@ func MknodAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	}
 	resp := MknodAtResp{
 		Child: Inode{
-			ControlFD: child.id,
+			ControlFD: c.publishFD(child),
 			Stat:      childStat,
 		},
 	}
@@ -918,7 +916,7 @@ func SymlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 	}
 	resp := SymlinkAtResp{
 		Symlink: Inode{
-			ControlFD: symlink.id,
+			ControlFD: c.publishFD(symlink),
 			Stat:      symlinkStat,
 		},
 	}
@@ -987,7 +985,7 @@ func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	}
 	resp := LinkAtResp{
 		Link: Inode{
-			ControlFD: link.id,
+			ControlFD: c.publishFD(link),
 			Stat:      linkStat,
 		},
 	}
@@ -1260,10 +1258,10 @@ func BindAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	comm.DonateFD(hostSocketFD)
 	resp := BindAtResp{
 		Child: Inode{
-			ControlFD: childFD.id,
+			ControlFD: c.publishFD(childFD),
 			Stat:      childStat,
 		},
-		BoundSocketFD: boundSocketFD.id,
+		BoundSocketFD: c.publishFD(boundSocketFD),
 	}
 	respLen := uint32(resp.SizeBytes())
 	resp.MarshalUnsafe(comm.PayloadBuf(respLen))

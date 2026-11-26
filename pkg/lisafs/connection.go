@@ -21,6 +21,7 @@ import (
 	"slices"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -37,8 +38,8 @@ import (
 // RPC concurrency.
 //
 // Reference model:
-//   - When any FD is created, the connection takes a ref on it which represents
-//     the client's ref on the FD.
+//   - A new FD belongs to its creator. Returning it to the client transfers
+//     that reference to the connection's FD table.
 //   - The client can drop its ref via the Close RPC which will in turn make the
 //     connection drop its ref.
 type Connection struct {
@@ -55,6 +56,9 @@ type Connection struct {
 	// mountPath is trusted because it is configured by the server (trusted) as
 	// per the user's sandbox configuration. mountPath is immutable.
 	mountPath string
+
+	// mounted is true during a Mount RPC and after a successful one.
+	mounted atomicbitops.Bool
 
 	// maxMessageSize is the cached value of impl.MaxMessageSize().
 	maxMessageSize uint32
@@ -370,11 +374,11 @@ func (c *Connection) lookupBoundSocketFD(id FDID) (*BoundSocketFD, error) {
 	return bsfd, nil
 }
 
-// insertFD inserts the passed fd into the internal data structure to track FDs.
-// The caller must hold a ref on fd which is transferred to the connection.
+// publishFD transfers the caller's reference to the connection and returns
+// its ID. The FD must belong to c. The client can close it immediately.
 //
 // +checklocksexclude:c.fdsMu
-func (c *Connection) insertFD(fd genericFD) FDID {
+func (c *Connection) publishFD(fd genericFD) FDID {
 	c.fdsMu.Lock()
 	defer c.fdsMu.Unlock()
 
@@ -399,27 +403,6 @@ func (c *Connection) removeFD(id FDID) {
 		// Drop the ref held by c. This can take arbitrarily long. So do not hold
 		// c.fdsMu while calling it.
 		fd.DecRef(nil)
-	}
-}
-
-// removeControlFDLocked removes a control FD with the server's rename mutex
-// already held at least for reading, avoiding its reacquisition during
-// destruction.
-//
-// Precondition: id must point to a control FD.
-//
-// +checklocksread:c.server.renameMu
-// +checklocksexclude:c.fdsMu
-func (c *Connection) removeControlFDLocked(id FDID) {
-	c.fdsMu.Lock()
-	fd := c.stopTrackingFD(id)
-	c.fdsMu.Unlock()
-	if fd != nil {
-		// Drop the ref held by c. This can take arbitrarily long. So do not hold
-		// c.fdsMu while calling it.
-		// The removed FD belongs to c, whose server.renameMu is held.
-		// checklocks cannot recover its owner through the connection map.
-		fd.(*ControlFD).decRefLocked() // +checklocksignore
 	}
 }
 
