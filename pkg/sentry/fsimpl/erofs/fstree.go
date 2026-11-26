@@ -32,7 +32,7 @@ func genericSetParentAndName(fs *filesystem, d, newParent *dentry, newName strin
 	fs.ancestryMu.Lock()
 	defer fs.ancestryMu.Unlock()
 	d.parent.Store(newParent)
-	d.name = newName
+	d.name = newName // +checklocksignore: fs.ancestryMu is locked; caller holds filesystem rename lock.
 }
 
 // IsAncestorDentry returns true if d is an ancestor of d2; that is, d is
@@ -70,7 +70,7 @@ func genericPrependPath(fs *filesystem, vfsroot vfs.VirtualDentry, mnt *vfs.Moun
 		if parent == nil {
 			return vfs.PrependPathAtNonMountRootError{}
 		}
-		b.PrependComponent(d.name)
+		b.PrependComponent(d.name) // +checklocksignore: fs.ancestryMu is read-locked.
 		d = parent
 	}
 }
