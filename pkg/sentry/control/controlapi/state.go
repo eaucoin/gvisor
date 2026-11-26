@@ -142,8 +142,20 @@ type SaveRestoreExecOpts struct {
 	// The first element is the path to the binary.
 	Argv string
 
+	// Socket, if not empty, is the path, in the container's mount namespace,
+	// of a Unix stream socket that the Sentry sends each mode's request to in
+	// place of running a binary, which Argv must then not name: what it sends
+	// and what it waits for are runsc checkpoint's --save-restore-exec-socket's.
+	Socket string
+
 	// Timeout is the timeout for waiting for the save/restore binary.
 	Timeout time.Duration
+
+	// SaveTimeout, if not zero, bounds the wait for the save and resume
+	// modes, Timeout then bounding the restore mode's alone: a restore's
+	// may wait on pages loading lazily, which a save's and a resume's
+	// need not.
+	SaveTimeout time.Duration
 
 	// ContainerID is the ID of the container that the save/restore binary executes in.
 	ContainerID string

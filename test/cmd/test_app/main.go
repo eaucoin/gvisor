@@ -59,6 +59,7 @@ func main() {
 	subcommands.Register(new(hostinetSR), "")
 	subcommands.Register(new(ptyRunner), "")
 	subcommands.Register(new(reaper), "")
+	subcommands.Register(new(saveRestoreListener), "")
 	subcommands.Register(new(syscall), "")
 	subcommands.Register(new(taskTree), "")
 	subcommands.Register(new(taskTreePGID), "")
