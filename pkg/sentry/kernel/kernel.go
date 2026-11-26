@@ -137,9 +137,16 @@ type SaveRestoreExecConfig struct {
 	// saved, "restore" after the kernel is restored and restarted, and "resume"
 	// after the kernel is saved and resumed.
 	Argv []string
+	// Socket, if not empty, is the path of a Unix stream socket, in the leader
+	// task's mount namespace, that each mode's request is sent to in place of
+	// running a binary; Argv is then empty.
+	Socket string
 	// Timeout is the timeout for the save/restore binary. If the binary fails to
 	// exit within this timeout the save/restore operation will fail.
 	Timeout time.Duration
+	// SaveTimeout, if not zero, is the timeout of the save and resume modes,
+	// Timeout then being the restore mode's alone.
+	SaveTimeout time.Duration
 	// LeaderTask is the task in the kernel that the save/restore binary will run
 	// under.
 	LeaderTask *Task

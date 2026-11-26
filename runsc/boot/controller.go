@@ -953,7 +953,7 @@ func (cm *containerManager) pauseRestored() {
 // Resume resumes all tasks. It does nothing if they are not paused: pausing
 // and resuming apply to the whole sandbox, and each container of a sandbox
 // restored paused is resumed, the first of them resuming the sandbox.
-func (cm *containerManager) Resume(_, _ *struct{}) error {
+func (cm *containerManager) Resume(args *sentryapi.ResumeArgs, _ *struct{}) error {
 	if _, err := cm.resumableSandbox(); err != nil {
 		return err
 	}
@@ -970,7 +970,11 @@ func (cm *containerManager) Resume(_, _ *struct{}) error {
 		defer cm.l.stopIfKilled()
 		cm.l.startWorkingSetRecording()
 		cm.l.k.Unpause()
-		return postRestoreResumed(cm.l.k)
+		reason := ""
+		if args != nil {
+			reason = args.SaveRestoreReason
+		}
+		return postRestoreResumed(cm.l.k, reason)
 	}
 	cm.l.k.Unpause()
 	return control.PostResume(cm.l.k, nil)

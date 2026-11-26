@@ -375,12 +375,23 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 		return err
 	}
 
-	if execOpts.Argv != "" {
-		argv := strings.Split(execOpts.Argv, " ")
-		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Timeout, execOpts.ContainerID); err != nil {
+	if execOpts.Argv != "" || execOpts.Socket != "" {
+		if execOpts.Argv != "" && execOpts.Socket != "" {
+			return fmt.Errorf("both a save/restore binary (%q) and a save/restore socket (%q) are given: give one", execOpts.Argv, execOpts.Socket)
+		}
+		var argv []string
+		if execOpts.Argv != "" {
+			argv = strings.Split(execOpts.Argv, " ")
+		}
+		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Socket, execOpts.Timeout, execOpts.SaveTimeout, execOpts.ContainerID); err != nil {
 			return fmt.Errorf("failed to configure save/restore binary: %w", err)
 		}
-		if err := saveRestoreExec(k, SaveRestoreExecSave, o.LoadWaitDeadline); err != nil {
+		// A save that leaves the sandbox running says so to a socket.
+		detail := ""
+		if o.Resume {
+			detail = saveRestoreLeaveRunning
+		}
+		if err := saveRestoreExec(k, SaveRestoreExecSave, detail, o.LoadWaitDeadline); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
 		}
 	}
@@ -422,10 +433,12 @@ func postResume(k *kernel.Kernel, timeline *timing.Timeline, cuda bool) error {
 	return postResumeTPU(k)
 }
 
-// PostRestore is called after restoring the kernel.
+// PostRestore is called after restoring the kernel. reason, if not empty, is
+// why the sandbox stopped before it was restored, which the restore mode's
+// request tells a save/restore socket (see SaveRestoreRequest).
 //
 // Precondition: The kernel should be running.
-func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
+func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, reason string) error {
 	if k.IsPaused() {
 		// The kernel is still paused (double-pause can happen with Docker which
 		// calls pause first and then checkpoint command). The final resume command
@@ -442,7 +455,7 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	if err := SaveRestoreExec(k, SaveRestoreExecRestore); err != nil {
+	if err := saveRestoreExec(k, SaveRestoreExecRestore, reason, time.Time{}); err != nil {
 		return fmt.Errorf("failed to wait for save/restore binary: %w", err)
 	}
 
@@ -555,26 +568,39 @@ func waitWithin(done <-chan struct{}, timeout time.Duration, loadWaitDeadline ti
 }
 
 // SaveRestoreExec creates a new process that executes the save/restore
-// binary specified by k.SaveRestoreExecConfig and waits for it to finish.
+// binary specified by k.SaveRestoreExecConfig and waits for it to finish, or,
+// where the configuration names a socket, sends the mode's request to it and
+// waits for its answer (see SaveRestoreRequest).
 //
 // Precondition: The kernel should be running; k.SetSaveRestoreExecConfig should
-// be setup with an argv, otherwise this function is a no-op.
+// be setup with an argv or a socket, otherwise this function is a no-op.
 func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
-	return saveRestoreExec(k, mode, time.Time{})
+	return saveRestoreExec(k, mode, "", time.Time{})
 }
 
-// saveRestoreExec is SaveRestoreExec, whose wait for the binary
-// loadWaitDeadline bounds if it is not zero (see waitWithin): once async page
-// loads stall past it, the binary is killed, and saveRestoreExec fails with
-// pgalloc.ErrLoadWaitExpired.
-func saveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode, loadWaitDeadline time.Time) error {
-	if k.SaveRestoreExecConfig == nil {
+// saveRestoreExec is SaveRestoreExec, whose request to a socket carries
+// detail after its mode, if detail is not empty, and whose wait for the
+// binary or the socket loadWaitDeadline bounds if it is not zero (see
+// waitWithin): once async page loads stall past it, the binary is killed, or
+// the request abandoned, and saveRestoreExec fails with
+// pgalloc.ErrLoadWaitExpired. The wait is bounded by the configuration's
+// SaveTimeout for the save and resume modes, where it is not zero, and by its
+// Timeout otherwise.
+func saveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode, detail string, loadWaitDeadline time.Time) error {
+	config := k.SaveRestoreExecConfig
+	if config == nil {
 		return nil
 	}
+	timeout := config.Timeout
+	if mode != SaveRestoreExecRestore && config.SaveTimeout != 0 {
+		timeout = config.SaveTimeout
+	}
+	if config.Socket != "" {
+		return saveRestoreRequest(k, config, mode, detail, timeout, loadWaitDeadline)
+	}
 
-	leader := k.SaveRestoreExecConfig.LeaderTask
-	argv := k.SaveRestoreExecConfig.Argv
-	timeout := k.SaveRestoreExecConfig.Timeout
+	leader := config.LeaderTask
+	argv := config.Argv
 	sctx := k.SupervisorContext()
 	contID := leader.ContainerID()
 	mntns := leader.MountNamespace()
@@ -653,23 +679,26 @@ func saveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode, loadWaitDeadlin
 	return nil
 }
 
-// ConfigureSaveRestoreExec sets the configuration for the save/restore binary.
-// If containerID is empty, the global init process will be used for the
-// save/restore binary's leader task.
+// ConfigureSaveRestoreExec sets the configuration for the save/restore binary,
+// argv, or for the save/restore socket, socket, one of which is empty; see
+// kernel.SaveRestoreExecConfig for the timeouts. If containerID is empty, the
+// global init process will be used for the save/restore binary's leader task.
 //
 // A previously stored configuration is replaced: a sandbox may be
 // checkpointed repeatedly, and the configuration also survives in the kernel
 // state across a restore. The leader task is always resolved anew, since a
 // task stored by an earlier call may have exited.
-func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, timeout time.Duration, containerID string) error {
+func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, socket string, timeout, saveTimeout time.Duration, containerID string) error {
 	leader, err := findContainerInitProcess(k, containerID)
 	if err != nil {
 		return err
 	}
 	k.SaveRestoreExecConfig = &kernel.SaveRestoreExecConfig{
-		Argv:       argv,
-		Timeout:    timeout,
-		LeaderTask: leader,
+		Argv:        argv,
+		Socket:      socket,
+		Timeout:     timeout,
+		SaveTimeout: saveTimeout,
+		LeaderTask:  leader,
 	}
 	return nil
 }
