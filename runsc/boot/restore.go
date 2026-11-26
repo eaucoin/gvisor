@@ -789,7 +789,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	// A kernel restored paused does this work at its first resume instead
 	// (postRestoreResumed), once its application runs.
 	if !r.paused {
-		if err := doPostRestore(k, timeline); err != nil {
+		if err := doPostRestore(k, timeline, "" /* reason */); err != nil {
 			r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
 			log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
@@ -831,9 +831,10 @@ func (l *Loader) startWorkingSetRecording() {
 }
 
 // doPostRestore does the work that follows a restore, once the restored kernel
-// runs.
-func doPostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
-	if err := control.PostRestore(k, timeline); err != nil {
+// runs, telling a save/restore socket reason, if it is not empty, as why the
+// sandbox stopped before it (see control.PostRestore).
+func doPostRestore(k *kernel.Kernel, timeline *timing.Timeline, reason string) error {
+	if err := control.PostRestore(k, timeline, reason); err != nil {
 		return err
 	}
 	timeline.Reached("post restore done")
@@ -849,10 +850,12 @@ func doPostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 
 // postRestoreResumed does the post-restore work of a kernel restored paused,
 // once it is resumed: the save/restore exec hook runs then, in its restore
-// mode rather than its resume mode. If the work fails, the sandbox is killed,
-// as it is when the work fails after a restore that leaves it running.
-func postRestoreResumed(k *kernel.Kernel) error {
-	if err := doPostRestore(k, nil /* timeline */); err != nil {
+// mode rather than its resume mode, told reason as why the sandbox stopped if
+// it is a save/restore socket and reason is not empty. If the work fails, the
+// sandbox is killed, as it is when the work fails after a restore that leaves
+// it running.
+func postRestoreResumed(k *kernel.Kernel, reason string) error {
+	if err := doPostRestore(k, nil /* timeline */, reason); err != nil {
 		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 		return fmt.Errorf("post restore work failed: %w", err)

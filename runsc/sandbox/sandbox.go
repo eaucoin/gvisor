@@ -2131,7 +2131,9 @@ type CheckpointOpts struct {
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
+	SaveRestoreExecSocket      string
 	SaveRestoreExecTimeout     time.Duration
+	SaveRestoreExecSaveTimeout time.Duration
 	SaveRestoreExecContainerID string
 	SplitFSCheckpointPaths     []string
 
@@ -2183,7 +2185,9 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		SplitFSCheckpointPaths:         bundles,
 		ExecOpts: controlapi.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
+			Socket:      opts.SaveRestoreExecSocket,
 			Timeout:     opts.SaveRestoreExecTimeout,
+			SaveTimeout: opts.SaveRestoreExecSaveTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
 		Precopy:          opts.Precopy,
@@ -2946,8 +2950,22 @@ func (s *Sandbox) Pause(cid string) error {
 
 // Resume sends the resume call for a container in the sandbox.
 func (s *Sandbox) Resume(cid string) error {
+	return s.ResumeWithOpts(cid, ResumeOpts{})
+}
+
+// ResumeOpts are the options of a resume.
+type ResumeOpts struct {
+	// SaveRestoreReason, if not empty, is why the sandbox stopped before it
+	// was restored, which the restore of a sandbox restored paused, which
+	// its first resume runs, tells a save/restore socket.
+	SaveRestoreReason string
+}
+
+// ResumeWithOpts resumes the sandbox, as Resume does, with opts.
+func (s *Sandbox) ResumeWithOpts(cid string, opts ResumeOpts) error {
 	log.Debugf("Resume sandbox %q", s.ID)
-	if err := s.call(sentryapi.ContMgrResume, nil, nil); err != nil {
+	args := sentryapi.ResumeArgs{SaveRestoreReason: opts.SaveRestoreReason}
+	if err := s.call(sentryapi.ContMgrResume, &args, nil); err != nil {
 		return fmt.Errorf("resuming container %q: %w", cid, err)
 	}
 	return nil

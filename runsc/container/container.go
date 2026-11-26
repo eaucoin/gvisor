@@ -1186,12 +1186,17 @@ func (c *Container) Pause() error {
 // and resuming a Running container resumes its sandbox if it is paused, and
 // otherwise does nothing.
 func (c *Container) Resume() error {
+	return c.ResumeWithOpts(sandbox.ResumeOpts{})
+}
+
+// ResumeWithOpts resumes the container, as Resume does, with opts.
+func (c *Container) ResumeWithOpts(opts sandbox.ResumeOpts) error {
 	log.Debugf("Resuming container, cid: %s", c.ID)
 	if err := c.modify(func() error {
 		if c.Status != Paused && c.Status != Running {
 			return fmt.Errorf("cannot resume container %q in state %v", c.ID, c.Status)
 		}
-		if err := c.Sandbox.Resume(c.ID); err != nil {
+		if err := c.Sandbox.ResumeWithOpts(c.ID, opts); err != nil {
 			return fmt.Errorf("resuming container: %v", err)
 		}
 		if c.Status == Paused {

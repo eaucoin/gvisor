@@ -161,6 +161,14 @@ const ContMgrPause = "containerManager.Pause"
 // ContMgrResume resumes all tasks.
 const ContMgrResume = "containerManager.Resume"
 
+// ResumeArgs are the arguments to ContMgrResume.
+type ResumeArgs struct {
+	// SaveRestoreReason, if not empty, is why the sandbox stopped before it
+	// was restored: the post-restore work of a sandbox restored paused, which
+	// its first resume runs, tells it a save/restore socket.
+	SaveRestoreReason string
+}
+
 // ContMgrKillPaused sends SIGKILL to a container of a paused sandbox, and
 // resumes the sandbox so that the signal takes effect.
 const ContMgrKillPaused = "containerManager.KillPaused"
