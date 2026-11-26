@@ -64,9 +64,13 @@ func optionsToPrecompile() []Options {
 		func(opt Options) []Options {
 			readWrite := opt
 			readWrite.HostFS = HostFSReadWrite
+			readWriteExistingFiles := opt
+			readWriteExistingFiles.HostFS = HostFSReadWriteExistingFiles
+			readOnly := opt
+			readOnly.HostFS = HostFSReadOnly
 			none := opt
 			none.HostFS = HostFSNone
-			return []Options{readWrite, none}
+			return []Options{readWrite, readWriteExistingFiles, readOnly, none}
 		},
 
 		// Expand the sets of vendor syscalls that may be available.

@@ -44,8 +44,20 @@ const (
 	// sufficient when the Sentry uses directfs for every mount.
 	HostFSNone HostFSAccess = iota
 
-	// HostFSReadWrite means that the gofer can also list directories, read
-	// symlinks, change the metadata of host files, make directories,
+	// HostFSReadOnly means that the gofer can also list directories, read
+	// symlinks and the metadata of host files, and set the size of a file.
+	// The gofer sets the size of the memory that it shares with the Sentry
+	// for the channels of a connection. This level is sufficient when every
+	// connection is read-only.
+	HostFSReadOnly
+
+	// HostFSReadWriteExistingFiles means that the gofer can also change
+	// the metadata of host files and allocate space for them. This level
+	// is sufficient when the root of every writable connection is not a
+	// directory and not a symlink.
+	HostFSReadWriteExistingFiles
+
+	// HostFSReadWrite means that the gofer can also make directories,
 	// symlinks, hard links and whiteouts, and rename and remove host files.
 	HostFSReadWrite
 )
@@ -55,6 +67,10 @@ func (a HostFSAccess) String() string {
 	switch a {
 	case HostFSNone:
 		return "none"
+	case HostFSReadOnly:
+		return "readonly"
+	case HostFSReadWriteExistingFiles:
+		return "readwriteexistingfiles"
 	case HostFSReadWrite:
 		return "readwrite"
 	default:
@@ -144,8 +160,8 @@ func (opt Options) Vars() precompiledseccomp.Values {
 	vars := precompiledseccomp.Values{}
 	vars.SetUint64(filter.SelfPIDVarName, uint64(os.Getpid()))
 	switch opt.HostFS {
-	case HostFSNone:
-	case HostFSReadWrite:
+	case HostFSNone, HostFSReadOnly:
+	case HostFSReadWriteExistingFiles, HostFSReadWrite:
 		vars[procSelfFDVarName] = opt.ProcSelfFD
 	default:
 		panic(fmt.Sprintf("unknown HostFSAccess: %v", opt.HostFS))
@@ -186,8 +202,14 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(filter.CgoFilters())
 	}
 	s.Merge(filter.InstrumentationFilters())
-	if opt.HostFS == HostFSReadWrite {
-		s.Merge(lisafsFilters(vars[procSelfFDVarName]))
+	if opt.HostFS >= HostFSReadOnly {
+		s.Merge(hostFSReadSyscalls)
+	}
+	if opt.HostFS >= HostFSReadWriteExistingFiles {
+		s.Merge(hostFSReadWriteExistingFilesSyscalls(vars[procSelfFDVarName]))
+	}
+	if opt.HostFS >= HostFSReadWrite {
+		s.Merge(hostFSReadWriteSyscalls)
 	}
 	for _, rules := range opt.ExtraRules {
 		s.Merge(rules)
