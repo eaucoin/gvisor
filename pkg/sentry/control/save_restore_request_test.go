@@ -16,6 +16,7 @@ package control
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -270,6 +271,106 @@ func TestSaveRestoreSocketFailures(t *testing.T) {
 	// A binary and a socket are not both run.
 	if err := preSave(k, &state.SaveOpts{}, &controlapi.SaveRestoreExecOpts{Argv: "/bin/true", Socket: hookSocket}); err == nil || !strings.Contains(err.Error(), "give one") {
 		t.Errorf("preSave() with a binary and a socket = %v, want an error", err)
+	}
+}
+
+// stubSync replaces syncSandboxFilesystems, for the test, with a sync that
+// fails with err, if it is not nil, and returns how many syncs ran, each once
+// the listener had read the save request that came before it.
+func stubSync(t *testing.T, l *hookListener, err error) *int {
+	t.Helper()
+	synced := new(int)
+	was := syncSandboxFilesystems
+	t.Cleanup(func() { syncSandboxFilesystems = was })
+	syncSandboxFilesystems = func(*kernel.Kernel) error {
+		if got := len(l.requests); got != 1 {
+			t.Errorf("a sync ran with %d requests read before it, want it after the save request alone", got)
+		}
+		*synced++
+		return err
+	}
+	return synced
+}
+
+func TestSaveRestoreSocketSync(t *testing.T) {
+	k, l := newSaveRestoreKernel(t)
+	synced := stubSync(t, l, nil)
+	for _, tc := range []struct {
+		name   string
+		resume bool
+		want   string
+	}{
+		{name: "leaving it running", resume: true, want: "save leave-running syncs\n"},
+		{name: "ending it", resume: false, want: "save syncs\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := *synced
+			l.serve(t, "ok\n", 0, false)
+			if err := preSave(k, &state.SaveOpts{Resume: tc.resume}, &controlapi.SaveRestoreExecOpts{Socket: hookSocket, Timeout: time.Minute, Sync: true}); err != nil {
+				t.Fatalf("preSave() failed: %v", err)
+			}
+			if got := l.request(t); got != tc.want {
+				t.Errorf("save request: got %q, want %q", got, tc.want)
+			}
+			if got := *synced - before; got != 1 {
+				t.Errorf("syncs after the save request: got %d, want 1", got)
+			}
+		})
+	}
+
+	// Without Sync, the save syncs nothing, and tells nothing of it.
+	before := *synced
+	l.serve(t, "ok\n", 0, false)
+	if err := preSave(k, &state.SaveOpts{}, &controlapi.SaveRestoreExecOpts{Socket: hookSocket, Timeout: time.Minute}); err != nil {
+		t.Fatalf("preSave() failed: %v", err)
+	}
+	if got, want := l.request(t), "save\n"; got != want {
+		t.Errorf("save request: got %q, want %q", got, want)
+	}
+	if got := *synced - before; got != 0 {
+		t.Errorf("syncs of a save without Sync: got %d, want 0", got)
+	}
+
+	// A save that is refused syncs nothing.
+	l.serve(t, "could not save\n", 0, false)
+	if err := preSave(k, &state.SaveOpts{}, &controlapi.SaveRestoreExecOpts{Socket: hookSocket, Timeout: time.Minute, Sync: true}); err == nil {
+		t.Errorf("preSave() of a refused save succeeded")
+	}
+	l.request(t)
+	if got := *synced - before; got != 0 {
+		t.Errorf("syncs of a refused save: got %d, want 0", got)
+	}
+
+	// Only a socket is told that the save syncs.
+	if err := preSave(k, &state.SaveOpts{}, &controlapi.SaveRestoreExecOpts{Argv: "/bin/true", Timeout: time.Minute, Sync: true}); err == nil || !strings.Contains(err.Error(), "give one, not a save/restore binary") {
+		t.Errorf("preSave() syncing with a binary = %v, want an error", err)
+	}
+}
+
+func TestSaveRestoreSocketSyncFailure(t *testing.T) {
+	k, l := newSaveRestoreKernel(t)
+	synced := stubSync(t, l, errors.New("the gofer is gone"))
+	l.serve(t, "ok\n", 0, false)
+	resume, err := SaveWithOpts(k, nil, &state.SaveOpts{Resume: true}, &controlapi.SaveRestoreExecOpts{Socket: hookSocket, Timeout: time.Minute, Sync: true})
+	if got, want := l.request(t), "save leave-running syncs\n"; got != want {
+		t.Errorf("save request: got %q, want %q", got, want)
+	}
+	if *synced != 1 {
+		t.Errorf("syncs: got %d, want 1", *synced)
+	}
+	if err == nil || !errors.Is(err, errSaveSyncFailed) || !strings.Contains(err.Error(), "the gofer is gone") {
+		t.Fatalf("SaveWithOpts() with a sync that fails = %v, want the sync's error", err)
+	}
+	// The sandbox runs on: the socket, asked the save, is told of its resume.
+	if resume == nil {
+		t.Fatalf("SaveWithOpts() with a sync that fails returned no resume, so the socket asked the save is never told the sandbox runs on")
+	}
+	l.serve(t, "ok\n", 0, false)
+	if err := resume(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got, want := l.request(t), "resume\n"; got != want {
+		t.Errorf("request after the failed save: got %q, want %q", got, want)
 	}
 }
 

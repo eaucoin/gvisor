@@ -1089,8 +1089,10 @@ func awaitResumed(resumed <-chan struct{}, deadline time2.Time) error {
 }
 
 // postResume runs post-resume work, resume, and then completes the checkpoint
-// attempt, which ended with saveErr: nil, or the expiry of its load wait, after
-// which the sandbox runs on as after a save that resumes it. The checkpoint's
+// attempt, which ended with saveErr: nil, or the expiry of its load wait or the
+// failure of its sync of the sandbox's filesystems after the save/restore
+// socket's save request, after either of which the sandbox runs on as after a
+// save that resumes it. The checkpoint's
 // caller was answered before, so that its answer is not held by the
 // save/restore binary's resume, which may wait for the very pages that the
 // load wait gave up on: a sandbox whose post-resume work fails is killed
@@ -1103,7 +1105,7 @@ func (l *Loader) postResume(resume func() error, saveErr error) {
 		return
 	}
 	if saveErr != nil {
-		err = fmt.Errorf("post resume work after a save whose load wait ran out: %w", err)
+		err = fmt.Errorf("post resume work after a save that failed (%v): %w", saveErr, err)
 	}
 	l.k.OnCheckpointAttempt(err)
 	log.Warningf("Killing the sandbox after post resume work failed: %v", err)

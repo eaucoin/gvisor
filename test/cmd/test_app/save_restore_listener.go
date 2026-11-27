@@ -21,6 +21,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -33,6 +34,7 @@ type saveRestoreListener struct {
 	socket string
 	log    string
 	answer string
+	write  string
 }
 
 // Name implements subcommands.Command.Name.
@@ -45,7 +47,7 @@ func (*saveRestoreListener) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*saveRestoreListener) Usage() string {
-	return "save-restore-listener --socket=<path> --log=<path> [--answer=<line>]\n"
+	return "save-restore-listener --socket=<path> --log=<path> [--answer=<line>] [--write=<path>]\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -53,6 +55,7 @@ func (c *saveRestoreListener) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.socket, "socket", "", "path of the socket to listen on")
 	f.StringVar(&c.log, "log", "", "path of the file that \"listening\", then each request's line, is appended to")
 	f.StringVar(&c.answer, "answer", "ok", "line answered to each request")
+	f.StringVar(&c.write, "write", "", "path of a file over whose content each save request's line is written, from its start on, before the request is answered, and left unsynced")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -64,6 +67,15 @@ func (c *saveRestoreListener) Execute(ctx context.Context, f *flag.FlagSet, args
 	out, err := os.OpenFile(c.log, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
 		log.Fatalf("opening the log: %v", err)
+	}
+	var written *os.File
+	var at int64
+	if c.write != "" {
+		var err error
+		if written, err = os.OpenFile(c.write, os.O_WRONLY, 0); err != nil {
+			log.Fatalf("opening %q for writing: %v", c.write, err)
+		}
+		defer written.Close()
 	}
 	listener, err := net.Listen("unix", c.socket)
 	if err != nil {
@@ -83,6 +95,13 @@ func (c *saveRestoreListener) Execute(ctx context.Context, f *flag.FlagSet, args
 		}
 		if _, err := out.WriteString(line); err != nil {
 			log.Fatalf("writing the log: %v", err)
+		}
+		if written != nil && strings.HasPrefix(line, "save") {
+			n, err := written.WriteAt([]byte(line), at)
+			if err != nil {
+				log.Fatalf("writing %q: %v", c.write, err)
+			}
+			at += int64(n)
 		}
 		if _, err := fmt.Fprintln(conn, c.answer); err != nil {
 			log.Fatalf("answering: %v", err)

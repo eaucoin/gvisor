@@ -37,6 +37,10 @@ import (
 // a save/restore socket.
 const saveRestoreLeaveRunning = "leave-running"
 
+// saveRestoreSyncs is what a save that syncs the sandbox's filesystems itself
+// once its request is answered tells a save/restore socket.
+const saveRestoreSyncs = "syncs"
+
 // saveRestoreConnectRetry is how long a connection to a save/restore socket
 // whose listener's backlog is full waits before it is tried again.
 const saveRestoreConnectRetry = 10 * time.Millisecond
@@ -140,7 +144,10 @@ func saveRestoreExchange(ctx context.Context, ep transport.Endpoint, request str
 // leader task's mount namespace with its credentials, and sends one line: the
 // mode, then, after a space, what it tells of it, if anything, and a newline.
 // It tells a save that leaves the sandbox running "leave-running"
-// (saveRestoreLeaveRunning), and a restore why the sandbox stopped before it,
+// (saveRestoreLeaveRunning), a save that syncs the sandbox's filesystems
+// once the request is answered "syncs" (saveRestoreSyncs), after a space
+// from the one before where it tells both, so that the listener need not
+// sync them itself, and a restore why the sandbox stopped before it,
 // where the resume that runs the restore mode was given a reason. It then
 // reads the answer until the listener ends the connection. The request
 // succeeds if the answer is "ok" and a newline, or "ok", a space, whatever the
