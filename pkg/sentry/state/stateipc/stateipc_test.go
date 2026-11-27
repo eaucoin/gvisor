@@ -1040,3 +1040,110 @@ func TestCacheStatus(t *testing.T) {
 		})
 	}
 }
+
+// cancelReaderAt is an io.ReaderAt whose reads say they began, then wait for
+// canceled to be closed and fail.
+type cancelReaderAt struct {
+	began    chan struct{}
+	canceled chan struct{}
+}
+
+// ReadAt implements io.ReaderAt.ReadAt.
+func (r *cancelReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	r.began <- struct{}{}
+	<-r.canceled
+	return 0, unix.ECANCELED
+}
+
+// testCancelServer serves a file whose reads end only once the server's
+// implementation is canceled.
+type testCancelServer struct {
+	src       cancelReaderAt
+	destroyed bool
+}
+
+func (s *testCancelServer) Destroy() {
+	s.destroyed = true
+}
+
+// Cancel implements Canceler.Cancel.
+func (s *testCancelServer) Cancel() {
+	close(s.src.canceled)
+}
+
+func (s *testCancelServer) OpenRead(path string) (stateio.AsyncReader, error) {
+	return stateio.NewIOReader(&s.src, 4096, 1 /* maxRanges */, 1 /* maxParallel */), nil
+}
+
+func (s *testCancelServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
+	panic("unexpected call to OpenWrite")
+}
+
+// TestStopCancels checks that a server whose client goes while one of its
+// reads waits, for something that only its implementation's Cancel ends,
+// stops, as its implementation is canceled, then destroyed.
+func TestStopCancels(t *testing.T) {
+	memfd, buf, err := stateio.CreateMappedMemoryFD("stateipc.TestStopCancels", 4096)
+	if err != nil {
+		t.Fatalf("failed to create destination file: %v", err)
+	}
+	defer unix.Close(int(memfd))
+	defer unix.Munmap(buf)
+
+	impl := &testCancelServer{src: cancelReaderAt{began: make(chan struct{}, 1), canceled: make(chan struct{})}}
+	usrv := urpc.NewServer()
+	server, err := NewAsyncFileServer(impl)
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileServer: %v", err)
+	}
+	usrv.Register(server)
+	clientSock, serverSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatalf("failed to create socketpair: %v", err)
+	}
+	client, err := NewAsyncFileClient(urpc.NewClient(clientSock))
+	if err != nil {
+		t.Fatalf("failed to create AsyncFileClient: %v", err)
+	}
+	defer client.DecRef()
+	// Serve as the checkpoint gofer does: until the client goes, then stop.
+	stopped := make(chan struct{})
+	go func() {
+		usrv.Handle(serverSock)
+		usrv.Stop(0)
+		close(stopped)
+	}()
+
+	ar, err := client.OpenRead("file")
+	if err != nil {
+		t.Fatalf("failed to open remote file: %v", err)
+	}
+	defer ar.Close()
+	df, err := ar.RegisterDestinationFD(memfd, 4096, 0 /* discard */, nil)
+	if err != nil {
+		t.Fatalf("failed to register destination file: %v", err)
+	}
+	ar.AddRead(0 /* id */, 0 /* off */, df, memmap.FileRange{0, 4096}, buf)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := ar.Wait(nil, 1 /* minCompletions */)
+		waited <- err
+	}()
+	<-impl.src.began
+
+	// The client goes, as a sandbox that is killed does, its read in flight.
+	if err := clientSock.Shutdown(); err != nil {
+		t.Fatalf("failed to shut down client socket: %v", err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the server did not stop within 10s of its client going while a read waited")
+	}
+	if !impl.destroyed {
+		t.Errorf("the server stopped without destroying its implementation")
+	}
+	if err := <-waited; err == nil {
+		t.Errorf("the client's Wait for the read in flight as it went returned nil, want an error")
+	}
+}
