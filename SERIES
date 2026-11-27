@@ -51,3 +51,19 @@ series/31-standby on series/30-sandbox-fixes
 series/32-save-load-wait on series/31-standby
 # A background restore's reads say whether a task awaits them, and can be traced (--async-load-trace; stateio, stateipc, pgalloc, s3 reader).
 series/33-async-load-trace on series/32-save-load-wait
+# A checkpoint saves the remote metadata of only the files a restore validates and can evict the gofer's cached dentries before its pause, and a restore reopens its files in parallel (--save-remote-metadata, --save-dentry-eviction, --restore-file-parallelism; vfs, gofer, state, runsc).
+series/34-gofer-save-restore on series/33-async-load-trace
+# Checkpoints and restores are summarized as JSON (runsc checkpoint --summary-file, runsc wait --restore --summary; state, kernel, pgalloc, runsc).
+series/35-save-restore-summary on series/34-gofer-save-restore
+# Chosen paths are left out of a restore's file validation (--restore-validate-files-exclude; runsc/boot).
+series/36-restore-validate-exclude on series/35-save-restore-summary
+# A restore checks its image's layers at once, whatever its depth, and reads each file as the version its ETag names (runsc/boot, stateio, s3 checkpoint gofer).
+series/37-restore-metadata-at-once on series/36-restore-validate-exclude
+# A checkpoint that leaves the sandbox running records its working set after the resume, if the sandbox holds none (--working-set-after-save; state, kernel, mm).
+series/38-working-set-after-save on series/37-restore-metadata-at-once
+# A restore's checkpoint gofer can write the pages files it reads through to a cache on the node (s3 checkpoint gofer, stateipc, runsc).
+series/39-pages-cache on series/38-working-set-after-save
+# A background restore's loading can be ended on demand, and its checkpoint gofer can read by presigned URLs (runsc fail-load; pgalloc, s3 checkpoint gofer, runsc).
+series/40-restore-reads-by-url on series/39-pages-cache
+# A save/restore socket in the sandbox can be asked instead of a binary run, and a resume can say why (--save-restore-exec-socket, --save-restore-exec-save-timeout, runsc resume --save-restore-reason; control, kernel, runsc).
+series/41-save-restore-socket on series/40-restore-reads-by-url
