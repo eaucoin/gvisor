@@ -357,6 +357,11 @@ func TestCacheWriterYieldsWhileLoading(t *testing.T) {
 		t.Fatalf("read: %d bytes, %v", c.N, c.Err)
 	}
 	srv.cache.pending.Wait()
+	// The writer waits after a write is done, which pending says: the second
+	// wait may begin after pending.Wait returns.
+	for deadline := time.Now().Add(10 * time.Second); len(waited()) < 2 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if got := waited(); len(got) != 2 {
 		t.Fatalf("the writer waited %v after 2 writes while loading, want once after each", got)
 	}
