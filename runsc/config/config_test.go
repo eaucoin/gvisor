@@ -1391,3 +1391,46 @@ func TestIsFlagExplicitlySet(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreValidateFilesExclude(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	if err := testFlags.Parse([]string{"--restore-validate-files-exclude=/attach/,/srv//data"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.RestoreValidateFilesExclude, (RestoreValidateFilesExclude{"/attach", "/srv/data"}); !slices.Equal(got, want) {
+		t.Errorf("RestoreValidateFilesExclude = %q, want %q", got, want)
+	}
+	if got, want := c.ToFlags(), "--restore-validate-files-exclude=/attach,/srv/data"; !slices.Contains(got, want) {
+		t.Errorf("ToFlags() = %q, want it to contain %q", got, want)
+	}
+	for p, want := range map[string]bool{
+		"/attach":           true,
+		"/attach/token":     true,
+		"/attach/sub/file":  true,
+		"/attachment":       false,
+		"/srv/data/x":       true,
+		"/srv/database":     false,
+		"/srv":              false,
+		"/":                 false,
+		"/usr/bin/whatever": false,
+	} {
+		if got := c.RestoreValidateFilesExclude.Excludes(p); got != want {
+			t.Errorf("Excludes(%q) = %t, want %t", p, got, want)
+		}
+	}
+	if !(RestoreValidateFilesExclude{"/"}).Excludes("/usr") {
+		t.Errorf("excluding / does not exclude /usr")
+	}
+	var e RestoreValidateFilesExclude
+	if err := e.Set("attach"); err == nil {
+		t.Errorf("Set(%q) succeeded, want an error for a relative path", "attach")
+	}
+	if err := e.Set(""); err != nil || len(e) != 0 || e.String() != "" {
+		t.Errorf("Set(\"\") = %v, leaving %q; want no error and no path", err, e)
+	}
+}
