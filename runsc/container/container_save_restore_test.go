@@ -4984,6 +4984,13 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 		// checkpoint holds, such as the executables of running processes,
 		// are validated.
 		change string
+		// If rewrite is true, the change rewrites the file with the same
+		// contents, which changes only its modification time, as a container
+		// manager that writes a mount's files anew for every restore does;
+		// otherwise it appends to the file.
+		rewrite bool
+		// exclude is the value of restore-validate-files-exclude.
+		exclude string
 		// wantErr is a substring of the expected restore error, or empty if the
 		// restore must succeed.
 		wantErr string
@@ -5015,11 +5022,55 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 			change:  "mnt/test_app",
 			wantErr: "file size validation failed",
 		},
+		{
+			name:    "all, mount rewritten",
+			policy:  "all",
+			change:  "mnt/test_app",
+			rewrite: true,
+			wantErr: "mtime validation failed",
+		},
+		{
+			name:    "all, excluded mount rewritten",
+			policy:  "all",
+			change:  "mnt/test_app",
+			rewrite: true,
+			exclude: "/hosts,/mnt",
+		},
+		{
+			name:    "all, excluded mount changed",
+			policy:  "all",
+			change:  "mnt/test_app",
+			exclude: "/mnt/",
+		},
+		{
+			name:    "all, mount rewritten, another path excluded",
+			policy:  "all",
+			change:  "mnt/test_app",
+			rewrite: true,
+			exclude: "/mn,/test_app/mnt",
+			wantErr: "mtime validation failed",
+		},
+		{
+			name:    "rootfs, rootfs changed, but excluded",
+			policy:  "rootfs",
+			change:  "rootfs/test_app",
+			exclude: "/test_app",
+		},
+		{
+			name:    "all, rootfs changed, mount excluded",
+			policy:  "all",
+			change:  "rootfs/test_app",
+			exclude: "/mnt",
+			wantErr: "file size validation failed",
+		},
 	} {
 		for name, conf := range configs(t, true /* noOverlay */) {
 			t.Run(tc.name+"/"+name, func(t *testing.T) {
 				if err := conf.RestoreValidateFiles.Set(tc.policy); err != nil {
 					t.Fatalf("error setting restore-validate-files: %v", err)
+				}
+				if err := conf.RestoreValidateFilesExclude.Set(tc.exclude); err != nil {
+					t.Fatalf("error setting restore-validate-files-exclude: %v", err)
 				}
 				dir, err := os.MkdirTemp(testutil.TmpDir(), "validate-files")
 				if err != nil {
@@ -5094,14 +5145,24 @@ func TestCheckpointRestoreValidateFiles(t *testing.T) {
 				cont.Destroy()
 
 				changed := filepath.Join(dir, tc.change)
-				f, err := os.OpenFile(changed, os.O_WRONLY|os.O_APPEND, 0)
-				if err != nil {
-					t.Fatalf("error opening %q: %v", changed, err)
-				}
-				_, err = f.Write([]byte("changed"))
-				f.Close()
-				if err != nil {
-					t.Fatalf("error changing %q: %v", changed, err)
+				if tc.rewrite {
+					data, err := os.ReadFile(changed)
+					if err != nil {
+						t.Fatalf("error reading %q: %v", changed, err)
+					}
+					if err := os.WriteFile(changed, data, 0); err != nil {
+						t.Fatalf("error rewriting %q: %v", changed, err)
+					}
+				} else {
+					f, err := os.OpenFile(changed, os.O_WRONLY|os.O_APPEND, 0)
+					if err != nil {
+						t.Fatalf("error opening %q: %v", changed, err)
+					}
+					_, err = f.Write([]byte("changed"))
+					f.Close()
+					if err != nil {
+						t.Fatalf("error changing %q: %v", changed, err)
+					}
 				}
 
 				cont2, err := New(conf, args)

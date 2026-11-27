@@ -399,6 +399,9 @@ func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*spec
 	// container manager may have created them for the mounts, so they are new
 	// files in a root filesystem that is new at restore. containerd does so for
 	// Kubernetes' /etc/hosts.
+	//
+	// Nor are the files under the paths that conf.RestoreValidateFilesExclude
+	// holds, which the container manager rewrites for every restore.
 	mountPoints := make(map[checkpoint.ResourceID]struct{})
 	for name, spec := range containerSpecs {
 		for _, m := range spec.Mounts {
@@ -413,7 +416,11 @@ func completeRestoreOptions(conf *config.Config, containerSpecs map[string]*spec
 			if rootfsOnly && fsID.Path != "/" {
 				return false
 			}
-			_, isMountPoint := mountPoints[checkpoint.ResourceID{ContainerName: fsID.ContainerName, Path: path.Join(fsID.Path, p)}]
+			full := path.Join(fsID.Path, p)
+			if conf.RestoreValidateFilesExclude.Excludes(full) {
+				return false
+			}
+			_, isMountPoint := mountPoints[checkpoint.ResourceID{ContainerName: fsID.ContainerName, Path: full}]
 			return !isMountPoint
 		},
 	}

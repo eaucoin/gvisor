@@ -513,6 +513,10 @@ type Config struct {
 	// changes since the checkpoint.
 	RestoreValidateFiles RestoreValidateFilesPolicy `flag:"restore-validate-files"`
 
+	// RestoreValidateFilesExclude holds the paths, in every container, under
+	// which a restore checks no file, whatever RestoreValidateFiles says.
+	RestoreValidateFilesExclude RestoreValidateFilesExclude `flag:"restore-validate-files-exclude"`
+
 	// WorkingSetWindow is how long after a restore, or after the first resume
 	// of a sandbox restored paused, the memory that the application touches
 	// is recorded as its working set, which the next checkpoint saves in its
@@ -2230,6 +2234,52 @@ func (p RestoreValidateFilesPolicy) String() string {
 	default:
 		panic(fmt.Sprintf("invalid restore file validation policy %d", p))
 	}
+}
+
+// RestoreValidateFilesExclude holds absolute paths, clean, under which a
+// restore checks no file for changes since the checkpoint, in every container:
+// the mount destinations of filesystems whose files are, by contract, new at
+// every restore, as a container manager that rewrites them for each restore
+// makes them. A path excludes the file or directory at it and everything
+// under it, whether it is a mount's destination or a directory of the
+// container's root filesystem.
+type RestoreValidateFilesExclude []string
+
+// Set implements flag.Value. Set(String()) should be idempotent. v is a
+// comma-separated list of absolute paths, or empty for none.
+func (e *RestoreValidateFilesExclude) Set(v string) error {
+	*e = nil
+	if v == "" {
+		return nil
+	}
+	for _, p := range strings.Split(v, ",") {
+		if !filepath.IsAbs(p) {
+			return fmt.Errorf("invalid path %q excluded from restore file validation: not absolute", p)
+		}
+		*e = append(*e, filepath.Clean(p))
+	}
+	return nil
+}
+
+// Get implements flag.Get.
+func (e *RestoreValidateFilesExclude) Get() any {
+	return *e
+}
+
+// String implements flag.String.
+func (e RestoreValidateFilesExclude) String() string {
+	return strings.Join(e, ",")
+}
+
+// Excludes returns true if e excludes the file at p, an absolute path in a
+// container.
+func (e RestoreValidateFilesExclude) Excludes(p string) bool {
+	for _, x := range e {
+		if p == x || x == "/" || strings.HasPrefix(p, x+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // WorkingSetUnit is the granularity of working sets in bytes.

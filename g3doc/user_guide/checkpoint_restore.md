@@ -776,6 +776,16 @@ and restore: Kubernetes writes `/etc/hosts`, `/etc/hostname` and
 containers, pods or the host while the sandbox is checkpointed. `all` suits
 sandboxes whose mounts do not change, such as read-only volumes.
 
+`--restore-validate-files-exclude` takes comma-separated absolute paths under
+which, in every container, a restore checks no file, whatever
+`--restore-validate-files` says: the mounts whose files the container manager
+writes anew for every restore, such as credentials or configuration it hands
+the restored sandbox, which a process that held one open at the checkpoint
+would otherwise fail the restore with. With `--restore-validate-files=all
+--restore-validate-files-exclude=/run/secrets`, the restore checks the files of
+every mount but those under `/run/secrets`. A path excludes everything under
+it, whether a mount or a directory of the root filesystem.
+
 The files that a checkpoint holds are those that something in the sandbox
 pins as it is saved: an open file, a mapped one (such as a running
 executable, even with its file descriptor closed), a working or root
