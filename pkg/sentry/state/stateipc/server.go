@@ -68,6 +68,17 @@ type CacheReporter interface {
 	CacheStatus() CacheStatus
 }
 
+// Canceler is implemented by an AsyncFileServerImpl whose files' I/O may not
+// end on its own, as reads that retry for as long as their store is away do
+// not.
+type Canceler interface {
+	// Cancel ends the I/O in flight on the files that the
+	// AsyncFileServerImpl serves, which fails, as does any that follows.
+	// AsyncFileServer.Stop calls it once it has shut its files down, before
+	// it waits for their I/O to end, since no client waits for it any more.
+	Cancel()
+}
+
 // NewAsyncFileServer returns a new AsyncFileServer.
 func NewAsyncFileServer(impl AsyncFileServerImpl) (*AsyncFileServer, error) {
 	s := &AsyncFileServer{
@@ -95,6 +106,9 @@ func (s *AsyncFileServer) Stop() {
 		}
 	}
 	s.filesMu.Unlock()
+	if c, ok := s.impl.(Canceler); ok {
+		c.Cancel()
+	}
 	for _, f := range files {
 		f.wg.Wait()
 	}
