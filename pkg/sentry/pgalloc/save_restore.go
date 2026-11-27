@@ -2586,7 +2586,8 @@ func mergeFileRanges(frs []memmap.FileRange) []memmap.FileRange {
 // number of bytes of frs that remained to be loaded, which it waited for, and
 // logs them with the time it waited: a save waits for them while the sandbox
 // is paused. If deadline is not zero, it waits until deadline, then fails
-// with ErrLoadWaitExpired.
+// with ErrLoadWaitExpired, unless loading failed: it fails with that failure
+// then, whether or not the deadline has passed.
 //
 // Preconditions:
 //   - frs are sorted by offset and do not overlap.
@@ -2628,7 +2629,14 @@ func (f *MemoryFile) awaitLoads(loads *asyncMemoryFileLoads, frs []memmap.FileRa
 	}
 	dur := time.Duration(gohacks.Nanotime() - start)
 	if errors.Is(err, ErrLoadWaitExpired) {
-		return waited, loads.expired(dur, waited, err)
+		// The deadline can end the wait before it finds pages whose loading
+		// failed, at once if it has passed: their failure ends it then, as
+		// it ends awaitLoadingDone's, since those pages will never load.
+		ferr := loads.failure()
+		if ferr == nil {
+			return waited, loads.expired(dur, waited, err)
+		}
+		err = ferr
 	}
 	if err != nil {
 		log.Warningf("MemoryFile(%p): waited %s for %d bytes of dirty pages still loading, whose loading failed: %v", f, dur, waited, err)
