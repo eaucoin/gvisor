@@ -2134,6 +2134,7 @@ type CheckpointOpts struct {
 	SaveRestoreExecSocket      string
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecSaveTimeout time.Duration
+	SaveRestoreExecSync        bool
 	SaveRestoreExecContainerID string
 	SplitFSCheckpointPaths     []string
 
@@ -2188,6 +2189,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			Socket:      opts.SaveRestoreExecSocket,
 			Timeout:     opts.SaveRestoreExecTimeout,
 			SaveTimeout: opts.SaveRestoreExecSaveTimeout,
+			Sync:        opts.SaveRestoreExecSync,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
 		Precopy:          opts.Precopy,

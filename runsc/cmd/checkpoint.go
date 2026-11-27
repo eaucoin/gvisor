@@ -45,6 +45,7 @@ type Checkpoint struct {
 	saveRestoreExecSocket     string
 	saveRestoreExecTimeout    time.Duration
 	saveRestoreSaveTimeout    time.Duration
+	saveRestoreExecSync       bool
 	splitFSCheckpointPaths    pathVar
 	stateEngine               optionalStateEnginePolicy
 	parentImagePath           string
@@ -90,6 +91,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.saveRestoreExecSocket, "save-restore-exec-socket", "", "path, in the container, of a Unix stream socket that the sandbox sends a request to before saving and after restoring, in place of running a save/restore binary (not with --save-restore-exec-argv): one line, the mode (save, restore or resume), then, after a space, \"leave-running\" for a save that leaves the container running, or for a restore the reason the resume that runs it was given (runsc resume --save-restore-reason), and a newline. The listener answers \"ok\" and a newline, or \"ok\", a space, anything and a newline, then ends the connection; any other answer fails the save or restore.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", controlapi.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv, or the request to save-restore-exec-socket.")
 	f.DurationVar(&c.saveRestoreSaveTimeout, "save-restore-exec-save-timeout", 0, "if not 0, the timeout of the save/restore binary or request before saving and after a save that leaves the container running, --save-restore-exec-timeout then bounding the one after restoring alone, which may wait for memory that is still being loaded.")
+	f.BoolVar(&c.saveRestoreExecSync, "save-restore-exec-sync", false, "with --save-restore-exec-socket, sync all of the sandbox's filesystems once the save request is answered, before saving, and tell the socket so: the save request's line then carries \"syncs\" after the mode, after \"leave-running\" where both are told, so that the listener need not sync them itself. A sync that fails fails the checkpoint, the container running on, as after a checkpoint that leaves it running.")
 	f.StringVar(&c.parentImagePath, "parent-image-path", "", "make the checkpoint incremental: write only the memory changed since the image at this path, which must be the image the container was last checkpointed to or restored from (with --dirty-tracking), and refer to it for the rest. Restoring the checkpoint then needs that image, found by --layer-path or in the checkpoint's layers/ directory.")
 	f.StringVar(&c.precopy, "precopy", "off", "write memory while the container runs, in rounds over the memory written meanwhile, before pausing it to write the rest: off, on, or auto (on unless the write speed last measured, by a checkpoint or a round of this container, says that the pause would write memory within --precopy-budget anyway; the first round measures it). Requires --dirty-tracking and an uncompressed image; --direct is recommended.")
 	f.DurationVar(&c.precopyBudget, "precopy-budget", 100*time.Millisecond, "with --precopy, stop the rounds when the memory written during the last one would take at most this long to write in the pause.")
@@ -135,6 +137,9 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	if c.saveRestoreExecArgv != "" && c.saveRestoreExecSocket != "" {
 		util.Fatalf("save-restore-exec-argv and save-restore-exec-socket cannot both be given")
 	}
+	if c.saveRestoreExecSync && c.saveRestoreExecSocket == "" {
+		util.Fatalf("save-restore-exec-sync requires save-restore-exec-socket")
+	}
 
 	if err := os.MkdirAll(c.imagePath, 0755); err != nil {
 		util.Fatalf("making directories at path provided: %v", err)
@@ -151,6 +156,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecSocket:      c.saveRestoreExecSocket,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecSaveTimeout: c.saveRestoreSaveTimeout,
+		SaveRestoreExecSync:        c.saveRestoreExecSync,
 		SaveRestoreExecContainerID: cont.ID,
 		SplitFSCheckpointPaths:     c.splitFSCheckpointPaths.targets,
 		StateEngine:                c.stateEngine.ptr(),

@@ -5508,6 +5508,126 @@ func TestCheckpointRestoreSaveRestoreSocket(t *testing.T) {
 	}
 }
 
+// TestCheckpointSaveRestoreSocketSyncs checks that a checkpoint with
+// --save-restore-exec-sync tells the save/restore socket that it syncs the
+// sandbox's filesystems once the save request is answered, which one without
+// it does not, and that what the listener wrote before answering, with no sync
+// of its own, is on the host as the checkpoint returns, as the memory the
+// checkpoint saved has it.
+func TestCheckpointSaveRestoreSocketSyncs(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+	// Skip overlay because test requires writing to host file.
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			imagePath := filepath.Join(dir, "image")
+			logPath := filepath.Join(dir, "requests")
+			logFile, err := createWriteableOutputFile(logPath)
+			if err != nil {
+				t.Fatalf("error creating the listener's log: %v", err)
+			}
+			defer logFile.Close()
+			// What the listener writes over its dots.
+			written := filepath.Join(dir, "written")
+			dots := strings.Repeat(".", 4096)
+			if err := os.WriteFile(written, []byte(dots), 0666); err != nil {
+				t.Fatalf("error creating %q: %v", written, err)
+			}
+			if err := os.Chmod(written, 0666); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", written, err)
+			}
+			checkWritten := func(want string) {
+				t.Helper()
+				got, err := os.ReadFile(written)
+				if err != nil {
+					t.Fatalf("error reading %q: %v", written, err)
+				}
+				if want += dots[len(want):]; string(got) != want {
+					t.Errorf("what the listener wrote, on the host: got %q, want %q", got, want)
+				}
+			}
+			socket := "/save-restore/listener.sock"
+			spec := testutil.NewSpecWithArgs(app, "save-restore-listener", "--socket", socket, "--log", logPath, "--write", written)
+			spec.Mounts = append(spec.Mounts, specs.Mount{
+				Destination: "/save-restore",
+				Type:        "tmpfs",
+				Source:      "tmpfs",
+			})
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(logFile); err != nil {
+				t.Fatalf("the listener did not start: %v", err)
+			}
+			checkpoint := func(sync bool) {
+				t.Helper()
+				if err := os.RemoveAll(imagePath); err != nil {
+					t.Fatalf("os.RemoveAll failed: %v", err)
+				}
+				if err := os.Mkdir(imagePath, 0777); err != nil {
+					t.Fatalf("os.Mkdir failed: %v", err)
+				}
+				if err := cont.Checkpoint(conf, imagePath, sandbox.CheckpointOpts{
+					Resume:                     true,
+					SaveRestoreExecSocket:      socket,
+					SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+					SaveRestoreExecSaveTimeout: 30 * time.Second,
+					SaveRestoreExecSync:        sync,
+					SaveRestoreExecContainerID: cont.ID,
+				}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				// The resume is asked after the checkpoint returns.
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+					if got, err := os.ReadFile(logPath); err == nil && strings.HasSuffix(string(got), "resume\n") {
+						break
+					}
+				}
+			}
+
+			// Without the sync, the save request tells none.
+			checkpoint(false)
+			checkWritten("save leave-running\n")
+
+			// With it, the save request says so, and what the listener wrote
+			// before it answered is on the host as the checkpoint returns.
+			checkpoint(true)
+			got, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("error reading the listener's log: %v", err)
+			}
+			if want := "listening\nsave leave-running\nresume\nsave leave-running syncs\nresume\n"; string(got) != want {
+				t.Errorf("the listener's log: got %q, want %q", got, want)
+			}
+			checkWritten("save leave-running\nsave leave-running syncs\n")
+		})
+	}
+}
+
 // TestCheckpointLeaveRunningRestoresWhatMovedOn checks what the restore of a
 // checkpoint taken with --leave-running asks of the files that the container,
 // running on, changes after it. The checkpoint holds only the files pinned at

@@ -265,10 +265,10 @@ func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
 	if resume != nil {
 		if perr := resume(); perr != nil {
 			if err != nil {
-				// The save's load wait ran out, and the sandbox runs on,
-				// but resuming it failed, as after a save that succeeded:
-				// the save is not one to try again later.
-				return fmt.Errorf("post resume work after a save whose load wait ran out: %w", perr)
+				// The save's load wait ran out, or its sync failed, and the
+				// sandbox runs on, but resuming it failed, as after a save
+				// that succeeded: the save is not one to try again later.
+				return fmt.Errorf("post resume work after a save that failed (%v): %w", err, perr)
 			}
 			return perr
 		}
@@ -302,6 +302,11 @@ func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
 // system call on pages still loading, as a read of a tmpfs file's may be,
 // stops only once they have loaded, which the wait before the binary runs
 // leaves none of for a save that is not incremental.
+//
+// A save whose execOpts.Sync is set syncs the sandbox's filesystems once the
+// save/restore socket has answered its save request; a sync that fails fails
+// the save before it writes anything, the sandbox running on, resume undoing
+// the request, as after a save whose load wait expired.
 func SaveWithOpts(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (resume func() error, err error) {
 	ctx := k.SupervisorContext()
 	if !saveOpts.LoadWaitDeadline.IsZero() && !saveOpts.TestOnlySkipRunningLoadWait {
@@ -310,11 +315,11 @@ func SaveWithOpts(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOp
 		}
 	}
 	if err := preSave(k, saveOpts, execOpts); err != nil {
-		if errors.Is(err, pgalloc.ErrLoadWaitExpired) {
+		if errors.Is(err, pgalloc.ErrLoadWaitExpired) || errors.Is(err, errSaveSyncFailed) {
 			// A save/restore binary that waited for pages past the load
-			// wait was killed: the sandbox runs on, to be resumed as after
-			// a save.
-			return resumeAfterBinaryExpired(k), err
+			// wait was killed, or the sync after the save request failed:
+			// the sandbox runs on, to be resumed as after a save.
+			return resumeAfterSaveRequest(k), err
 		}
 		return nil, err
 	}
@@ -328,11 +333,12 @@ func SaveWithOpts(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOp
 	return nil, err
 }
 
-// resumeAfterBinaryExpired returns what undoes preSave once its save/restore
-// binary was killed for waiting for pages past the save's load wait: the
-// binary's resume, and the TPU checkpoint before it, but not CUDA's, which
-// runs after the binary and so never ran.
-func resumeAfterBinaryExpired(k *kernel.Kernel) func() error {
+// resumeAfterSaveRequest returns what undoes preSave once its save/restore
+// binary was killed for waiting for pages past the save's load wait, or its
+// sync of the sandbox's filesystems after the socket's save request failed:
+// the binary's or socket's resume, and the TPU checkpoint before it, but not
+// CUDA's, which runs after them and so never ran.
+func resumeAfterSaveRequest(k *kernel.Kernel) func() error {
 	return func() error { return postResume(k, nil, false /* cuda */) }
 }
 
@@ -386,16 +392,41 @@ func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveResto
 		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Socket, execOpts.Timeout, execOpts.SaveTimeout, execOpts.ContainerID); err != nil {
 			return fmt.Errorf("failed to configure save/restore binary: %w", err)
 		}
-		// A save that leaves the sandbox running says so to a socket.
-		detail := ""
-		if o.Resume {
-			detail = saveRestoreLeaveRunning
+		if execOpts.Sync && execOpts.Socket == "" {
+			return fmt.Errorf("a save that syncs the sandbox's filesystems tells a save/restore socket so: give one, not a save/restore binary (%q)", execOpts.Argv)
 		}
-		if err := saveRestoreExec(k, SaveRestoreExecSave, detail, o.LoadWaitDeadline); err != nil {
+		// A save that leaves the sandbox running, or that syncs its
+		// filesystems, says so to a socket.
+		var told []string
+		if o.Resume {
+			told = append(told, saveRestoreLeaveRunning)
+		}
+		if execOpts.Sync {
+			told = append(told, saveRestoreSyncs)
+		}
+		if err := saveRestoreExec(k, SaveRestoreExecSave, strings.Join(told, " "), o.LoadWaitDeadline); err != nil {
 			return fmt.Errorf("failed to exec save/restore binary: %w", err)
+		}
+		if execOpts.Sync {
+			start := time.Now()
+			if err := syncSandboxFilesystems(k); err != nil {
+				return fmt.Errorf("%w: %w", errSaveSyncFailed, err)
+			}
+			log.Infof("Synced the sandbox's filesystems after the save request in %v", time.Since(start))
 		}
 	}
 	return preSaveCuda(k, o)
+}
+
+// errSaveSyncFailed is the error of a save whose sync of the sandbox's
+// filesystems failed (controlapi.SaveRestoreExecOpts.Sync): the save/restore
+// socket was asked the save, which the sandbox then runs on from.
+var errSaveSyncFailed = errors.New("syncing the sandbox's filesystems after the save request failed")
+
+// syncSandboxFilesystems syncs all of k's filesystems, as sync(2) does. It is
+// a variable for tests.
+var syncSandboxFilesystems = func(k *kernel.Kernel) error {
+	return k.VFS().SyncAllFilesystems(k.SupervisorContext())
 }
 
 // PostResume is called after resuming the kernel.

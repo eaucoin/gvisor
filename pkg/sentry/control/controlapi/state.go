@@ -144,6 +144,14 @@ type SaveRestoreExecOpts struct {
 	// need not.
 	SaveTimeout time.Duration
 
+	// Sync, which requires Socket, has the save sync all of the sandbox's
+	// filesystems once the save mode's request is answered, before the save
+	// goes on, and tell the socket so in that request: what the sandbox wrote
+	// then reaches what backs its filesystems, as of the save, without a sync
+	// of the listener's own. A sync that fails fails the save, the sandbox
+	// running on as after a save that left it running.
+	Sync bool
+
 	// ContainerID is the ID of the container that the save/restore binary executes in.
 	ContainerID string
 }

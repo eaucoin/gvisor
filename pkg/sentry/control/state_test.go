@@ -114,12 +114,12 @@ func TestStateSaveGraphEngineOverride(t *testing.T) {
 	}
 }
 
-// TestResumeAfterBinaryExpiredLeavesCuda checks that the resume of a save
-// whose save/restore binary was killed for waiting past its load wait does not
-// undo CUDA's checkpoint, which preSave runs after the binary and so did not
-// run for it: CUDA's checkpoint state, as one before left it, is left as it
-// is.
-func TestResumeAfterBinaryExpiredLeavesCuda(t *testing.T) {
+// TestResumeAfterSaveRequestLeavesCuda checks that the resume of a save
+// whose save/restore binary was killed for waiting past its load wait, or
+// whose sync after the socket's save request failed, does not undo CUDA's
+// checkpoint, which preSave runs after both and so did not run for it: CUDA's
+// checkpoint state, as one before left it, is left as it is.
+func TestResumeAfterSaveRequestLeavesCuda(t *testing.T) {
 	k, err := testutil.Boot()
 	if err != nil {
 		t.Fatalf("testutil.Boot() failed: %v", err)
@@ -128,7 +128,7 @@ func TestResumeAfterBinaryExpiredLeavesCuda(t *testing.T) {
 	k.AddStateToCheckpoint(cudaCheckpointPathKey, "/cuda-checkpoint")
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, false)
 	k.AddStateToCheckpoint(cudaProcsKey, []*kernel.ThreadGroup(nil))
-	if err := resumeAfterBinaryExpired(k)(); err != nil {
+	if err := resumeAfterSaveRequest(k)(); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if got := k.PopCheckpointState(cudaCheckpointPathKey); got != "/cuda-checkpoint" {
