@@ -183,6 +183,7 @@ func saveRestoreRequest(k *kernel.Kernel, config *kernel.SaveRestoreExecConfig, 
 	abandon := make(chan struct{})
 	done := make(chan struct{})
 	var exchanged error
+	start := time.Now()
 	go func() {
 		defer close(done)
 		for {
@@ -219,5 +220,6 @@ func saveRestoreRequest(k *kernel.Kernel, config *kernel.SaveRestoreExecConfig, 
 	if exchanged != nil {
 		return fmt.Errorf("the %s request to the save/restore socket %s failed: %w", mode, config.Socket, exchanged)
 	}
+	log.Infof("The %s request to the save/restore socket %s was answered in %v", mode, config.Socket, time.Since(start))
 	return nil
 }
