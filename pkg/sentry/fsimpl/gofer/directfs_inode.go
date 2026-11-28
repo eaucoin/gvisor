@@ -272,6 +272,8 @@ func (i *directfsInode) openHandle(flags uint32) (handle, error) {
 }
 
 // Precondition: fs.renameMu is locked.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) ensureLisafsControlFD(ctx context.Context, d *dentry) error {
 	i.handleMu.Lock()
 	defer d.inode.handleMu.Unlock()
@@ -282,7 +284,7 @@ func (i *directfsInode) ensureLisafsControlFD(ctx context.Context, d *dentry) er
 	var names []string
 	root := d
 	for root.parent.Load() != nil {
-		names = append(names, root.name)
+		names = append(names, root.name) // +checklocksforce: d.inode.fs.renameMu is locked; root shares fs.
 		root = root.parent.Load()
 	}
 	if !root.inode.impl.(*directfsInode).controlFDLisa.Ok() {
@@ -550,6 +552,7 @@ var xattrBufPool = sync.Pool{
 	},
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) getXattr(ctx context.Context, name string, size uint64, d *dentry) (string, error) {
 	if ftype := d.inode.fileType(); ftype == linux.S_IFSOCK || ftype == linux.S_IFLNK {
 		// Sockets and symlinks use O_PATH control FDs. However, fgetxattr(2) fails
@@ -576,6 +579,7 @@ func (i *directfsInode) getXattr(ctx context.Context, name string, size uint64, 
 	return string(data[:sz]), nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) setXattr(ctx context.Context, opts *vfs.SetXattrOptions, d *dentry) error {
 	if ftype := d.inode.fileType(); ftype == linux.S_IFSOCK || ftype == linux.S_IFLNK {
 		// Sockets and symlinks use O_PATH control FDs. However, fsetxattr(2) fails
@@ -588,6 +592,7 @@ func (i *directfsInode) setXattr(ctx context.Context, opts *vfs.SetXattrOptions,
 	return unix.Fsetxattr(i.controlFD, opts.Name, []byte(opts.Value), int(opts.Flags))
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) listXattr(ctx context.Context, size uint64, d *dentry) ([]string, error) {
 	if ftype := d.inode.fileType(); ftype == linux.S_IFSOCK || ftype == linux.S_IFLNK {
 		// Sockets and symlinks use O_PATH control FDs. However, flistxattr(2) fails
@@ -624,6 +629,7 @@ func (i *directfsInode) listXattr(ctx context.Context, size uint64, d *dentry) (
 	return names, nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) removeXattr(ctx context.Context, name string, d *dentry) error {
 	if ftype := d.inode.fileType(); ftype == linux.S_IFSOCK || ftype == linux.S_IFLNK {
 		// Sockets and symlinks use O_PATH control FDs. However, fremovexattr(2) fails
@@ -680,6 +686,7 @@ func (i *directfsInode) getCreatedChild(name string, uid auth.KUID, gid auth.KGI
 	return child, nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) mknod(ctx context.Context, name string, creds *auth.Credentials, opts *vfs.MknodOptions, d *dentry) (*dentry, error) {
 	if _, ok := opts.Endpoint.(transport.HostBoundEndpoint); ok {
 		return i.bindAt(ctx, name, creds, opts, d)
@@ -709,6 +716,8 @@ func (i *directfsInode) mknod(ctx context.Context, name string, creds *auth.Cred
 }
 
 // Precondition: opts.Endpoint != nil and is transport.HostBoundEndpoint type.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) bindAt(ctx context.Context, name string, creds *auth.Credentials, opts *vfs.MknodOptions, d *dentry) (*dentry, error) {
 	// There are no filesystems mounted in the sandbox process's mount namespace.
 	// So we can't perform absolute path traversals. So fallback to using lisafs.
@@ -810,6 +819,8 @@ func (i *directfsInode) getDirentsLocked(recordDirent func(name string, key inoK
 }
 
 // Precondition: fs.renameMu is locked.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (i *directfsInode) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID, groups []lisafs.GID, d *dentry) (int, error) {
 	// There are no filesystems mounted in the sandbox process's mount namespace.
 	// So we can't perform absolute path traversals. So fallback to using lisafs.
@@ -904,6 +915,8 @@ func (i *directfsInode) restoreFile(ctx context.Context, controlFD int, opts *vf
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:state.start.inode.fs.renameMu
 func doRevalidationDirectfs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, state *revalidateState, ds **[]*dentry) error {
 	// Explicitly declare start dentry, instead of using the function receiver.
 	// The function receiver has to be named `d` (to be consistent with other
@@ -919,7 +932,7 @@ func doRevalidationDirectfs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, 
 		var stat unix.Statx_t
 		// Lock metadata *before* getting attributes for d.
 		d.inode.metadataMu.Lock()
-		err := unix.Statx(parent.controlFD, d.name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_NO_AUTOMOUNT, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat)
+		err := unix.Statx(parent.controlFD, d.name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_NO_AUTOMOUNT, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 		if err != nil && err != unix.ENOENT {
 			d.inode.metadataMu.Unlock()
 			return err
@@ -938,7 +951,7 @@ func doRevalidationDirectfs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, 
 			}
 			// The file at this path has changed or no longer exists. Mark the
 			// dentry invalidated.
-			d.invalidate(ctx, vfsObj, ds)
+			d.invalidate(ctx, vfsObj, ds) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 			return nil
 		}
 

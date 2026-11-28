@@ -298,15 +298,15 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 
 	// Emit entries for synthetic children.
 	if d.syntheticChildren != 0 {
-		for _, child := range d.children {
+		for name, child := range d.children {
 			if child == nil || !child.inode.isSynthetic() {
 				continue
 			}
-			if _, ok := realChildren[child.name]; ok {
+			if _, ok := realChildren[name]; ok {
 				continue
 			}
 			dirents = append(dirents, vfs.Dirent{
-				Name:    child.name,
+				Name:    name,
 				Type:    uint8(child.inode.mode.Load() >> 12),
 				Ino:     uint64(child.inode.ino),
 				NextOff: int64(len(dirents) + 1),

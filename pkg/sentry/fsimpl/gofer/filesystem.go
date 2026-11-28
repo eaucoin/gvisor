@@ -371,6 +371,8 @@ func (d *dentry) getCachedChildLocked(name string) (*dentry, error) {
 //   - !rp.Done().
 //   - If !d.inode.cachedMetadataAuthoritative(), then d's cached metadata must be up
 //     to date.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, vfsRP *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
 	rp := resolvingPathParent(vfsRP)
 	if err := fs.revalidatePath(ctx, rp, d, ds); err != nil {
@@ -399,6 +401,8 @@ func (fs *filesystem) walkParentDirLocked(ctx context.Context, vfsRP *vfs.Resolv
 // resolveLocked resolves rp to an existing file.
 //
 // Preconditions: fs.renameMu must be locked.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) resolveLocked(ctx context.Context, vfsRP *vfs.ResolvingPath, ds **[]*dentry) (*dentry, error) {
 	rp := resolvingPathFull(vfsRP)
 	d := rp.Start().Impl().(*dentry)
@@ -927,7 +931,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		creds := rp.Credentials()
-		if child, err := parent.mknod(ctx, name, creds, &opts); err == nil {
+		if child, err := parent.mknod(ctx, name, creds, &opts); err == nil { // +checklocksforce: fs.renameMu is locked by doCreateAt.
 			return child, nil
 		} else if !linuxerr.Equals(linuxerr.EPERM, err) {
 			return nil, err
@@ -1134,11 +1138,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, err
 		}
 	}
-	if d.inode.fileType() == linux.S_IFSOCK && !d.inode.isSynthetic() {
-		// d.connect(), called by d.openSocketByConnecting(), requires renameMu.
-		d.inode.fs.renameMu.RLock()
-		defer d.inode.fs.renameMu.RUnlock()
-	}
 
 	mnt := rp.Mount()
 	trunc := opts.Flags&linux.O_TRUNC != 0 && d.inode.fileType() == linux.S_IFREG
@@ -1214,7 +1213,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 		if d.inode.fs.opts.disableFifoOpen {
 			logRejectedFifoOpenOnce.Do(func() {
-				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", d.name)
+				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", d.loadName())
 			})
 			return nil, linuxerr.EPERM
 		}
@@ -1224,7 +1223,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		case charDevEmulatedOnly:
 			if !rp.VirtualFilesystem().IsDeviceRegistered(vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor) {
 				logUnimplementedCharDevOpenOnce.Do(func() {
-					log.Warningf("Opening character device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO. If you want to allow this device to be opened on the host instead, set flag --character-device-policy=prefer-emulated", d.inode.rdevMajor, d.inode.rdevMinor, d.name)
+					log.Warningf("Opening character device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO. If you want to allow this device to be opened on the host instead, set flag --character-device-policy=prefer-emulated", d.inode.rdevMajor, d.inode.rdevMinor, d.loadName())
 				})
 			}
 			emulate = true
@@ -1245,7 +1244,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// block device with no driver. There is deliberately no passthrough
 		// policy for block devices.
 		logUnimplementedBlockDevOpenOnce.Do(func() {
-			log.Warningf("Opening block device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO.", d.inode.rdevMajor, d.inode.rdevMinor, d.name)
+			log.Warningf("Opening block device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO.", d.inode.rdevMajor, d.inode.rdevMinor, d.loadName())
 		})
 		return nil, linuxerr.ENXIO
 	}
@@ -1270,7 +1269,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	return vfd, err
 }
 
-// Precondition: fs.renameMu is locked.
 func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fsmetric.GoferOpensByConnecting.Increment()
 	if opts.Flags&linux.O_DIRECT != 0 {
@@ -1278,7 +1276,9 @@ func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptio
 	}
 	// Note that special value of linux.SockType = 0 is interpreted by lisafs
 	// as "do not care about the socket type". Analogous to p9.AnonymousSocket.
+	d.inode.fs.renameMu.RLock()
 	sockFD, err := d.connect(ctx, 0 /* sockType */)
+	d.inode.fs.renameMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -1892,7 +1892,7 @@ func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 	if err != nil {
 		return nil, err
 	}
-	return d.listXattr(ctx, size)
+	return d.listXattr(ctx, size) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 }
 
 // GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
@@ -1904,7 +1904,7 @@ func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	if err != nil {
 		return "", err
 	}
-	return d.getXattr(ctx, rp.Credentials(), &opts)
+	return d.getXattr(ctx, rp.Credentials(), &opts) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 }
 
 // SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
@@ -1916,7 +1916,7 @@ func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	err = d.setXattr(ctx, rp.Credentials(), &opts)
+	err = d.setXattr(ctx, rp.Credentials(), &opts) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 	if err == nil {
 		d.InotifyWithParent(withCheckCachingList(ctx, &ds), linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	}
@@ -1933,7 +1933,7 @@ func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	err = d.removeXattr(ctx, rp.Credentials(), name)
+	err = d.removeXattr(ctx, rp.Credentials(), name) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 	if err == nil {
 		d.InotifyWithParent(withCheckCachingList(ctx, &ds), linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	}

@@ -289,6 +289,8 @@ func (i *inode) getRemoteChildAndWalkPathLocked(ctx context.Context, rp resolvin
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) listXattrImpl(ctx context.Context, size uint64) ([]string, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -301,6 +303,8 @@ func (d *dentry) listXattrImpl(ctx context.Context, size uint64) ([]string, erro
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (string, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -313,6 +317,8 @@ func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (s
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) setXattrImpl(ctx context.Context, opts *vfs.SetXattrOptions) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -325,6 +331,8 @@ func (d *dentry) setXattrImpl(ctx context.Context, opts *vfs.SetXattrOptions) er
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) removeXattrImpl(ctx context.Context, name string) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -337,6 +345,8 @@ func (d *dentry) removeXattrImpl(ctx context.Context, name string) error {
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) mknod(ctx context.Context, name string, creds *auth.Credentials, opts *vfs.MknodOptions) (*dentry, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -446,6 +456,8 @@ func (i *inode) allocate(ctx context.Context, mode, offset, length uint64) error
 // Preconditions:
 //   - !d.isSynthetic().
 //   - fs.renameMu is locked.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) connect(ctx context.Context, sockType linux.SockType) (int, error) {
 	creds := auth.CredentialsOrNilFromContext(ctx)
 	// The host reports these IDs as the client's SO_PEERCRED, which Linux
@@ -540,6 +552,8 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 // Preconditions:
 //   - !d.isSynthetic().
 //   - d.parent != nil and has been restored.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -573,8 +587,9 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 			return nil
 		}
 		controlFD := d.parent.Load().inode.impl.(*directfsInode).controlFD
+		name := d.name
 		childFD, err := tryOpen(func(flags int) (int, error) {
-			n, err := unix.Openat(controlFD, d.name, flags, 0)
+			n, err := unix.Openat(controlFD, name, flags, 0)
 			return n, err
 		})
 		if err != nil {
@@ -584,13 +599,13 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 
 			// Recreate directories that were created during volume mounting, since
 			// during restore we don't attempt to remount them.
-			if err := unix.Mkdirat(controlFD, d.name, it.mode.Load()); err != nil {
+			if err := unix.Mkdirat(controlFD, name, it.mode.Load()); err != nil {
 				return fmt.Errorf("failed to create mountpoint directory at %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 
 			// Try again...
 			childFD, err = tryOpen(func(flags int) (int, error) {
-				return unix.Openat(controlFD, d.name, flags, 0)
+				return unix.Openat(controlFD, name, flags, 0)
 			})
 			if err != nil {
 				return fmt.Errorf("failed to open %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
@@ -624,6 +639,8 @@ func (d *dentry) readHandleForDeleted(ctx context.Context) (handle, error) {
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:r.start.inode.fs.renameMu
 func (r *revalidateState) doRevalidation(ctx context.Context, vfsObj *vfs.VirtualFilesystem, ds **[]*dentry) error {
 	// Skip synthetic dentries because there is no actual implementation that can
 	// be used to walk the remote filesystem. A start dentry cannot be replaced.

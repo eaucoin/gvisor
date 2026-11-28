@@ -44,6 +44,8 @@ func (errRevalidationStepDone) Error() string {
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig resolvingPath, start *dentry, ds **[]*dentry) error {
 	// Revalidation is done even if start is synthetic in case the path is
 	// something like: ../non_synthetic_file.
@@ -63,6 +65,8 @@ func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig resolvingPath, 
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - parent must have up to date metadata.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *dentry, name string, ds **[]*dentry) error {
 	// Skip revalidation for interop mode different than InteropModeShared or
 	// if the parent is synthetic (child must be synthetic too, but it cannot be
@@ -83,7 +87,7 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 	// Note that child can not be nil, because we don't cache negative entries
 	// when InteropModeShared is in effect.
 	state.add(child)
-	return state.doRevalidation(ctx, vfsObj, ds)
+	return state.doRevalidation(ctx, vfsObj, ds) // +checklocksforce: fs.renameMu is locked; parent belongs to fs.
 }
 
 // revalidate revalidates path components in rp until done returns true, or
@@ -93,6 +97,8 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) revalidate(ctx context.Context, rp resolvingPath, start *dentry, ds **[]*dentry) error {
 	state := makeRevalidateState(start, true /* refreshStart */)
 	defer state.release()
@@ -104,7 +110,7 @@ done:
 		if err != nil {
 			switch err.(type) {
 			case errPartialRevalidation:
-				if err := state.doRevalidation(ctx, rp.VirtualFilesystem(), ds); err != nil {
+				if err := state.doRevalidation(ctx, rp.VirtualFilesystem(), ds); err != nil { // +checklocksforce: fs.renameMu is locked; state.start belongs to fs.
 					return err
 				}
 
@@ -120,7 +126,7 @@ done:
 			}
 		}
 	}
-	return state.doRevalidation(ctx, rp.VirtualFilesystem(), ds)
+	return state.doRevalidation(ctx, rp.VirtualFilesystem(), ds) // +checklocksforce: fs.renameMu is locked; state.start belongs to fs.
 }
 
 // revalidateStep walks one element of the path and updates revalidationState
@@ -197,8 +203,11 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp resolvingPath, d *d
 }
 
 // Precondition: fs.renameMu must be locked.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) invalidate(ctx context.Context, vfsObj *vfs.VirtualFilesystem, ds **[]*dentry) {
 	// Remove d from its parent.
+	name := d.name
 	removed := func() bool {
 		parent := d.parent.Load()
 		parent.opMu.RLock()
@@ -209,9 +218,9 @@ func (d *dentry) invalidate(ctx context.Context, vfsObj *vfs.VirtualFilesystem, 
 		// Since the opMu was just reacquired above, re-check that the
 		// parent's child with this name is still the same. Do not touch it if
 		// it has been replaced with a different one.
-		if child := parent.children[d.name]; child == d {
+		if child := parent.children[name]; child == d {
 			// Invalidate dentry so it gets reloaded next time it's accessed.
-			delete(parent.children, d.name)
+			delete(parent.children, name)
 			if d.inode.isSynthetic() {
 				// Normally we don't mark invalidated dentries as deleted since
 				// they may still exist (but at a different path), and also for

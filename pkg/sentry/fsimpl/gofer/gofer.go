@@ -1201,7 +1201,11 @@ type dentry struct {
 
 	// name is the name of this dentry in its parent. If this dentry is a
 	// filesystem root, name is the empty string. name is protected by
-	// filesystem.renameMu.
+	// filesystem.renameMu and filesystem.ancestryMu.
+	//
+	// +checklocks:inode.fs.renameMu
+	// +checklocks:inode.fs.ancestryMu
+	// +checklocksreadany
 	name string
 
 	// inode is the inode represented by this dentry. Multiple Dentries may
@@ -2029,7 +2033,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked, ke
 		}
 		if parent := d.parent.Load(); parent != nil {
 			parent.childrenMu.Lock()
-			delete(parent.children, d.name)
+			delete(parent.children, d.name) // +checklocksforce: renameMu is locked above or by caller.
 			parent.childrenMu.Unlock()
 		}
 		d.destroyLocked(ctx, keepRenameMu) // +checklocksforce: see above.
@@ -2256,10 +2260,18 @@ func (d *dentry) isDeleted() bool {
 	return d.deleted.Load() != 0
 }
 
+// loadName returns d's name under ancestryMu.
+func (d *dentry) loadName() string {
+	d.inode.fs.ancestryMu.RLock()
+	defer d.inode.fs.ancestryMu.RUnlock()
+	return d.name
+}
+
 func (d *dentry) setDeleted() {
 	d.deleted.Store(1)
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {
 	if d.inode.isSynthetic() {
 		return nil, nil
@@ -2281,6 +2293,7 @@ func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {
 	return names, nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
 	if d.inode.isSynthetic() {
 		return "", linuxerr.ENODATA
@@ -2311,6 +2324,7 @@ func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	return val, nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
 	if d.inode.isSynthetic() {
 		return linuxerr.EPERM
@@ -2329,6 +2343,7 @@ func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	return nil
 }
 
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name string) error {
 	if d.inode.isSynthetic() {
 		return linuxerr.EPERM
@@ -2649,22 +2664,34 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 
 // ListXattr implements vfs.FileDescriptionImpl.ListXattr.
 func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.dentry().listXattr(ctx, size)
+	d := fd.dentry()
+	d.inode.fs.renameMu.RLock()
+	defer d.inode.fs.renameMu.RUnlock()
+	return d.listXattr(ctx, size)
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.
 func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
-	return fd.dentry().getXattr(ctx, auth.CredentialsFromContext(ctx), &opts)
+	d := fd.dentry()
+	d.inode.fs.renameMu.RLock()
+	defer d.inode.fs.renameMu.RUnlock()
+	return d.getXattr(ctx, auth.CredentialsFromContext(ctx), &opts)
 }
 
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
-	return fd.dentry().setXattr(ctx, auth.CredentialsFromContext(ctx), &opts)
+	d := fd.dentry()
+	d.inode.fs.renameMu.RLock()
+	defer d.inode.fs.renameMu.RUnlock()
+	return d.setXattr(ctx, auth.CredentialsFromContext(ctx), &opts)
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
-	return fd.dentry().removeXattr(ctx, auth.CredentialsFromContext(ctx), name)
+	d := fd.dentry()
+	d.inode.fs.renameMu.RLock()
+	defer d.inode.fs.renameMu.RUnlock()
+	return d.removeXattr(ctx, auth.CredentialsFromContext(ctx), name)
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.

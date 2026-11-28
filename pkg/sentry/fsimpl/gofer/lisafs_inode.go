@@ -687,6 +687,8 @@ func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opt
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:state.start.inode.fs.renameMu
 func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, state *revalidateState, ds **[]*dentry) error {
 	start := state.start.inode.impl.(*lisafsInode)
 
@@ -696,7 +698,7 @@ func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, st
 		state.names = append(state.names, "")
 	}
 	for _, d := range state.dentries {
-		state.names = append(state.names, d.name)
+		state.names = append(state.names, d.name) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 	}
 
 	// Lock metadata on all dentries *before* getting attributes for them.
@@ -751,7 +753,7 @@ func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, st
 			}
 			// The file at this path has changed or no longer exists. Mark the
 			// dentry invalidated.
-			d.invalidate(ctx, vfsObj, ds)
+			d.invalidate(ctx, vfsObj, ds) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 			return nil
 		}
 
