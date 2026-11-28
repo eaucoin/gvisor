@@ -839,8 +839,34 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}
 	}
 
+	// Propagate the lower layer's root's owner, group, and mode to the upper
+	// layer's root for consistency with VFS1.
+	upperRootSetStat := vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
+			UID:  stat.UID,
+			GID:  stat.GID,
+			Mode: stat.Mode,
+		},
+	}
+
 	// We need to hide the filestore from the containerized application.
 	if mountConf.IsSelfBacked() {
+		// The whiteout is internal and must not change the mtime of the upper
+		// layer's root, which may come from a filesystem checkpoint. Creating
+		// the whiteout does not change atime, and checkpoints do not keep ctime.
+		upperRootPop := &vfs.PathOperation{
+			Root:  upperRootVD,
+			Start: upperRootVD,
+		}
+		upperRootStat, err := c.l.k.VFS().StatAt(ctx, creds, upperRootPop, &vfs.StatOptions{
+			Mask: linux.STATX_MTIME,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to stat upper layer's root: %w", err)
+		}
+		upperRootSetStat.Stat.Mask |= linux.STATX_MTIME
+		upperRootSetStat.Stat.Mtime = upperRootStat.Mtime
 		if err := overlay.CreateWhiteout(ctx, c.l.k.VFS(), creds, &vfs.PathOperation{
 			Root:  upperRootVD,
 			Start: upperRootVD,
@@ -850,19 +876,10 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}
 	}
 
-	// Propagate the lower layer's root's owner, group, and mode to the upper
-	// layer's root for consistency with VFS1.
 	err = c.l.k.VFS().SetStatAt(ctx, creds, &vfs.PathOperation{
 		Root:  upperRootVD,
 		Start: upperRootVD,
-	}, &vfs.SetStatOptions{
-		Stat: linux.Statx{
-			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
-			UID:  stat.UID,
-			GID:  stat.GID,
-			Mode: stat.Mode,
-		},
-	})
+	}, &upperRootSetStat)
 	if err != nil {
 		return nil, nil, err
 	}
